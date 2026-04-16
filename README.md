@@ -10,35 +10,33 @@
 7. [Memória Híbrida (Redis + Pinecone)](#7-memória-híbrida-redis--pinecone)
 8. [RAG com LlamaIndex e Pinecone](#8-rag-com-llamaindex-e-pinecone)
 9. [Observabilidade com LangSmith](#9-observabilidade-com-langsmith)
-10. [Frontend – Next.js com Streaming de Raciocínio](#10-frontend--nextjs-com-streaming-de-raciocínio)
-11. [Testes e Validação](#11-testes-e-validação)
-12. [Deploy e Monitoramento](#12-deploy-e-monitoramento)
+10. [Testes e Validação](#10-testes-e-validação)
+11. [Deploy e Monitoramento](#11-deploy-e-monitoramento)
 
 ---
 
 ## 1. Arquitetura Geral
 
 ```
-[Next.js] → [FastAPI] → [LangGraph Agent]
-                             │
-          ┌──────────────────┼──────────────────┐
-          ↓                  ↓                  ↓
-      [Tools]           [Memory]           [RAG]
-    (APIs/ML)         (Redis/Pinecone)   (LlamaIndex)
-          │                  │                  │
-          ↓                  ↓                  ↓
-   PostgreSQL/Redis    Histórico + Perfil   Documentos/News
+[FastAPI] → [LangGraph Agent]
+                 │
+  ┌──────────────┼──────────────┐
+  ↓              ↓              ↓
+[Tools]       [Memory]       [RAG]
+(APIs/ML)   (Redis/ChromaDB) (ChromaDB)
+  │              │              │
+  ↓              ↓              ↓
+PostgreSQL  Histórico+Perfil  Documentos/News
 ```
 
 **Componentes Principais**:
 - **Orquestração**: LangChain + LangGraph (loop de raciocínio explícito)
 - **LLM**: OpenAI GPT-4o (ou GPT-4 Turbo)
-- **Vector DB**: Pinecone (memória de longo prazo e RAG)
+- **Vector DB**: ChromaDB (memória de longo prazo e RAG)
 - **Cache**: Redis (buffer de conversa e cache de ferramentas)
 - **DB relacional**: PostgreSQL (dados de mercado, portfólios, usuários)
 - **Backend API**: FastAPI (endpoints de chat e admin)
-- **Frontend**: Next.js (chat interativo com streaming)
-- **Observabilidade**: LangSmith (traces, custos, performance)
+- **Observabilidade**: LangFuse (traces, custos, performance)
 
 ---
 
@@ -46,15 +44,12 @@
 
 - **Contas/APIs**:
   - OpenAI API key
-  - Pinecone (crie um índice)
-  - LangSmith API key
+  - LangFuse API keys (PUBLIC_KEY e SECRET_KEY)
   - Provedor de dados cripto (ex: Binance, CoinGecko, CoinMarketCap)
 - **Software local**:
   - Python 3.11+
-  - Node.js 20+
   - Docker + Docker Compose (PostgreSQL, Redis)
   - Poetry (gerenciador de dependências Python)
-  - pnpm (para Next.js)
 
 ---
 
@@ -64,22 +59,17 @@
 
 ```
 crypto-agent/
-├── backend/
-│   ├── app/
-│   │   ├── api/           # endpoints FastAPI
-│   │   ├── agent/         # LangGraph agent, nós, prompts
-│   │   ├── tools/         # ferramentas (preço, indicadores, ML)
-│   │   ├── memory/        # Redis + Pinecone memory wrappers
-│   │   ├── rag/           # LlamaIndex + Pinecone indexação
-│   │   ├── models/        # SQLAlchemy models (PostgreSQL)
-│   │   └── config.py
-│   ├── Dockerfile
-│   ├── docker-compose.yml
-│   └── pyproject.toml
-├── frontend/
-│   ├── app/               # Next.js App Router
-│   ├── components/        # Chat UI, streaming
-│   └── package.json
+├── app/
+│   ├── api/           # endpoints FastAPI
+│   ├── agent/         # LangGraph agent, nós, prompts
+│   ├── tools/         # ferramentas (preço, indicadores, ML)
+│   ├── memory/        # Redis + Pinecone memory wrappers
+│   ├── rag/           # LlamaIndex + Pinecone indexação
+│   ├── models/        # SQLAlchemy models (PostgreSQL)
+│   └── config.py
+├── Dockerfile
+├── docker-compose.yml
+├── pyproject.toml
 └── README.md
 ```
 
@@ -122,12 +112,13 @@ services:
 
 ```bash
 OPENAI_API_KEY=sk-...
-PINECONE_API_KEY=...
-PINECONE_INDEX_NAME=crypto-memory
-LANGSMITH_API_KEY=...
+LANGFUSE_PUBLIC_KEY=...
+LANGFUSE_SECRET_KEY=...
+LANGFUSE_HOST=https://cloud.langfuse.com
 DATABASE_URL=postgresql://crypto:secret@postgres:5432/cryptodb
 REDIS_URL=redis://redis:6379
 CRYPTO_DATA_API_KEY=...   # Binance/CoinGecko
+CHROMADB_PERSIST_DIRECTORY=./chroma_db
 ```
 
 ---
@@ -139,8 +130,8 @@ CRYPTO_DATA_API_KEY=...   # Binance/CoinGecko
 ```bash
 cd backend
 poetry init
-poetry add fastapi uvicorn langchain langchain-openai langgraph langsmith
-poetry add llama-index pinecone-client redis asyncpg sqlalchemy
+poetry add fastapi uvicorn langchain langchain-openai langgraph langfuse
+poetry add chromadb redis asyncpg sqlalchemy
 poetry add python-dotenv pydantic-settings
 ```
 
@@ -151,11 +142,12 @@ from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
     openai_api_key: str
-    pinecone_api_key: str
-    pinecone_index_name: str
-    langsmith_api_key: str
+    langfuse_public_key: str
+    langfuse_secret_key: str
+    langfuse_host: str
     database_url: str
     redis_url: str
+    chromadb_persist_directory: str
 
     class Config:
         env_file = ".env"
@@ -402,7 +394,7 @@ all_tools = [get_live_price, get_indicators, predict_future, calculate_risk, opt
 
 ---
 
-## 7. Memória Híbrida (Redis + Pinecone)
+## 7. Memória Híbrida (Redis + ChromaDB)
 
 ### 7.1. Memória de curto prazo (Redis)
 
@@ -426,199 +418,133 @@ def get_recent_messages(user_id: str, k: int = 5):
     return [json.loads(m) for m in msgs]
 ```
 
-### 7.2. Memória de longo prazo (Pinecone)
+### 7.2. Memória de longo prazo (ChromaDB)
 
-Cada vez que o agente finaliza uma resposta importante, armazenamos um resumo no Pinecone:
+Cada vez que o agente finaliza uma resposta importante, armazenamos um resumo no ChromaDB:
 
 ```python
 # app/memory/long_term.py
-import pinecone
+import chromadb
+from chromadb.config import Settings as ChromaSettings
 from langchain_openai import OpenAIEmbeddings
 from app.config import settings
 
-pinecone.init(api_key=settings.pinecone_api_key, environment="us-west1-gcp")
-index = pinecone.Index(settings.pinecone_index_name)
+client = chromadb.PersistentClient(path=settings.chromadb_persist_directory)
+collection = client.get_or_create_collection("user_memories")
 embeddings = OpenAIEmbeddings()
 
 def store_memory(user_id: str, text: str, metadata: dict):
     vector = embeddings.embed_query(text)
-    index.upsert(vectors=[(f"{user_id}:{hash(text)}", vector, {**metadata, "user_id": user_id})])
+    collection.add(
+        documents=[text],
+        embeddings=[vector],
+        metadatas=[{**metadata, "user_id": user_id}],
+        ids=[f"{user_id}:{hash(text)}"]
+    )
 
 def retrieve_memory(user_id: str, query: str, top_k=3):
     query_vec = embeddings.embed_query(query)
-    results = index.query(vector=query_vec, top_k=top_k, filter={"user_id": user_id})
-    return [match["metadata"]["text"] for match in results["matches"]]
+    results = collection.query(
+        query_embeddings=[query_vec],
+        n_results=top_k,
+        where={"user_id": user_id}
+    )
+    return results["documents"][0]
 ```
 
 ---
 
-## 8. RAG com LlamaIndex e Pinecone
+## 8. RAG com ChromaDB
 
 ### 8.1. Indexação de documentos (news, relatórios)
 
 ```python
 # app/rag/indexer.py
-from llama_index import VectorStoreIndex, SimpleDirectoryReader
-from llama_index.vector_stores import PineconeVectorStore
-import pinecone
+import chromadb
+from langchain_community.document_loaders import TextLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_openai import OpenAIEmbeddings
 from app.config import settings
 
-pinecone.init(api_key=settings.pinecone_api_key)
-vector_store = PineconeVectorStore(index_name="crypto-news")
+client = chromadb.PersistentClient(path=settings.chromadb_persist_directory)
+collection = client.get_or_create_collection("crypto_news")
+embeddings = OpenAIEmbeddings()
 
 def index_news_documents(folder_path: str):
-    documents = SimpleDirectoryReader(folder_path).load_data()
-    index = VectorStoreIndex.from_documents(documents, vector_store=vector_store)
-    return index
+    loader = TextLoader(folder_path)
+    documents = loader.load()
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    splits = text_splitter.split_documents(documents)
+    
+    for i, split in enumerate(splits):
+        vector = embeddings.embed_query(split.page_content)
+        collection.add(
+            documents=[split.page_content],
+            embeddings=[vector],
+            metadatas=[split.metadata],
+            ids=[f"doc_{i}"]
+        )
 ```
 
 ### 8.2. Busca RAG para o agente
 
 ```python
 # app/rag/search.py
-from llama_index import VectorStoreIndex
+import chromadb
+from langchain_openai import OpenAIEmbeddings
 from app.config import settings
 
+client = chromadb.PersistentClient(path=settings.chromadb_persist_directory)
+collection = client.get_collection("crypto_news")
+embeddings = OpenAIEmbeddings()
+
 def search_news(query: str, top_k=3):
-    vector_store = PineconeVectorStore(index_name="crypto-news")
-    index = VectorStoreIndex.from_vector_store(vector_store)
-    retriever = index.as_retriever(similarity_top_k=top_k)
-    nodes = retriever.retrieve(query)
-    return [{"text": node.text, "score": node.score} for node in nodes]
+    query_vec = embeddings.embed_query(query)
+    results = collection.query(
+        query_embeddings=[query_vec],
+        n_results=top_k
+    )
+    return [{"text": doc, "score": 0.0} for doc in results["documents"][0]]
 ```
 
 ---
 
-## 9. Observabilidade com LangSmith
+## 9. Observabilidade com LangFuse
 
 ### 9.1. Configuração no backend
 
 ```python
 # app/main.py
-from langsmith import Client
+from langfuse import Langfuse
 from langchain.callbacks.tracers import LangChainTracer
 from app.config import settings
 
-tracer = LangChainTracer(project_name="crypto-agent")
-client = Client(api_key=settings.langsmith_api_key)
+langfuse = Langfuse(
+    public_key=settings.langfuse_public_key,
+    secret_key=settings.langfuse_secret_key,
+    host=settings.langfuse_host
+)
 ```
 
-No `graph.py`, adicione o tracer ao invocar o LLM:
+No `graph.py`, adicione o callback ao invocar o LLM:
 
 ```python
-llm = ChatOpenAI(model="gpt-4-turbo", callbacks=[tracer])
+llm = ChatOpenAI(model="gpt-4-turbo", callbacks=[langfuse.get_callback_handler()])
 ```
 
 ### 9.2. Logging manual de ferramentas
 
 ```python
-from langsmith import traceable
+from langfuse.decorators import observe
 
-@traceable(name="get_live_price", run_type="tool")
+@observe(name="get_live_price")
 def get_live_price(symbol: str):
     ...
 ```
 
 ---
 
-## 10. Frontend – Next.js com Streaming de Raciocínio
-
-### 10.1. Setup do projeto Next.js
-
-```bash
-npx create-next-app@latest frontend --typescript --tailwind --app
-cd frontend
-pnpm add eventsource-parser
-```
-
-### 10.2. Componente de chat com SSE (`app/components/ChatInterface.tsx`)
-
-```tsx
-"use client";
-import { useState } from "react";
-
-export default function ChatInterface() {
-  const [input, setInput] = useState("");
-  const [messages, setMessages] = useState<{role:string, content:string}[]>([]);
-
-  const sendMessage = async () => {
-    setMessages(prev => [...prev, {role:"user", content:input}]);
-    const response = await fetch("/api/chat/stream", {
-      method: "POST",
-      body: JSON.stringify({ message: input, user_id: "user123" }),
-      headers: { "Content-Type": "application/json" },
-    });
-    const reader = response.body?.getReader();
-    const decoder = new TextDecoder();
-    let reasoningText = "";
-    while (true) {
-      const { done, value } = await reader!.read();
-      if (done) break;
-      const chunk = decoder.decode(value);
-      const lines = chunk.split("\n");
-      for (const line of lines) {
-        if (line.startsWith("data: ")) {
-          const data = line.slice(6);
-          if (data === "[DONE]") {
-            setMessages(prev => [...prev, {role:"assistant", content:reasoningText}]);
-          } else {
-            reasoningText += data + "\n";
-            // Atualizar UI em tempo real
-            setMessages(prev => {
-              const last = prev[prev.length-1];
-              if (last?.role === "assistant") {
-                return [...prev.slice(0,-1), {...last, content: reasoningText}];
-              } else {
-                return [...prev, {role:"assistant", content: reasoningText}];
-              }
-            });
-          }
-        }
-      }
-    }
-  };
-
-  return (
-    <div className="flex flex-col h-screen">
-      <div className="flex-1 overflow-y-auto p-4">
-        {messages.map((m, i) => (
-          <div key={i} className={`mb-2 ${m.role === "user" ? "text-right" : "text-left"}`}>
-            <span className="inline-block p-2 rounded bg-gray-200">{m.content}</span>
-          </div>
-        ))}
-      </div>
-      <input
-        className="border p-2 m-2"
-        value={input}
-        onChange={(e) => setInput(e.target.value)}
-        onKeyDown={(e) => e.key === "Enter" && sendMessage()}
-      />
-    </div>
-  );
-}
-```
-
-### 10.3. Proxy API route (`frontend/app/api/chat/stream/route.ts`)
-
-```ts
-import { NextRequest } from "next/server";
-
-export async function POST(req: NextRequest) {
-  const body = await req.json();
-  const backendRes = await fetch("http://localhost:8000/chat/stream", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  return new Response(backendRes.body, {
-    headers: { "Content-Type": "text/event-stream" },
-  });
-}
-```
-
----
-
-## 11. Testes e Validação
+## 10. Testes e Validação
 
 ### 11.1. Teste unitário de tools
 
@@ -630,9 +556,9 @@ def test_get_live_price():
     assert "$" in result
 ```
 
-### 11.2. Teste do grafo com LangSmith
+### 11.2. Teste do grafo com LangFuse
 
-- Crie um dataset no LangSmith com perguntas típicas e respostas esperadas.
+- Crie um dataset no LangFuse com perguntas típicas e respostas esperadas.
 - Execute avaliação automática (ex: critério de corretude, uso correto de ferramentas).
 - Ajuste prompts com base nos traces.
 
@@ -643,7 +569,7 @@ def test_get_live_price():
 
 ---
 
-## 12. Deploy e Monitoramento
+## 11. Deploy e Monitoramento
 
 ### 12.1. Opções de deploy
 
@@ -652,8 +578,7 @@ def test_get_live_price():
 | FastAPI + LangGraph | AWS ECS (Fargate) ou GCP Cloud Run (com aumento de timeout) |
 | PostgreSQL | AWS RDS ou Neon.tech |
 | Redis | Redis Cloud ou Upstash |
-| Pinecone | Serviço gerenciado (já é) |
-| Next.js | Vercel (ótimo para streaming) |
+| ChromaDB | Local ou Docker (self-hosted) |
 | Modelos ML | AWS SageMaker ou Lambda (com container) |
 
 ### 12.2. Variáveis de ambiente em produção
@@ -663,7 +588,7 @@ def test_get_live_price():
 
 ### 12.3. Monitoramento pós-deploy
 
-- **LangSmith**: análise de custos e qualidade das respostas.
+- **LangFuse**: análise de custos e qualidade das respostas.
 - **Prometheus + Grafana**: métricas de API (req/s, latência, erros).
 - **Logs centralizados**: Datadog ou ELK.
 
@@ -697,7 +622,6 @@ Este plano cobre desde a configuração zero até um agente de investimento **qu
 **Próximos passos imediatos**:
 1. Configurar Docker Compose com PostgreSQL e Redis.
 2. Implementar uma tool simples (`get_live_price`) e testar o grafo básico.
-3. Conectar o frontend Next.js com streaming.
-4. Adicionar a memória híbrida e RAG.
+3. Adicionar a memória híbrida e RAG.
 
 Precisa de ajuda para implementar algum módulo específico? Posso fornecer código detalhado de qualquer parte.
