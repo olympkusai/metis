@@ -8,3 +8,4 @@ class AgentState(TypedDict):
     next_action: str                # "tools" | "finalize"
     intermediate_steps: List[Tuple[str, str]]  # (tool_name, result)
     final_answer: Optional[str]
+
