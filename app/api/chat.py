@@ -19,7 +19,7 @@ async def chat(request: ChatRequest):
     # recursion_limit = 8 nós × max 6 iterações internas + margem
     final_state = await agent.ainvoke(initial_state, config={"recursion_limit": 60})
 
-    intermediate_steps = final_state.get("intermediate_steps", [])
+    intermediate_steps = final_state.get("intermediate_steps_global", [])
     final_answer       = final_state.get("final_answer", "")
 
     # Formatar processo de raciocínio
