@@ -235,8 +235,8 @@ REGRAS DE TIMEFRAME:
 NORMALIZAÇÃO OBRIGATÓRIA:
 - Volatilidade 1m: anualizar = sqrt(252 × 1440) × vol_1m
 - Momentum: converter para z-score = (valor - média_30d) / std_30d
-- RSI: reportar regime (overbought >70, oversold <30, neutro 30-70)
-- Bollinger Bands: reportar %B = (close - lower) / (upper - lower)
+- RSI: escala 0-100 (padrão da indústria) — overbought >70, oversold <30, neutro 30-70
+- Bollinger Bands: reportar %B = (close - lower) / (upper - lower); breakout se %B > 1 ou < 0
 - MACD: reportar cruzamento (bull cross / bear cross / divergência)
 
 INSTRUÇÃO IMPORTANTE: Você DEVE chamar as ferramentas get_feature_rsi, get_feature_macd, get_feature_bollinger, get_feature_volatility para calcular os indicadores. Chame-as em PARALELO.
@@ -476,10 +476,25 @@ def orchestrator_node(state: QuantAgentState) -> dict:
         "intermediate_steps_agent": [],
     }
 
+# Derive canonical interval from analysis timeframe (single source of truth)
+_TIMEFRAME_INTERVAL = {
+    AnalysisTimeframe.INTRADAY: "1m",
+    AnalysisTimeframe.DAILY: "1h",
+    AnalysisTimeframe.WEEKLY: "1D",
+}
+
+def _get_analysis_interval(timeframe: AnalysisTimeframe) -> str:
+    """Returns the canonical data interval for a given analysis timeframe."""
+    return _TIMEFRAME_INTERVAL.get(timeframe, "1h")
+
 def market_data_node(state: QuantAgentState) -> dict:
     print(f"[DEBUG] ===== MARKET DATA NODE START =====")
     print(f"[DEBUG] Input symbol: {state.symbol}, timeframe: {state.timeframe}")
-    context = f"Symbol: {state.symbol} | Timeframe: {state.timeframe}"
+    analysis_interval = _get_analysis_interval(state.timeframe)
+    context = (
+        f"Symbol: {state.symbol} | Timeframe: {state.timeframe} | "
+        f"INTERVALO OBRIGATÓRIO: interval=\"{analysis_interval}\" — use ESTE intervalo em TODAS as ferramentas"
+    )
     print(f"[DEBUG] Context: {context}")
     content, tool_msgs, steps = _run_agent_loop(
         state, llm_market_data, _MARKET_DATA_SYSTEM, context
@@ -542,8 +557,10 @@ def market_data_node(state: QuantAgentState) -> dict:
 def feature_engineering_node(state: QuantAgentState) -> dict:
     print(f"[DEBUG] ===== FEATURE ENGINEERING NODE START =====")
     print(f"[DEBUG] Input symbol: {state.symbol}, live_price: {state.live_price}")
+    analysis_interval = _get_analysis_interval(state.timeframe)
     context = (
         f"Symbol: {state.symbol} | Timeframe: {state.timeframe} | "
+        f"INTERVALO OBRIGATÓRIO: interval=\"{analysis_interval}\" — use ESTE intervalo em TODAS as ferramentas | "
         f"Preço atual: {state.live_price} | "
         f"Anomalias: {state.anomalies_detected}"
     )
@@ -606,8 +623,10 @@ def risk_agent_node(state: QuantAgentState) -> dict:
     print(f"[DEBUG] ===== RISK AGENT NODE START =====")
     print(f"[DEBUG] Input symbol: {state.symbol}, live_price: {state.live_price}")
     # Passa contexto dos dados já coletados, mas limpa histórico de tool calls
+    analysis_interval = _get_analysis_interval(state.timeframe)
     context = (
         f"Symbol: {state.symbol} | Preço: {state.live_price} | "
+        f"INTERVALO OBRIGATÓRIO: interval=\"{analysis_interval}\" — use ESTE intervalo em TODAS as ferramentas | "
         f"Vol 24h: {state.volume_24h} | Variação: {state.price_change_pct}%\n"
         f"DADOS JÁ COLETADOS: RSI={state.rsi_14}, MACD={state.macd_line}, BB={state.bb_upper}\n"
         f"SUA TAREFA: Calcular métricas de risco usando as ferramentas disponíveis."
@@ -756,7 +775,8 @@ def signal_agent_node(state: QuantAgentState) -> dict:
         bb_lower=state.bb_lower,
         live_price=state.live_price,
         price_change_pct=state.price_change_pct,
-        volatility_annualized=state.volatility_annualized
+        volatility_annualized=state.volatility_annualized,
+        sharpe=state.sharpe,
     )
 
     # Override regime with quantitative engine result
@@ -861,6 +881,12 @@ def pre_trade_risk_gate_node(state: QuantAgentState) -> dict:
     # Regra 8: Volatilidade excessiva
     if state.volatility_annualized and state.volatility_annualized > 1.5:  # 150% a.a.
         warnings.append(f"Volatilidade anualizada muito alta ({state.volatility_annualized:.1%}) — considere reduzir exposição")
+
+    # Regra 9: Risk-signal alignment check
+    # Block Long/Short signals when Sharpe is negative (indicates poor risk-adjusted performance)
+    if state.signal_direction in ["long", "short"] and state.sharpe is not None and state.sharpe < 0:
+        blocked = True
+        reasons.append(f"Signal {state.signal_direction} com Sharpe negativo ({state.sharpe:.2f}) — conflito entre sinal e performance ajustada ao risco.")
 
     gate_reason  = " | ".join(reasons) if reasons else "Aprovado."
     if warnings:

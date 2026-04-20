@@ -65,6 +65,10 @@ class BollingerBandsOutput(BaseModel):
     middle: float
     lower: float
     pct_b: float  # Position within bands (0-1)
+    width: Optional[float] = None
+    breakout: Optional[bool] = None  # True if price is outside the bands
+    available: Optional[bool] = None
+    anomalies: Optional[list] = None
 
 
 class VolatilityOutput(BaseModel):

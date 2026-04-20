@@ -172,6 +172,7 @@ def compute_signal_score(
     live_price: Optional[float],
     price_change_pct: Optional[float],
     volatility_annualized: Optional[float],
+    sharpe: Optional[float] = None,
     params: dict = None,
 ) -> SignalOutput:
     """
@@ -253,14 +254,38 @@ def compute_signal_score(
     elif indicator_count < params["confidence_penalty_if_indicators_lt"]:
         confidence = confidence * params["confidence_penalty_factor"]
 
+    # Sharpe-based confidence ceiling: weak risk-adjusted edge = lower max confidence
+    # This prevents 90%+ confidence when Sharpe indicates poor/uncertain performance
+    if sharpe is not None:
+        if sharpe < 0:
+            sharpe_ceiling = 0.40   # Negative Sharpe: capped at 40%
+        elif sharpe < 0.5:
+            sharpe_ceiling = 0.55   # Weak edge: capped at 55%
+        elif sharpe < 1.0:
+            sharpe_ceiling = 0.70   # Moderate edge: capped at 70%
+        elif sharpe < 2.0:
+            sharpe_ceiling = 0.85   # Good edge: capped at 85%
+        else:
+            sharpe_ceiling = 1.00   # Excellent: no cap
+        confidence = min(confidence, sharpe_ceiling)
+
     # Regime detection
     trending_thresh = params["trending_threshold"]
-    if abs(signal_score) > trending_thresh:
-        regime = "trending"
-    elif abs(signal_score) < long_thresh:  # using long_thresh as neutral band
-        regime = "ranging"
-    else:
+
+    # Breakout: price outside Bollinger Bands (most reliable detection)
+    bb_breakout = False
+    if bb_upper is not None and bb_lower is not None and live_price is not None:
+        bandwidth = bb_upper - bb_lower
+        if abs(bandwidth) > 1e-8:
+            raw_pct_b = (live_price - bb_lower) / bandwidth
+            bb_breakout = raw_pct_b > 1.0 or raw_pct_b < 0.0
+
+    if bb_breakout:
         regime = "breakout"
+    elif abs(signal_score) > trending_thresh:
+        regime = "trending"
+    else:
+        regime = "ranging"  # Default to ranging when no clear signal
 
     return SignalOutput(
         direction=direction,
