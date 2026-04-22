@@ -10,12 +10,12 @@ import asyncio
 from typing import Any, Dict, List, Tuple, Optional
 from dataclasses import dataclass, field
 from app.config import get_settings
-from app.services.market_snapshot import get_market_snapshot_service
+from app.api_client import K0sApiClient
 
 # API client configuration
 settings = get_settings()
 API_BASE_URL = str(settings.api_base_url)
-_snapshot_service = get_market_snapshot_service()
+_api_client = K0sApiClient(base_url=API_BASE_URL)
 
 # Performance tuning: connection pool limits
 MAX_CONCURRENT_REQUESTS = settings.max_concurrent_requests
@@ -158,7 +158,9 @@ async def _get_current_price_async(symbol: str, metrics: Optional[TimingMetrics]
     
     try:
         api_start = _time.time()
-        response = await _snapshot_service.get_live_ohlcv(symbol, interval="1m")
+        to_ts = int(_time.time() * 1000)
+        from_ts = to_ts - (60 * 1000)  # Last 1 minute
+        response = await _api_client.get_ohlcv(symbol, interval, from_ts, to_ts, limit=1)
         api_ms = (_time.time() - api_start) * 1000
 
         if metrics:
@@ -197,7 +199,9 @@ async def _get_feature_parallel(
     
     try:
         api_start = _time.time()
-        response = await _snapshot_service.get_features(symbol, interval, [feature])
+        to_ts = int(_time.time() * 1000)
+        from_ts = to_ts - (_INTERVAL_MS.get(interval, _INTERVAL_MS["1m"]) * _MIN_WINDOW.get(feature, _MIN_CANDLES))
+        response = await _api_client.get_features(symbol, interval, [feature], from_ts, to_ts)
         api_ms = (_time.time() - api_start) * 1000
 
         if metrics:
@@ -275,7 +279,9 @@ async def _get_indicator_parallel(
     
     try:
         api_start = _time.time()
-        response = await _snapshot_service.get_indicators(symbol, interval, [indicator])
+        to_ts = int(_time.time() * 1000)
+        from_ts = to_ts - (_INTERVAL_MS.get(interval, _INTERVAL_MS["1m"]) * _MIN_WINDOW.get(indicator, _MIN_CANDLES))
+        response = await _api_client.get_indicators(symbol, interval, [indicator], from_ts, to_ts)
         api_ms = (_time.time() - api_start) * 1000
 
         if metrics:
@@ -418,7 +424,9 @@ async def get_live_price(symbol: str, interval: str = "1m") -> str:
 
     try:
         api_start = _time.time()
-        response = await _snapshot_service.get_market_ohlcv(norm_symbol, interval)
+        to_ts = int(_time.time() * 1000)
+        from_ts = to_ts - (_INTERVAL_MS.get(interval, _INTERVAL_MS["1m"]) * 100)
+        response = await _api_client.get_ohlcv(norm_symbol, interval, from_ts, to_ts, limit=100)
         api_ms = (_time.time() - api_start) * 1000
         metrics.api_calls_ms["ohlcv_market"] = api_ms
         metrics.add_phase("load_market_snapshot", api_ms, f"interval={interval}")
@@ -455,7 +463,9 @@ async def get_indicators(symbol: str, interval: str = "1m") -> str:
 
     try:
         api_start = _time.time()
-        response = await _snapshot_service.get_market_ohlcv(norm_symbol, interval)
+        to_ts = int(_time.time() * 1000)
+        from_ts = to_ts - (_INTERVAL_MS.get(interval, _INTERVAL_MS["1m"]) * 100)
+        response = await _api_client.get_ohlcv(norm_symbol, interval, from_ts, to_ts, limit=100)
         api_ms = (_time.time() - api_start) * 1000
         metrics.api_calls_ms["ohlcv_market"] = api_ms
         metrics.add_phase("load_market_snapshot", api_ms, f"interval={interval}")
@@ -867,7 +877,7 @@ async def get_ohlcv_history(symbol: str, interval: str = "1m", from_ts: int = No
 
     try:
         api_start = _time.time()
-        response = await _snapshot_service.get_ohlcv_window(
+        response = await _api_client.get_ohlcv(
             symbol=norm_symbol,
             interval=interval,
             from_time=from_ts,
