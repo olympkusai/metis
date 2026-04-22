@@ -27,6 +27,7 @@ import asyncio
 import json
 import math
 from enum import Enum
+from functools import lru_cache
 from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -35,6 +36,7 @@ from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field, ConfigDict
 
 from app.tools import all_tools
+from app.config import get_settings
 from app.agent.schemas import (
     OrchestratorOutput,
     MarketDataOutput,
@@ -165,16 +167,45 @@ class QuantAgentState(BaseModel):
 _BASE_MODEL = "gpt-4o"
 
 def _make_llm(temperature: float = 0.1, **kw) -> ChatOpenAI:
-    return ChatOpenAI(model=_BASE_MODEL, temperature=temperature, **kw)
+    settings = get_settings()
+    return ChatOpenAI(
+        model=_BASE_MODEL,
+        temperature=temperature,
+        api_key=settings.openai_api_key,
+        **kw,
+    )
 
 tool_map = {t.name: t for t in all_tools}
+risk_tools = [t for t in all_tools if t.name == "calculate_risk"]
 
-llm_orchestrator   = _make_llm(temperature=0.1).with_structured_output(OrchestratorOutput)
-llm_market_data    = _make_llm(temperature=0.0).bind_tools(all_tools)
-llm_features       = _make_llm(temperature=0.0).bind_tools(all_tools, parallel_tool_calls=True)
-llm_risk           = _make_llm(temperature=0.0).bind_tools(all_tools)
-llm_signal         = _make_llm(temperature=0.15).bind_tools(all_tools)
-llm_execution      = _make_llm(temperature=0.0)  # no tools — pure reasoning
+@lru_cache(maxsize=1)
+def _get_llm_orchestrator():
+    return _make_llm(temperature=0.1).with_structured_output(OrchestratorOutput)
+
+
+@lru_cache(maxsize=1)
+def _get_llm_market_data():
+    return _make_llm(temperature=0.0).bind_tools(all_tools)
+
+
+@lru_cache(maxsize=1)
+def _get_llm_features():
+    return _make_llm(temperature=0.0).bind_tools(all_tools, parallel_tool_calls=True)
+
+
+@lru_cache(maxsize=1)
+def _get_llm_risk():
+    return _make_llm(temperature=0.0).bind_tools(risk_tools)
+
+
+@lru_cache(maxsize=1)
+def _get_llm_signal():
+    return _make_llm(temperature=0.15).bind_tools(all_tools)
+
+
+@lru_cache(maxsize=1)
+def _get_llm_execution():
+    return _make_llm(temperature=0.0)  # no tools — pure reasoning
 
 # ─────────────────────────────────────────────
 # 4. SYSTEM PROMPTS  (cada agente tem seu próprio)
@@ -272,9 +303,10 @@ CLASSIFICAÇÃO DE RISCO:
 - HIGH:     vol 80-120% a.a., sharpe < 0.5, drawdown 30-50%
 - EXTREME:  vol > 120% a.a., sharpe < 0, drawdown > 50%
 
-INSTRUÇÃO IMPORTANTE: Você DEVE chamar as ferramentas calculate_risk, get_feature_sharpe, get_feature_cvar, get_feature_max_drawdown, get_feature_volatility para calcular as métricas de risco.
+INSTRUÇÃO IMPORTANTE: Você DEVE chamar a ferramenta calculate_risk para calcular as métricas de risco.
+Ela já consolida CVaR, Sharpe, Max Drawdown e volatilidade em uma única consulta agregada.
 
-FERRAMENTAS: calculate_risk, get_feature_sharpe, get_feature_cvar, get_feature_max_drawdown, get_feature_volatility
+FERRAMENTAS: calculate_risk
 """.strip()
 
 _SIGNAL_SYSTEM = """
@@ -521,7 +553,7 @@ async def orchestrator_node(state: QuantAgentState) -> dict:
     print(f"[DEBUG] Input state messages: {len(state.messages)} messages")
     msgs  = [SystemMessage(content=_ORCHESTRATOR_SYSTEM)] + state.messages
     try:
-        resp = await llm_orchestrator.ainvoke(msgs)
+        resp = await _get_llm_orchestrator().ainvoke(msgs)
         print(f"[DEBUG] Orchestrator response type: {type(resp).__name__}")
         print(f"[DEBUG] Orchestrator response: {resp}")
         # resp is now a structured OrchestratorOutput object
@@ -566,7 +598,7 @@ async def market_data_node(state: QuantAgentState) -> dict:
     )
     print(f"[DEBUG] Context: {context}")
     content, tool_msgs, steps = await _run_agent_loop(
-        state, llm_market_data, _MARKET_DATA_SYSTEM, context,
+        state, _get_llm_market_data(), _MARKET_DATA_SYSTEM, context,
         force_interval=analysis_interval,
     )
     print(f"[DEBUG] Market data - steps: {len(steps)}, tool_msgs: {len(tool_msgs)}")
@@ -642,7 +674,7 @@ async def feature_engineering_node(state: QuantAgentState) -> dict:
     )
     print(f"[DEBUG] Context: {context}")
     content, tool_msgs, steps = await _run_agent_loop(
-        state, llm_features, _FEATURE_SYSTEM, context,
+        state, _get_llm_features(), _FEATURE_SYSTEM, context,
         force_interval=analysis_interval,
     )
     print(f"[DEBUG] Feature engineering - steps: {len(steps)}, tool_msgs: {len(tool_msgs)}")
@@ -710,7 +742,7 @@ async def risk_agent_node(state: QuantAgentState) -> dict:
     )
     print(f"[DEBUG] Context: {context}")
     content, tool_msgs, steps = await _run_agent_loop(
-        state, llm_risk, _RISK_SYSTEM, context, clear_steps=True,
+        state, _get_llm_risk(), _RISK_SYSTEM, context, clear_steps=True,
         force_interval=analysis_interval,
     )
     print(f"[DEBUG] Risk agent - steps: {len(steps)}, tool_msgs: {len(tool_msgs)}")
@@ -736,8 +768,8 @@ async def risk_agent_node(state: QuantAgentState) -> dict:
                 cvar_95 = parsed.cvar_95
                 sharpe = parsed.sharpe
                 max_drawdown = parsed.max_drawdown
-                volatility_raw = parsed.volatility_20d
-                volatility_interval = "1d"
+                volatility_raw = parsed.volatility_20d if parsed.volatility_20d is not None else parsed.volatility_21
+                volatility_interval = parsed.interval
                 print(f"[DEBUG] Parsed calculate_risk: cvar={cvar_95}, sharpe={sharpe}, drawdown={max_drawdown}")
             elif tool_name == "get_feature_cvar":
                 parsed = CVaROutput.model_validate_json(result)
@@ -873,7 +905,7 @@ async def signal_agent_node(state: QuantAgentState) -> dict:
     )
     print(f"[DEBUG] Context: {context}")
     content, tool_msgs, steps = await _run_agent_loop(
-        state, llm_signal, _SIGNAL_SYSTEM, context,
+        state, _get_llm_signal(), _SIGNAL_SYSTEM, context,
         force_interval=_get_analysis_interval(state.timeframe),
     )
     print(f"[DEBUG] Signal agent - steps: {len(steps)}, tool_msgs: {len(tool_msgs)}")
@@ -1148,7 +1180,7 @@ HISTÓRICO DE ANÁLISE (últimos 8 steps):
         SystemMessage(content=_EXECUTION_SYSTEM),
         HumanMessage(content=context),
     ]
-    final_response = await llm_execution.ainvoke(msgs)
+    final_response = await _get_llm_execution().ainvoke(msgs)
 
     return {
         **state.model_dump(),

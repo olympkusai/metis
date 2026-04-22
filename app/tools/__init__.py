@@ -5,22 +5,20 @@ Inclui timers detalhados para profiling de performance.
 
 from langchain_core.tools import tool
 import time as _time
-import os
 import json
 import asyncio
 from typing import Any, Dict, List, Tuple, Optional
 from dataclasses import dataclass, field
-from app.api_client import K0sApiClient
 from app.config import get_settings
+from app.services.market_snapshot import get_market_snapshot_service
 
 # API client configuration
 settings = get_settings()
 API_BASE_URL = str(settings.api_base_url)
+_snapshot_service = get_market_snapshot_service()
 
 # Performance tuning: connection pool limits
 MAX_CONCURRENT_REQUESTS = settings.max_concurrent_requests
-_semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
-_client_lock = asyncio.Lock()
 
 
 @dataclass
@@ -62,8 +60,10 @@ _INTERVAL_MS = {
     "8h":  8  * 60  * 60 * 1_000,
     "12h": 12 * 60  * 60 * 1_000,
     "1d":  1  * 24  * 60 * 60 * 1_000,
+    "1D":  1  * 24  * 60 * 60 * 1_000,
     "3d":  3  * 24  * 60 * 60 * 1_000,
     "1w":  7  * 24  * 60 * 60 * 1_000,
+    "1W":  7  * 24  * 60 * 60 * 1_000,
     "1M":  30 * 24  * 60 * 60 * 1_000,
 }
 _MIN_CANDLES = 100
@@ -84,24 +84,15 @@ _WARMUP_FILTER = {"target_1d", "ma_7", "ma_21", "ma_50", "volatility_7", "volati
 _RISK_INDICATORS = {"sharpe", "calmar", "cvar_95", "max_drawdown", "bootstrap_20"}
 
 
-async def _get_api_client() -> K0sApiClient:
-    """Get or create HTTP API client instance with connection pooling (thread-safe)."""
-    if not hasattr(_get_api_client, '_client'):
-        async with _client_lock:
-            if not hasattr(_get_api_client, '_client'):
-                _get_api_client._client = K0sApiClient(base_url=API_BASE_URL, timeout=8.0)
-    return _get_api_client._client
-
-
 def _default_timestamps(interval: str, from_ts=None, to_ts=None, feature_or_indicator=None) -> Tuple[int, int]:
     """Retorna (from_ts, to_ts) garantindo pelo menos o mínimo de candles necessário."""
+    min_candles = _MIN_WINDOW.get(feature_or_indicator, _MIN_CANDLES) if feature_or_indicator else _MIN_CANDLES
     if not to_ts:
         to_ts = int(_time.time() * 1000)
     if not from_ts:
         candle_ms = _INTERVAL_MS.get(interval, _INTERVAL_MS["1m"])
-        min_candles = _MIN_WINDOW.get(feature_or_indicator, _MIN_CANDLES)
         from_ts = to_ts - (min_candles * candle_ms)
-    print(f"[TOOLS] _default_timestamps: interval={interval}, feature={feature_or_indicator}, from_ts={from_ts}, to_ts={to_ts}, window={min_candles if feature_or_indicator else _MIN_CANDLES} candles")
+    print(f"[TOOLS] _default_timestamps: interval={interval}, feature={feature_or_indicator}, from_ts={from_ts}, to_ts={to_ts}, window={min_candles} candles")
     return from_ts, to_ts
 
 
@@ -153,6 +144,11 @@ def normalize_indicator(indicator_name: str, value: float, current_price: float)
     return value
 
 
+def _needs_current_price(indicator_name: str) -> bool:
+    """Only a small subset of indicators/features require current price normalization."""
+    return indicator_name in {"ma_7", "ma_21", "ma_50", "ewma_30d", "macd", "macd_signal"}
+
+
 # ============ FUNÇÕES CORE ASSÍNCRONAS OTIMIZADAS ============
 
 async def _get_current_price_async(symbol: str, metrics: Optional[TimingMetrics] = None) -> float:
@@ -161,27 +157,16 @@ async def _get_current_price_async(symbol: str, metrics: Optional[TimingMetrics]
     phase_name = f"get_price_{symbol}"
     
     try:
-        async with _semaphore:
-            client = await _get_api_client()
-            to_ts = int(_time.time() * 1000)
-            from_ts = to_ts - 5 * 60 * 1_000  # 5 minutos
-            
-            api_start = _time.time()
-            response = await client.get_ohlcv(
-                symbol=symbol,
-                interval="1m",
-                from_time=from_ts,
-                to_time=to_ts,
-                limit=1
-            )
-            api_ms = (_time.time() - api_start) * 1000
-            
-            if metrics:
-                metrics.api_calls_ms[phase_name] = api_ms
-                metrics.add_phase(phase_name, api_ms, "1 candle OHLCV")
-            
-            if response and response.candles:
-                return response.candles[-1].close
+        api_start = _time.time()
+        response = await _snapshot_service.get_live_ohlcv(symbol, interval="1m")
+        api_ms = (_time.time() - api_start) * 1000
+
+        if metrics:
+            metrics.api_calls_ms[phase_name] = api_ms
+            metrics.add_phase(phase_name, api_ms, "shared live snapshot")
+
+        if response and response.candles:
+            return response.candles[-1].close
     except Exception as e:
         if metrics:
             metrics.add_phase(phase_name, (_time.time() - start) * 1000, f"error: {str(e)}")
@@ -202,29 +187,21 @@ async def _get_feature_parallel(
     if not min_window:
         return [], 400, 0, []
     
-    from_ts, to_ts = _default_timestamps(interval, feature_or_indicator=feature)
-    
     # Get current price if not provided (parallel optimization)
     price_start = _time.time()
-    if current_price is None:
+    if current_price is None and _needs_current_price(feature):
         current_price = await _get_current_price_async(symbol, metrics)
+    if current_price is None:
+        current_price = 0.0
     price_ms = (_time.time() - price_start) * 1000
     
     try:
-        async with _semaphore:
-            client = await _get_api_client()
-            api_start = _time.time()
-            response = await client.get_features(
-                symbol=symbol,
-                interval=interval,
-                features=[feature],
-                from_time=from_ts,
-                to_time=to_ts
-            )
-            api_ms = (_time.time() - api_start) * 1000
-            
-            if metrics:
-                metrics.api_calls_ms[f"feature_{feature}"] = api_ms
+        api_start = _time.time()
+        response = await _snapshot_service.get_features(symbol, interval, [feature])
+        api_ms = (_time.time() - api_start) * 1000
+
+        if metrics:
+            metrics.api_calls_ms[f"feature_{feature}"] = api_ms
         
         if not response:
             total_ms = (_time.time() - total_start) * 1000
@@ -290,27 +267,19 @@ async def _get_indicator_parallel(
     if not min_window:
         return [], 400, 0, []
     
-    from_ts, to_ts = _default_timestamps(interval, feature_or_indicator=indicator)
-    
     # Get current price if not provided
-    if current_price is None:
+    if current_price is None and _needs_current_price(indicator):
         current_price = await _get_current_price_async(symbol, metrics)
+    if current_price is None:
+        current_price = 0.0
     
     try:
-        async with _semaphore:
-            client = await _get_api_client()
-            api_start = _time.time()
-            response = await client.get_indicators(
-                symbol=symbol,
-                interval=interval,
-                indicators=[indicator],
-                from_time=from_ts,
-                to_time=to_ts
-            )
-            api_ms = (_time.time() - api_start) * 1000
-            
-            if metrics:
-                metrics.api_calls_ms[f"indicator_{indicator}"] = api_ms
+        api_start = _time.time()
+        response = await _snapshot_service.get_indicators(symbol, interval, [indicator])
+        api_ms = (_time.time() - api_start) * 1000
+
+        if metrics:
+            metrics.api_calls_ms[f"indicator_{indicator}"] = api_ms
         
         if not response:
             total_ms = (_time.time() - total_start) * 1000
@@ -371,8 +340,10 @@ async def _get_multiple_features_parallel(
     """Busca múltiplas features em paralelo."""
     start = _time.time()
     
-    # Get price once for all features
-    price = await _get_current_price_async(symbol, metrics)
+    # Only fetch live price when at least one feature depends on it.
+    price = None
+    if any(_needs_current_price(feature) for feature in features):
+        price = await _get_current_price_async(symbol, metrics)
     
     # Create tasks for all features
     tasks = [
@@ -406,8 +377,10 @@ async def _get_multiple_indicators_parallel(
     """Busca múltiplos indicadores em paralelo."""
     start = _time.time()
     
-    # Get price once for all indicators
-    price = await _get_current_price_async(symbol, metrics)
+    # Only fetch live price when at least one indicator depends on it.
+    price = None
+    if any(_needs_current_price(indicator) for indicator in indicators):
+        price = await _get_current_price_async(symbol, metrics)
     
     # Create tasks for all indicators
     tasks = [
@@ -442,26 +415,18 @@ async def get_live_price(symbol: str, interval: str = "1m") -> str:
 
     norm_symbol = _normalize_symbol(symbol)
     print(f"[TOOLS] get_live_price: symbol={symbol} -> {norm_symbol}, interval={interval}")
-    to_ts = int(_time.time() * 1000)
-    from_ts = to_ts - 5 * _INTERVAL_MS.get(interval, _INTERVAL_MS["1m"])
 
     try:
-        async with _semaphore:
-            client = await _get_api_client()
-            api_start = _time.time()
-            response = await client.get_ohlcv(
-                symbol=norm_symbol,
-                interval=interval,
-                from_time=from_ts,
-                to_time=to_ts,
-                limit=5
-            )
-            api_ms = (_time.time() - api_start) * 1000
-            metrics.api_calls_ms["ohlcv"] = api_ms
-            print(f"[TOOLS] get_live_price API call took {api_ms:.2f}ms")
+        api_start = _time.time()
+        response = await _snapshot_service.get_market_ohlcv(norm_symbol, interval)
+        api_ms = (_time.time() - api_start) * 1000
+        metrics.api_calls_ms["ohlcv_market"] = api_ms
+        metrics.add_phase("load_market_snapshot", api_ms, f"interval={interval}")
+        print(f"[TOOLS] get_live_price snapshot lookup took {api_ms:.2f}ms")
 
         if response and response.candles:
             last = response.candles[-1]
+            metrics.total_ms = (_time.time() - start) * 1000
             result = {
                 "symbol": norm_symbol,
                 "interval": interval,
@@ -487,22 +452,14 @@ async def get_indicators(symbol: str, interval: str = "1m") -> str:
 
     norm_symbol = _normalize_symbol(symbol)
     print(f"[TOOLS] get_indicators: symbol={symbol} -> {norm_symbol}, interval={interval}")
-    from_ts, to_ts = _default_timestamps(interval, from_ts=None, to_ts=None)
 
     try:
-        async with _semaphore:
-            client = await _get_api_client()
-            api_start = _time.time()
-            response = await client.get_ohlcv(
-                symbol=norm_symbol,
-                interval=interval,
-                from_time=from_ts,
-                to_time=to_ts,
-                limit=100
-            )
-            api_ms = (_time.time() - api_start) * 1000
-            metrics.api_calls_ms["ohlcv_100"] = api_ms
-            print(f"[TOOLS] get_indicators API call took {api_ms:.2f}ms")
+        api_start = _time.time()
+        response = await _snapshot_service.get_market_ohlcv(norm_symbol, interval)
+        api_ms = (_time.time() - api_start) * 1000
+        metrics.api_calls_ms["ohlcv_market"] = api_ms
+        metrics.add_phase("load_market_snapshot", api_ms, f"interval={interval}")
+        print(f"[TOOLS] get_indicators snapshot lookup took {api_ms:.2f}ms")
 
         if not response or not response.candles:
             return json.dumps({"error": f"Sem candles para {norm_symbol} ({interval})."})
@@ -584,6 +541,7 @@ async def calculate_risk(symbol: str, interval: str = "1m") -> str:
         "cvar_95": results.get('cvar_95'),
         "sharpe": results.get('sharpe'),
         "max_drawdown": results.get('max_drawdown'),
+        "volatility_20d": results.get('volatility_21'),
         "volatility_21": results.get('volatility_21'),
         "_timing": metrics.to_dict()
     }
@@ -908,19 +866,18 @@ async def get_ohlcv_history(symbol: str, interval: str = "1m", from_ts: int = No
     print(f"[TOOLS] get_ohlcv_history: symbol={symbol} -> {norm_symbol}, interval={interval}, from_ts={from_ts}, to_ts={to_ts}")
 
     try:
-        async with _semaphore:
-            client = await _get_api_client()
-            api_start = _time.time()
-            response = await client.get_ohlcv(
-                symbol=norm_symbol,
-                interval=interval,
-                from_time=from_ts,
-                to_time=to_ts,
-                limit=100
-            )
-            api_ms = (_time.time() - api_start) * 1000
-            metrics.api_calls_ms["ohlcv_history"] = api_ms
-            print(f"[TOOLS] get_ohlcv_history API call took {api_ms:.2f}ms")
+        api_start = _time.time()
+        response = await _snapshot_service.get_ohlcv_window(
+            symbol=norm_symbol,
+            interval=interval,
+            from_time=from_ts,
+            to_time=to_ts,
+            limit=100,
+        )
+        api_ms = (_time.time() - api_start) * 1000
+        metrics.api_calls_ms["ohlcv_history"] = api_ms
+        metrics.add_phase("load_history_snapshot", api_ms, f"interval={interval}")
+        print(f"[TOOLS] get_ohlcv_history snapshot lookup took {api_ms:.2f}ms")
 
         if not response or not response.candles:
             return json.dumps({
