@@ -23,6 +23,7 @@ class LivePriceOutput(BaseModel):
     low: float
     volume: float
     timestamp: int
+    _timing: Optional[dict] = None
 
 
 class IndicatorsOutput(BaseModel):
@@ -37,6 +38,7 @@ class IndicatorsOutput(BaseModel):
     low: float
     first_timestamp: int
     last_timestamp: int
+    _timing: Optional[dict] = None
 
 
 class RSIOutput(BaseModel):
@@ -45,6 +47,7 @@ class RSIOutput(BaseModel):
     interval: str
     rsi_14: float
     regime: Literal["overbought", "oversold", "neutral"]
+    _timing: Optional[dict] = None
 
 
 class MACDOutput(BaseModel):
@@ -55,6 +58,7 @@ class MACDOutput(BaseModel):
     signal: float
     histogram: float
     crossover: Optional[Literal["bullish", "bearish", "none"]] = None
+    _timing: Optional[dict] = None
 
 
 class BollingerBandsOutput(BaseModel):
@@ -69,6 +73,7 @@ class BollingerBandsOutput(BaseModel):
     breakout: Optional[bool] = None  # True if price is outside the bands
     available: Optional[bool] = None
     anomalies: Optional[list] = None
+    _timing: Optional[dict] = None
 
 
 class VolatilityOutput(BaseModel):
@@ -78,6 +83,7 @@ class VolatilityOutput(BaseModel):
     volatility_raw: float
     volatility_annualized: float
     data_interval: str  # "1m", "1h", "1d", etc.
+    _timing: Optional[dict] = None
 
 
 class RiskMetricsOutput(BaseModel):
@@ -88,6 +94,8 @@ class RiskMetricsOutput(BaseModel):
     sharpe: float
     max_drawdown: float
     volatility_20d: Optional[float] = None
+    volatility_21: Optional[float] = None
+    _timing: Optional[dict] = None
 
 
 class SharpeOutput(BaseModel):
@@ -95,6 +103,7 @@ class SharpeOutput(BaseModel):
     symbol: str
     interval: str
     sharpe: float
+    _timing: Optional[dict] = None
 
 
 class CVaROutput(BaseModel):
@@ -102,6 +111,7 @@ class CVaROutput(BaseModel):
     symbol: str
     interval: str
     cvar_95: float
+    _timing: Optional[dict] = None
 
 
 class MaxDrawdownOutput(BaseModel):
@@ -109,6 +119,7 @@ class MaxDrawdownOutput(BaseModel):
     symbol: str
     interval: str
     max_drawdown: float
+    _timing: Optional[dict] = None
 
 
 class SMAOutput(BaseModel):
@@ -117,6 +128,7 @@ class SMAOutput(BaseModel):
     interval: str
     period: int
     sma: float
+    _timing: Optional[dict] = None
 
 
 class EMAReturnOutput(BaseModel):
@@ -124,6 +136,7 @@ class EMAReturnOutput(BaseModel):
     symbol: str
     interval: str
     ema_return_60: float
+    _timing: Optional[dict] = None
 
 
 # ─────────────────────────────────────────────

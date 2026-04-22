@@ -1,7 +1,10 @@
 from fastapi import APIRouter
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from langchain_core.messages import HumanMessage
 from app.agent.graph import get_agent_graph, QuantAgentState
+import json
+import asyncio
 
 router = APIRouter()
 
@@ -46,3 +49,133 @@ async def chat(request: ChatRequest):
         "tools_used":  [step[0] for step in intermediate_steps],
         "pipeline":    pipeline_meta,
     }
+
+
+@router.post("/streaming/chat")
+async def streaming_chat(request: ChatRequest):
+    """Streaming endpoint that emits each node execution as an SSE event."""
+    
+    async def event_generator():
+        agent = get_agent_graph()
+        initial_state = QuantAgentState(
+            messages=[HumanMessage(content=request.message)],
+            user_id=request.user_id,
+        )
+        
+        # Accumulate state updates to build final state
+        accumulated_state = {}
+        
+        # Stream node executions with reasoning
+        async for event in agent.astream(
+            initial_state,
+            config={"recursion_limit": 60},
+            stream_mode="updates"
+        ):
+            # event is a dict of node_name -> state_update
+            for node_name, state_update in event.items():
+                # Accumulate state
+                accumulated_state.update(state_update)
+                
+                # Extract relevant information from each node
+                step_data = {
+                    "node": node_name,
+                    "type": "node_execution",
+                    "timestamp": asyncio.get_event_loop().time(),
+                    "reasoning": ""
+                }
+                
+                # Extract reasoning from messages if available
+                if "messages" in state_update:
+                    messages = state_update["messages"]
+                    if messages:
+                        # Get the last AIMessage which contains the LLM's reasoning
+                        last_message = messages[-1]
+                        if hasattr(last_message, 'content') and last_message.content:
+                            # Extract content - handle both string and dict formats
+                            content = last_message.content
+                            if isinstance(content, dict) and "content" in content:
+                                content = content["content"]
+                            elif isinstance(content, str):
+                                try:
+                                    # Try to parse if it's a JSON string
+                                    import json
+                                    parsed = json.loads(content)
+                                    if isinstance(parsed, dict) and "content" in parsed:
+                                        content = parsed["content"]
+                                except:
+                                    pass  # Keep as-is if not valid JSON
+                            
+                            # Truncate long reasoning to keep it readable
+                            if isinstance(content, str) and len(content) > 500:
+                                content = content[:500] + "..."
+                            step_data["reasoning"] = content
+                
+                # Add node-specific data
+                if node_name == "orchestrator":
+                    if "next_agent" in state_update:
+                        step_data["next_agent"] = state_update["next_agent"]
+                    if "symbol" in state_update:
+                        step_data["symbol"] = state_update["symbol"]
+                    if "timeframe" in state_update:
+                        step_data["timeframe"] = str(state_update["timeframe"])
+                
+                elif node_name == "market_data":
+                    if "live_price" in state_update:
+                        step_data["live_price"] = state_update["live_price"]
+                    if "volume_24h" in state_update:
+                        step_data["volume_24h"] = state_update["volume_24h"]
+                
+                elif node_name == "feature_engineering":
+                    if "rsi" in state_update:
+                        step_data["rsi"] = state_update["rsi"]
+                    if "macd" in state_update:
+                        step_data["macd"] = state_update["macd"]
+                    if "bb_upper" in state_update:
+                        step_data["bb_upper"] = state_update["bb_upper"]
+                
+                elif node_name == "risk_agent":
+                    if "risk_level" in state_update:
+                        step_data["risk_level"] = str(state_update["risk_level"])
+                    if "cvar_95" in state_update:
+                        step_data["cvar_95"] = state_update["cvar_95"]
+                    if "sharpe" in state_update:
+                        step_data["sharpe"] = state_update["sharpe"]
+                
+                elif node_name == "signal_agent":
+                    if "signal_direction" in state_update:
+                        step_data["signal_direction"] = state_update["signal_direction"]
+                    if "signal_confidence" in state_update:
+                        step_data["signal_confidence"] = state_update["signal_confidence"]
+                
+                elif node_name == "risk_gate":
+                    if "gate_approved" in state_update:
+                        step_data["gate_approved"] = state_update["gate_approved"]
+                    if "gate_reason" in state_update:
+                        step_data["gate_reason"] = state_update["gate_reason"]
+                    if "next_action" in state_update:
+                        step_data["next_action"] = str(state_update["next_action"])
+                
+                # Emit SSE event
+                yield f"data: {json.dumps(step_data)}\n\n"
+        
+        # Send final event with complete accumulated state
+        final_event = {
+            "node": "final",
+            "type": "completion",
+            "response": accumulated_state.get("final_answer", ""),
+            "pipeline": {
+                "symbol": accumulated_state.get("symbol"),
+                "timeframe": str(accumulated_state.get("timeframe")),
+                "risk_level": str(accumulated_state.get("risk_level")),
+                "signal_direction": accumulated_state.get("signal_direction"),
+                "signal_confidence": accumulated_state.get("signal_confidence"),
+                "gate_approved": accumulated_state.get("gate_approved"),
+                "gate_reason": accumulated_state.get("gate_reason"),
+                "anomalies_detected": accumulated_state.get("anomalies_detected", []),
+            },
+            "timestamp": asyncio.get_event_loop().time()
+        }
+        
+        yield f"data: {json.dumps(final_event)}\n\n"
+    
+    return StreamingResponse(event_generator(), media_type="text/event-stream")

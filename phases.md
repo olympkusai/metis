@@ -9,10 +9,10 @@ Este documento divide o plano de implementação em fases sequenciais para facil
 **Objetivo**: Configurar ambiente básico e serviços de infraestrutura
 
 ### Tarefas
-- [ ] Criar estrutura de pastas do projeto
-- [ ] Configurar Docker Compose (PostgreSQL, Redis)
-- [ ] Criar arquivo `.env` com variáveis de ambiente
-- [ ] Configurar Poetry no backend
+- [x] Criar estrutura de pastas do projeto
+- [x] Configurar Docker Compose (PostgreSQL, Redis)
+- [x] Criar arquivo `.env` com variáveis de ambiente
+- [x] Configurar Poetry no backend
 - [ ] Criar contas/APIs necessárias (OpenAI, LangFuse, provedor de dados cripto)
 
 ### Entregáveis
@@ -33,12 +33,15 @@ Este documento divide o plano de implementação em fases sequenciais para facil
 **Objetivo**: Implementar backend com endpoint de chat básico e agente LangGraph simples
 
 ### Tarefas
-- [ ] Criar `app/config.py` com configurações
-- [ ] Implementar endpoint `/chat` básico em `app/api/chat.py`
-- [ ] Criar `app/agent/state.py` com definição do estado
-- [ ] Implementar `app/agent/prompts.py` com prompt de raciocínio
-- [ ] Criar grafo básico em `app/agent/graph.py` (nós: reason, action, observe, finalize)
-- [ ] Implementar uma tool simples (`get_live_price`)
+- [x] Criar `app/config.py` com configurações
+- [x] Implementar endpoint `/chat` básico em `app/api/chat.py`
+- [x] Criar estrutura modular de estado (`app/agent/state/`)
+- [x] Criar estrutura modular de prompts (`app/agent/prompts/`)
+- [x] Criar grafo avançado com 9 nós em `app/agent/graph/`
+- [x] Implementar engine quant (`app/agent/quant_engine/`)
+- [x] Implementar portfolio (`app/agent/portfolio/`)
+- [x] Implementar execution (`app/agent/execution/`)
+- [x] Implementar tools (`get_live_price`, `get_indicators`, `calculate_risk`, `get_feature_rsi`, `get_feature_macd`, `get_feature_bollinger`, `get_feature_volatility`, `get_feature_sharpe`, `get_feature_cvar`, `get_feature_max_drawdown`, `get_feature_sma`, `get_feature_ema_return`, `get_ohlcv_history`)
 - [ ] Testar endpoint `/chat` com curl/Postman
 
 ### Entregáveis
@@ -59,9 +62,10 @@ Este documento divide o plano de implementação em fases sequenciais para facil
 **Objetivo**: Desenvolver todas as ferramentas de dados e ML
 
 ### Tarefas
-- [ ] Implementar `get_indicators` (RSI, MACD, médias)
+- [x] Implementar `get_indicators` (RSI, MACD, médias, OHLCV)
+- [x] Implementar `calculate_risk` (VaR, CVaR, Sharpe, drawdown)
+- [x] Implementar integração com API externa (k0s.app) via HTTP REST
 - [ ] Implementar `predict_future` (integração com modelo ML)
-- [ ] Implementar `calculate_risk` (VaR, Sharpe)
 - [ ] Implementar `optimize_portfolio` (Markowitz)
 - [ ] Criar modelos ML (Transformer + XGBoost)
 - [ ] Configurar job para calcular indicadores e armazenar no PostgreSQL

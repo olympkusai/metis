@@ -23,9 +23,9 @@ Principais upgrades vs. implementação anterior:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import math
-import time
 from enum import Enum
 from typing import Any
 
@@ -117,6 +117,8 @@ class QuantAgentState(BaseModel):
     live_price:         float | None       = None
     volume_24h:         float | None       = None
     price_change_pct:   float | None       = None
+    recent_high:        float | None       = None  # from get_indicators (last 100 candles)
+    recent_low:         float | None       = None
 
     # Risk context (populated by RiskAgent)
     risk_level:         RiskLevel | None   = None
@@ -150,6 +152,9 @@ class QuantAgentState(BaseModel):
     # Portfolio context (for institutional portfolio management)
     portfolio_state: PortfolioState       = Field(default_factory=PortfolioState)
     proposed_position_size: float | None   = None
+
+    # Tool call deduplication cache (per run) — keyed by '<name>|<sorted_args>'
+    tool_cache:         dict[str, str]     = Field(default_factory=dict)
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -319,6 +324,13 @@ para o usuário com:
 6. ALERTAS: anomalias detectadas, riscos não cobertos, limitações da análise
 7. DISCLAIMER: "Análise quantitativa — não é recomendação de investimento"
 
+REGRAS CRÍTICAS ANTI-ALUCINAÇÃO:
+• Se um campo aparece como "(não coletado)" no contexto, reporte-o como indisponível.
+• Se um campo tem valor numérico, USE-O. NUNCA afirme que um dado está
+  indisponível se ele está preenchido no contexto.
+• Se há anomalias listadas (incluindo ajustes do sanity audit), mencione-as em ALERTAS.
+• NÃO invente valores. NÃO extrapole. Sintetize apenas o que está no contexto.
+
 Tom: analista institucional sênior. Preciso, direto, sem jargão desnecessário.
 """.strip()
 
@@ -326,25 +338,80 @@ Tom: analista institucional sênior. Preciso, direto, sem jargão desnecessário
 # 5. TOOL EXECUTOR  (reutilizável)
 # ─────────────────────────────────────────────
 
-def _execute_tools(last_ai: AIMessage, steps: list) -> tuple[list[ToolMessage], list]:
-    """Executa tool calls e retorna (tool_messages, steps_atualizados)."""
+# Tools cujo argumento `interval` é canônico (devem respeitar o timeframe do pipeline)
+_INTERVAL_AWARE_TOOLS = {
+    "get_live_price", "get_indicators", "calculate_risk",
+    "get_feature_rsi", "get_feature_macd", "get_feature_bollinger",
+    "get_feature_volatility", "get_feature_sharpe", "get_feature_cvar",
+    "get_feature_max_drawdown", "get_feature_sma", "get_feature_ema_return",
+    "get_ohlcv_history",
+}
+
+
+def _cache_key(name: str, args: dict) -> str:
+    try:
+        return f"{name}|{json.dumps(args, sort_keys=True, default=str)}"
+    except Exception:
+        return f"{name}|{repr(sorted(args.items()))}"
+
+
+async def _execute_tools(
+    last_ai: AIMessage,
+    steps: list,
+    cache: dict[str, str] | None = None,
+    force_interval: str | None = None,
+) -> tuple[list[ToolMessage], list]:
+    """Executa tool calls em paralelo, com dedup cache (por-run) e enforcement
+    do `interval` canônico derivado do timeframe do orchestrator.
+    """
     tool_messages: list[ToolMessage] = []
-    steps = list(steps)  # cópia para não mutar o original
-    for tc in last_ai.tool_calls:
-        name   = tc["name"]
-        args   = tc["args"]
-        tool   = tool_map.get(name)
-        result = tool.invoke(args) if tool else f"[ERR] Tool '{name}' não encontrada."
-        tool_messages.append(ToolMessage(content=str(result), tool_call_id=tc["id"]))
-        steps.append((name, str(result)))
+    steps = list(steps)
+    cache = cache if cache is not None else {}
+
+    async def _run_one(tc):
+        name = tc["name"]
+        args = dict(tc.get("args") or {})
+        # Enforce timeframe canônico
+        if force_interval and name in _INTERVAL_AWARE_TOOLS and "interval" in args:
+            if args.get("interval") != force_interval:
+                args["interval"] = force_interval
+        # Dedup cache
+        key = _cache_key(name, args)
+        if key in cache:
+            return name, tc["id"], cache[key], True
+        tool = tool_map.get(name)
+        if tool is None:
+            return name, tc["id"], f"[ERR] Tool '{name}' não encontrada.", False
+        result = await tool.ainvoke(args)
+        cache[key] = str(result)
+        return name, tc["id"], result, False
+
+    results = await asyncio.gather(
+        *[_run_one(tc) for tc in last_ai.tool_calls],
+        return_exceptions=True,
+    )
+
+    for item, tc in zip(results, last_ai.tool_calls):
+        if isinstance(item, Exception):
+            name = tc["name"]
+            result = f"[ERR] Tool '{name}' exceção: {item}"
+            tool_messages.append(ToolMessage(content=str(result), tool_call_id=tc["id"]))
+            steps.append((name, str(result)))
+        else:
+            name, call_id, result, was_cached = item
+            content = str(result)
+            tool_messages.append(ToolMessage(content=content, tool_call_id=call_id))
+            label = f"{name} [cached]" if was_cached else name
+            steps.append((label, content))
     return tool_messages, steps
 
-def _run_agent_loop(
+async def _run_agent_loop(
     state: QuantAgentState,
     llm,
     system_prompt: str,
     extra_context: str = "",
     clear_steps: bool = False,
+    force_interval: str | None = None,
 ) -> tuple[str, list[ToolMessage], list]:
     """
     Loop LLM → tool call → result para um agente especializado.
@@ -380,16 +447,16 @@ def _run_agent_loop(
         response = None
         for attempt in range(MAX_RETRIES):
             try:
-                response = llm.invoke(msgs, timeout=30)  # 30s timeout
+                response = await llm.ainvoke(msgs, timeout=30)  # 30s timeout
                 break
             except Exception as e:
                 if attempt == MAX_RETRIES - 1:
                     # Fallback: return error message
                     error_msg = f"[LLM ERROR after {MAX_RETRIES} retries]: {str(e)}"
                     return error_msg, all_tool_msgs, steps
-                # Exponential backoff: 0.5s, 1s, 2s
+                # Exponential backoff: 0.5s, 1s, 2s (não-bloqueante)
                 backoff_time = 0.5 * (2 ** attempt)
-                time.sleep(backoff_time)
+                await asyncio.sleep(backoff_time)
                 continue
         
         if response is None:
@@ -406,7 +473,9 @@ def _run_agent_loop(
         
         # Handle both AIMessage (with tool_calls) and structured Pydantic output
         if hasattr(response, 'tool_calls') and response.tool_calls:
-            tool_msgs, steps = _execute_tools(response, steps)
+            tool_msgs, steps = await _execute_tools(
+                response, steps, cache=state.tool_cache, force_interval=force_interval
+            )
             msgs.extend(tool_msgs)
             all_tool_msgs.extend(tool_msgs)
         elif isinstance(response, (str, dict)) or hasattr(response, 'model_dump'):
@@ -435,14 +504,14 @@ def _run_agent_loop(
             previous_step_count = len(steps)
 
     # Força finalização se exceder iterações
-    final = llm.invoke(msgs + [HumanMessage(content="Sintetize os resultados obtidos até agora.")])
+    final = await llm.ainvoke(msgs + [HumanMessage(content="Sintetize os resultados obtidos até agora.")])
     return final.content, all_tool_msgs, steps
 
 # ─────────────────────────────────────────────
 # 6. AGENT NODES
 # ─────────────────────────────────────────────
 
-def orchestrator_node(state: QuantAgentState) -> dict:
+async def orchestrator_node(state: QuantAgentState) -> dict:
     """
     Extrai intent, symbol, timeframe e define o pipeline inicial.
     Uses structured output from LLM.
@@ -452,7 +521,7 @@ def orchestrator_node(state: QuantAgentState) -> dict:
     print(f"[DEBUG] Input state messages: {len(state.messages)} messages")
     msgs  = [SystemMessage(content=_ORCHESTRATOR_SYSTEM)] + state.messages
     try:
-        resp = llm_orchestrator.invoke(msgs)
+        resp = await llm_orchestrator.ainvoke(msgs)
         print(f"[DEBUG] Orchestrator response type: {type(resp).__name__}")
         print(f"[DEBUG] Orchestrator response: {resp}")
         # resp is now a structured OrchestratorOutput object
@@ -487,7 +556,7 @@ def _get_analysis_interval(timeframe: AnalysisTimeframe) -> str:
     """Returns the canonical data interval for a given analysis timeframe."""
     return _TIMEFRAME_INTERVAL.get(timeframe, "1h")
 
-def market_data_node(state: QuantAgentState) -> dict:
+async def market_data_node(state: QuantAgentState) -> dict:
     print(f"[DEBUG] ===== MARKET DATA NODE START =====")
     print(f"[DEBUG] Input symbol: {state.symbol}, timeframe: {state.timeframe}")
     analysis_interval = _get_analysis_interval(state.timeframe)
@@ -496,8 +565,9 @@ def market_data_node(state: QuantAgentState) -> dict:
         f"INTERVALO OBRIGATÓRIO: interval=\"{analysis_interval}\" — use ESTE intervalo em TODAS as ferramentas"
     )
     print(f"[DEBUG] Context: {context}")
-    content, tool_msgs, steps = _run_agent_loop(
-        state, llm_market_data, _MARKET_DATA_SYSTEM, context
+    content, tool_msgs, steps = await _run_agent_loop(
+        state, llm_market_data, _MARKET_DATA_SYSTEM, context,
+        force_interval=analysis_interval,
     )
     print(f"[DEBUG] Market data - steps: {len(steps)}, tool_msgs: {len(tool_msgs)}")
     print(f"[DEBUG] Market data content preview: {content[:200] if content else 'None'}")
@@ -507,6 +577,8 @@ def market_data_node(state: QuantAgentState) -> dict:
     live_price = state.live_price
     volume_24h = state.volume_24h
     price_change_pct = state.price_change_pct
+    recent_high = state.recent_high
+    recent_low = state.recent_low
 
     for tool_name, result in steps:
         print(f"[DEBUG] Processing tool: {tool_name}, result preview: {result[:100] if result else 'None'}")
@@ -522,6 +594,8 @@ def market_data_node(state: QuantAgentState) -> dict:
                 volume_24h = parsed.total_volume
                 if live_price is None:
                     live_price = parsed.current_price
+                recent_high = parsed.high
+                recent_low = parsed.low
         except (json.JSONDecodeError, KeyError, TypeError, Exception):
             # Strict parsing: ignore invalid data (institutional rule)
             continue
@@ -552,9 +626,11 @@ def market_data_node(state: QuantAgentState) -> dict:
         "live_price":        live_price,
         "volume_24h":        volume_24h,
         "price_change_pct":  price_change_pct,
+        "recent_high":       recent_high,
+        "recent_low":        recent_low,
     }
 
-def feature_engineering_node(state: QuantAgentState) -> dict:
+async def feature_engineering_node(state: QuantAgentState) -> dict:
     print(f"[DEBUG] ===== FEATURE ENGINEERING NODE START =====")
     print(f"[DEBUG] Input symbol: {state.symbol}, live_price: {state.live_price}")
     analysis_interval = _get_analysis_interval(state.timeframe)
@@ -565,8 +641,9 @@ def feature_engineering_node(state: QuantAgentState) -> dict:
         f"Anomalias: {state.anomalies_detected}"
     )
     print(f"[DEBUG] Context: {context}")
-    content, tool_msgs, steps = _run_agent_loop(
-        state, llm_features, _FEATURE_SYSTEM, context
+    content, tool_msgs, steps = await _run_agent_loop(
+        state, llm_features, _FEATURE_SYSTEM, context,
+        force_interval=analysis_interval,
     )
     print(f"[DEBUG] Feature engineering - steps: {len(steps)}, tool_msgs: {len(tool_msgs)}")
 
@@ -619,7 +696,7 @@ def feature_engineering_node(state: QuantAgentState) -> dict:
         "bb_lower":           bb_lower,
     }
 
-def risk_agent_node(state: QuantAgentState) -> dict:
+async def risk_agent_node(state: QuantAgentState) -> dict:
     print(f"[DEBUG] ===== RISK AGENT NODE START =====")
     print(f"[DEBUG] Input symbol: {state.symbol}, live_price: {state.live_price}")
     # Passa contexto dos dados já coletados, mas limpa histórico de tool calls
@@ -632,8 +709,9 @@ def risk_agent_node(state: QuantAgentState) -> dict:
         f"SUA TAREFA: Calcular métricas de risco usando as ferramentas disponíveis."
     )
     print(f"[DEBUG] Context: {context}")
-    content, tool_msgs, steps = _run_agent_loop(
-        state, llm_risk, _RISK_SYSTEM, context, clear_steps=True
+    content, tool_msgs, steps = await _run_agent_loop(
+        state, llm_risk, _RISK_SYSTEM, context, clear_steps=True,
+        force_interval=analysis_interval,
     )
     print(f"[DEBUG] Risk agent - steps: {len(steps)}, tool_msgs: {len(tool_msgs)}")
 
@@ -685,6 +763,52 @@ def risk_agent_node(state: QuantAgentState) -> dict:
             continue
 
     print(f"[DEBUG] Risk metrics before calculation - cvar: {cvar_95}, sharpe: {sharpe}, drawdown: {max_drawdown}, vol: {volatility_annualized}")
+
+    # ─── SANITY AUDIT — proteção contra valores implausíveis do backend ───
+    risk_audit_anomalies: list[str] = []
+
+    # A) max_drawdown bounds: deve estar em [0, 1]
+    if max_drawdown is not None:
+        if max_drawdown < 0 or max_drawdown > 1:
+            risk_audit_anomalies.append(
+                f"max_drawdown fora do range [0,1]: {max_drawdown:.4f} — descartado"
+            )
+            max_drawdown = None
+        elif state.recent_high and state.recent_low and state.recent_high > 0:
+            # Cross-check: drawdown do backend não pode exceder o range observado
+            # * 1.5 (tolerância para janela maior do que nossos 100 candles).
+            observed_range_dd = (state.recent_high - state.recent_low) / state.recent_high
+            if max_drawdown > observed_range_dd * 1.5 and max_drawdown > 0.10:
+                risk_audit_anomalies.append(
+                    f"max_drawdown backend ({max_drawdown:.2%}) >> range observado "
+                    f"({observed_range_dd:.2%}) × 1.5 — usando fallback observado"
+                )
+                max_drawdown = observed_range_dd
+
+    # B) cvar_95: por convenção é uma perda (fração negativa ou próxima de 0 negativa)
+    if cvar_95 is not None and (cvar_95 < -1.0 or cvar_95 > 1.0):
+        risk_audit_anomalies.append(
+            f"cvar_95 fora do range [-1,1]: {cvar_95:.4f} — descartado"
+        )
+        cvar_95 = None
+
+    # C) sharpe: na prática financeira |sharpe| > 5 é extremamente suspeito
+    if sharpe is not None and abs(sharpe) > 10:
+        risk_audit_anomalies.append(
+            f"sharpe implausível: {sharpe:.4f} — descartado"
+        )
+        sharpe = None
+
+    # D) volatility_annualized: > 500% a.a. é essencialmente quebra de dados
+    if volatility_annualized is not None and volatility_annualized > 5.0:
+        risk_audit_anomalies.append(
+            f"volatility_annualized implausível: {volatility_annualized:.2%} — descartado"
+        )
+        volatility_annualized = None
+
+    if risk_audit_anomalies:
+        print(f"[DEBUG] Risk audit caught anomalies: {risk_audit_anomalies}")
+
     # QUANTITATIVE ENGINE: Deterministic risk level calculation (no LLM)
     risk_level_str = determine_risk_level(
         cvar_95=cvar_95,
@@ -736,9 +860,10 @@ def risk_agent_node(state: QuantAgentState) -> dict:
         "sharpe":             sharpe,
         "max_drawdown":       max_drawdown,
         "volatility_annualized": volatility_annualized,
+        "anomalies_detected": state.anomalies_detected + risk_audit_anomalies,
     }
 
-def signal_agent_node(state: QuantAgentState) -> dict:
+async def signal_agent_node(state: QuantAgentState) -> dict:
     print(f"[DEBUG] ===== SIGNAL AGENT NODE START =====")
     print(f"[DEBUG] Input symbol: {state.symbol}, risk_level: {state.risk_level}")
     context = (
@@ -747,8 +872,9 @@ def signal_agent_node(state: QuantAgentState) -> dict:
         f"CVaR 95%: {state.cvar_95}"
     )
     print(f"[DEBUG] Context: {context}")
-    content, tool_msgs, steps = _run_agent_loop(
-        state, llm_signal, _SIGNAL_SYSTEM, context
+    content, tool_msgs, steps = await _run_agent_loop(
+        state, llm_signal, _SIGNAL_SYSTEM, context,
+        force_interval=_get_analysis_interval(state.timeframe),
     )
     print(f"[DEBUG] Signal agent - steps: {len(steps)}, tool_msgs: {len(tool_msgs)}")
 
@@ -888,6 +1014,24 @@ def pre_trade_risk_gate_node(state: QuantAgentState) -> dict:
         blocked = True
         reasons.append(f"Signal {state.signal_direction} com Sharpe negativo ({state.sharpe:.2f}) — conflito entre sinal e performance ajustada ao risco.")
 
+    # Regra 10: Risk-confidence consistency — HIGH risk exige confiança mínima
+    if state.risk_level == RiskLevel.HIGH and (state.signal_confidence or 0) < 0.40 \
+            and state.signal_direction in ["long", "short"]:
+        blocked = True
+        reasons.append(
+            f"Risk level HIGH com confiança {(state.signal_confidence or 0):.0%} — "
+            f"threshold mínimo para HIGH = 40%."
+        )
+
+    # Regra 11: Data quality minimum — precisamos de pelo menos 2 indicadores técnicos
+    indicators_available = sum(
+        1 for x in [state.rsi_14, state.macd_line, state.bb_upper] if x is not None
+    )
+    if state.signal_direction in ["long", "short"] and indicators_available < 2:
+        warnings.append(
+            f"Apenas {indicators_available} indicador(es) técnico(s) disponível(is) — sinal frágil."
+        )
+
     gate_reason  = " | ".join(reasons) if reasons else "Aprovado."
     if warnings:
         gate_reason += f" | Avisos: {'; '.join(warnings)}"
@@ -903,16 +1047,45 @@ def pre_trade_risk_gate_node(state: QuantAgentState) -> dict:
         "intermediate_steps_agent": [],
     }
 
-def execution_node(state: QuantAgentState) -> dict:
+def _fmt(val, *, pct: bool = False, unit: str = "", prec: int = 4) -> str:
+    """Renderização explícita: None → '(não coletado)', números formatados."""
+    if val is None:
+        return "(não coletado)"
+    if isinstance(val, (int, float)):
+        if pct:
+            return f"{val * 100:.2f}%"
+        return f"{val:.{prec}f}{unit}"
+    return str(val)
+
+
+def _coverage_summary(state: QuantAgentState) -> tuple[int, int, list[str]]:
+    """Conta quantos campos críticos estão preenchidos; retorna (ok, total, missing)."""
+    fields = {
+        "live_price": state.live_price,
+        "price_change_pct": state.price_change_pct,
+        "rsi_14": state.rsi_14,
+        "macd_line": state.macd_line,
+        "bb_upper": state.bb_upper,
+        "sharpe": state.sharpe,
+        "cvar_95": state.cvar_95,
+        "max_drawdown": state.max_drawdown,
+        "volatility_annualized": state.volatility_annualized,
+    }
+    missing = [k for k, v in fields.items() if v is None]
+    return len(fields) - len(missing), len(fields), missing
+
+
+async def execution_node(state: QuantAgentState) -> dict:
     """
     Consolida toda a análise e gera resposta final institucional.
-    Inclui validação final antes de responder.
+    Hardened:
+      • valida gate + campos críticos
+      • renderiza None como '(não coletado)' explicitamente
+      • inclui resumo de cobertura para evitar alucinação
     """
     # VALIDAÇÃO FINAL OBRIGATÓRIA
     if not state.gate_approved:
         raise Exception(f"Execution node chamado sem aprovação do risk gate. Motivo: {state.gate_reason}")
-
-    # Validar dados críticos estão presentes
     if not state.symbol:
         raise Exception("Symbol não definido no estado.")
     if state.signal_direction is None:
@@ -920,35 +1093,45 @@ def execution_node(state: QuantAgentState) -> dict:
     if state.risk_level is None:
         raise Exception("Risk level não definido no estado.")
 
+    ok, total, missing = _coverage_summary(state)
+    coverage_line = f"Cobertura de dados: {ok}/{total} campos preenchidos"
+    if missing:
+        coverage_line += f" | AUSENTES: {', '.join(missing)}"
+
+    # Formatação explícita evita o LLM confundir 0.0 com None
     context = f"""
+RESUMO DE COBERTURA
+  {coverage_line}
+
 DADOS DE MERCADO
   Symbol:          {state.symbol}
   Timeframe:       {state.timeframe}
-  Preço atual:     {state.live_price}
-  Variação 24h:    {state.price_change_pct}%
-  Volume 24h:      {state.volume_24h}
+  Preço atual:     {_fmt(state.live_price, prec=2)}
+  Variação 24h:    {_fmt(state.price_change_pct, prec=4)}%
+  Volume 24h:      {_fmt(state.volume_24h, prec=2)}
+  Range recente:   high={_fmt(state.recent_high, prec=2)} low={_fmt(state.recent_low, prec=2)}
 
 INDICADORES TÉCNICOS
-  RSI (14):        {state.rsi_14}
-  MACD Line:       {state.macd_line}
-  MACD Signal:     {state.macd_signal}
-  MACD Histogram:  {state.macd_histogram}
-  Bollinger Upper: {state.bb_upper}
-  Bollinger Middle:{state.bb_middle}
-  Bollinger Lower: {state.bb_lower}
+  RSI (14):        {_fmt(state.rsi_14, prec=2)}
+  MACD Line:       {_fmt(state.macd_line)}
+  MACD Signal:     {_fmt(state.macd_signal)}
+  MACD Histogram:  {_fmt(state.macd_histogram)}
+  Bollinger Upper: {_fmt(state.bb_upper, prec=2)}
+  Bollinger Middle:{_fmt(state.bb_middle, prec=2)}
+  Bollinger Lower: {_fmt(state.bb_lower, prec=2)}
 
 MÉTRICAS DE RISCO
   Risk level:      {state.risk_level}
-  VaR 95%:         {state.var_95}
-  CVaR 95%:        {state.cvar_95}
-  Sharpe:          {state.sharpe}
-  Max Drawdown:    {state.max_drawdown}
-  Vol. anualizada: {state.volatility_annualized}
+  VaR 95%:         {_fmt(state.var_95, pct=True)}
+  CVaR 95%:        {_fmt(state.cvar_95, pct=True)}
+  Sharpe:          {_fmt(state.sharpe, prec=3)}
+  Max Drawdown:    {_fmt(state.max_drawdown, pct=True)}
+  Vol. anualizada: {_fmt(state.volatility_annualized, pct=True)}
 
 SINAL
   Regime:          {state.regime}
   Direção:         {state.signal_direction}
-  Confiança:       {state.signal_confidence}
+  Confiança:       {_fmt(state.signal_confidence, pct=True)}
 
 QUALIDADE DOS DADOS
   Anomalias:       {state.anomalies_detected or 'Nenhuma'}
@@ -957,17 +1140,15 @@ RISK GATE
   Aprovado:        {state.gate_approved}
   Motivo:          {state.gate_reason}
 
-HISTÓRICO DE ANÁLISE (resumo):
+HISTÓRICO DE ANÁLISE (últimos 8 steps):
 {chr(10).join(f'  [{k}] {v[:120]}' for k, v in state.intermediate_steps_global[-8:])}
 """.strip()
 
-    # Usa apenas o contexto estruturado — state.messages pode conter mensagens
-    # de outros agentes incompatíveis com a API OpenAI (órfãos de tool_calls)
     msgs = [
         SystemMessage(content=_EXECUTION_SYSTEM),
         HumanMessage(content=context),
     ]
-    final_response = llm_execution.invoke(msgs)
+    final_response = await llm_execution.ainvoke(msgs)
 
     return {
         **state.model_dump(),
