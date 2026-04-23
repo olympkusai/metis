@@ -232,7 +232,8 @@ def compute_signal_score(
     # Clip to valid range
     signal_score = max(-1.0, min(1.0, signal_score))
 
-    # Direction thresholds
+    # Direction thresholds - remove neutral fallback
+    # Use directional bias even when signal is weak, unless truly flat
     long_thresh = params["long_threshold"]
     short_thresh = params["short_threshold"]
 
@@ -241,7 +242,14 @@ def compute_signal_score(
     elif signal_score < short_thresh:
         direction = "short"
     else:
-        direction = "neutral"
+        # Remove neutral fallback: use weak direction based on signal sign
+        # Only use neutral if signal is truly flat (near zero)
+        if abs(signal_score) < 0.05:  # Truly flat signal
+            direction = "neutral"
+        elif signal_score > 0:
+            direction = "weak_long"
+        else:
+            direction = "weak_short"
 
     # Confidence based on absolute score and indicator count
     confidence = abs(signal_score)
@@ -269,7 +277,7 @@ def compute_signal_score(
             sharpe_ceiling = 1.00   # Excellent: no cap
         confidence = min(confidence, sharpe_ceiling)
 
-    # Regime detection
+    # Regime detection (more explicit and robust)
     trending_thresh = params["trending_threshold"]
 
     # Breakout: price outside Bollinger Bands (most reliable detection)
@@ -280,12 +288,27 @@ def compute_signal_score(
             raw_pct_b = (live_price - bb_lower) / bandwidth
             bb_breakout = raw_pct_b > 1.0 or raw_pct_b < 0.0
 
+    # Volatility expansion detection (high volatility regime)
+    vol_expansion = False
+    if volatility_annualized is not None:
+        vol_expansion = volatility_annualized > 0.5  # 50% annualized vol threshold
+
+    # RSI extreme detection (oversold/overbought regime)
+    rsi_extreme = False
+    if rsi_14 is not None:
+        rsi_extreme = rsi_14 < 30 or rsi_14 > 70
+
+    # Explicit regime classification
     if bb_breakout:
         regime = "breakout"
+    elif vol_expansion:
+        regime = "volatile"
+    elif rsi_extreme:
+        regime = "reversal"
     elif abs(signal_score) > trending_thresh:
         regime = "trending"
     else:
-        regime = "ranging"  # Default to ranging when no clear signal
+        regime = "ranging"
 
     return SignalOutput(
         direction=direction,

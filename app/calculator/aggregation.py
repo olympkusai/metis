@@ -17,6 +17,7 @@ INTERVAL_TO_MINUTES = {
     "8h": 480,
     "12h": 720,
     "1d": 1440,
+    "1D": 1440,  # Support uppercase
     "3d": 4320,
     "1w": 10080,
     "1M": 43200,  # 30 days

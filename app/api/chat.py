@@ -24,6 +24,7 @@ async def chat(request: ChatRequest):
 
     intermediate_steps = final_state.get("intermediate_steps_global", [])
     final_answer       = final_state.get("final_answer", "")
+    cot                 = final_state.get("cot", "")
 
     # Formatar processo de raciocínio
     reasoning_steps = [
@@ -48,6 +49,7 @@ async def chat(request: ChatRequest):
         "reasoning":   reasoning_steps,
         "tools_used":  [step[0] for step in intermediate_steps],
         "pipeline":    pipeline_meta,
+        "thought":     cot,
     }
 
 
@@ -81,8 +83,13 @@ async def streaming_chat(request: ChatRequest):
                     "node": node_name,
                     "type": "node_execution",
                     "timestamp": asyncio.get_event_loop().time(),
-                    "reasoning": ""
+                    "reasoning": "",
+                    "thought": ""
                 }
+                
+                # Extract CoT if available (chain-of-thought)
+                if "cot" in state_update and state_update["cot"]:
+                    step_data["thought"] = state_update["cot"]
                 
                 # Extract reasoning from messages if available
                 if "messages" in state_update:

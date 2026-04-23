@@ -57,10 +57,25 @@ from app.agent.schemas import (
     CVaROutput,
     MaxDrawdownOutput,
 )
+from app.agent.moe import MoESignalLayer
 from app.agent.quant_engine import (
     compute_signal_score,
     determine_risk_level,
     calculate_position_size,
+)
+from app.agent.trend_state import (
+    TrendStateMachine,
+    MultiTimeframeInterpreter,
+    TrendState,
+    TrendDirection,
+)
+from app.agent.decision_engine import (
+    DecisionEngine,
+    DecisionOutput,
+    MacroTrend,
+    ExecutionState,
+    FinalSignal,
+    SignalType,
 )
 from app.agent.portfolio import (
     PortfolioState,
@@ -92,13 +107,24 @@ class RiskLevel(str, Enum):
 
 class NextAction(str, Enum):
     MARKET_DATA    = "market_data"
-    FEATURES       = "features"
+    FEATURES_MACRO  = "features_macro"   # Daily features
+    FEATURES_SETUP  = "features_setup"   # 4H features
+    FEATURES_EXEC   = "features_exec"    # 1H features
+    TREND_INTERPRET = "trend_interpret"   # Multi-timeframe interpretation
+    DECISION_ENGINE = "decision_engine"   # Deterministic decision layer (FINAL authority)
     RISK           = "risk"
     SIGNAL         = "signal"
+    MOE            = "moe"
     RISK_GATE      = "risk_gate"
     EXECUTION      = "execution"
     FINALIZE       = "finalize"
     BLOCKED        = "blocked"
+
+# Multi-timeframe structure
+class TimeframeLayer(str, Enum):
+    MACRO = "daily"    # 1D - regime detection
+    SETUP = "4h"       # 4H - signal generation
+    EXECUTION = "1h"   # 1H - execution timing
 
 # ─────────────────────────────────────────────
 # 2. TYPED STATE  (Pydantic-backed)
@@ -141,10 +167,61 @@ class QuantAgentState(BaseModel):
     bb_middle:          float | None       = None
     bb_lower:           float | None       = None
 
-    # Signal context (populated by SignalAgent)
+    # Multi-timeframe indicators (separated by layer)
+    # Macro layer (1D) - regime detection
+    macro_rsi_14:       float | None       = None
+    macro_macd_line:    float | None       = None
+    macro_macd_signal:  float | None       = None
+    macro_bb_upper:     float | None       = None
+    macro_bb_lower:     float | None       = None
+    macro_bb_pct_b:     float | None       = None
+    macro_regime:       str | None         = None   # "trending" | "ranging" | "breakout" | "volatile" | "reversal"
+    macro_bias:         str | None         = None   # "bullish" | "bearish" | "neutral"
+    
+    # Trend state context (new hierarchical interpretation)
+    trend_state:        str | None         = None   # "trending" | "overextended" | "pullback" | "reversal" | "neutral"
+    trend_direction:    str | None         = None   # "bullish" | "bearish" | "neutral"
+    signal_type:        str | None         = None   # "trend_follow" | "pullback_entry" | "breakout" | "reversal" | "no_edge"
+    execution_timing:   str | None         = None   # "immediate" | "wait_for_pullback" | "wait_for_confirmation" | "wait"
+    
+    # Final decision (from Decision Engine - FINAL authority)
+    final_signal:       str | None         = None   # "long" | "short" | "conditional_long" | "conditional_short" | "wait" | "neutral"
+    final_signal_type:  str | None         = None   # "trend_follow" | "pullback_entry" | "breakout" | "reversal" | "no_edge"
+    final_confidence:   float | None       = None   # 0 to 1
+    final_reasoning:    str | None         = None   # Explanation of final decision
+
+    # Setup layer (4H) - signal generation
+    setup_rsi_14:       float | None       = None
+    setup_macd_line:    float | None       = None
+    setup_macd_signal:  float | None       = None
+    setup_bb_upper:     float | None       = None
+    setup_bb_lower:     float | None       = None
+    setup_bb_pct_b:     float | None       = None
+    setup_signal:       float | None       = None   # -1 to 1
+    setup_confidence:   float | None       = None   # 0..1
+    setup_direction:    str | None         = None   # "long" | "short" | "weak_long" | "weak_short"
+
+    # Execution layer (1H) - timing + risk
+    exec_rsi_14:        float | None       = None
+    exec_macd_line:     float | None       = None
+    exec_macd_signal:   float | None       = None
+    exec_sharpe:        float | None       = None
+    exec_volatility:    float | None       = None
+    exec_timing:        str | None         = None   # "entry" | "wait" | "exit"
+
+    # Signal context (legacy, will be phased out)
     regime:             str | None         = None   # "trending" | "ranging" | "breakout"
     signal_direction:   str | None         = None   # "long" | "short" | "neutral"
     signal_confidence:  float | None       = None   # 0..1
+
+    # MoE output (populated by MoE node)
+    moe_final_signal:       float | None   = None   # -1 to 1
+    moe_final_confidence:   float | None   = None   # 0 to 1
+    moe_selected_experts:   list[str]     = Field(default_factory=list)
+    moe_expert_weights:     dict[str, float] = Field(default_factory=dict)
+    moe_gating_reason:      str            = ""
+    moe_position_size:      float | None   = None   # 0 to 1 (fraction of capital)
+    moe_risk_adjusted_signal: float | None = None   # signal * position_size
 
     # Risk gate output
     gate_approved:      bool | None        = None
@@ -160,18 +237,36 @@ class QuantAgentState(BaseModel):
     # Tool call deduplication cache (per run) — keyed by '<name>|<sorted_args>'
     tool_cache:         dict[str, str]     = Field(default_factory=dict)
 
+    # Chain-of-thought (per node, for streaming)
+    cot:                str                = ""
+
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
 # ─────────────────────────────────────────────
-# 3. LLM INSTANCES  (per agent, tuned separately)
+# 3. NODE CONFIGURATION  (model + CoT per node)
+# ─────────────────────────────────────────────
+
+NODE_CONFIG = {
+    "orchestrator": {"model": "gpt-4o-mini", "cot": True},
+    "market_data": {"model": "gpt-4o-mini", "cot": True},
+    "feature_engineering": {"model": "gpt-4o-mini", "cot": True},
+    "risk_agent": {"model": "gpt-4o-mini", "cot": True},
+    "signal_agent": {"model": "gpt-4o", "cot": True},
+    "moe": {"model": "gpt-4o-mini", "cot": False},  # Deterministic, no LLM
+    "risk_gate": {"model": "gpt-4o", "cot": True},
+    "execution": {"model": "gpt-4o", "cot": True},
+}
+
+# ─────────────────────────────────────────────
+# 4. LLM INSTANCES  (per agent, tuned separately)
 # ─────────────────────────────────────────────
 
 _BASE_MODEL = "gpt-4o"
 
-def _make_llm(temperature: float = 0.1, **kw) -> ChatOpenAI:
+def _make_llm(model: str = _BASE_MODEL, temperature: float = 0.1, **kw) -> ChatOpenAI:
     settings = get_settings()
     return ChatOpenAI(
-        model=_BASE_MODEL,
+        model=model,
         temperature=temperature,
         api_key=settings.openai_api_key,
         **kw,
@@ -180,34 +275,52 @@ def _make_llm(temperature: float = 0.1, **kw) -> ChatOpenAI:
 tool_map = {t.name: t for t in all_tools}
 risk_tools = [t for t in all_tools if t.name == "calculate_risk"]
 
-@lru_cache(maxsize=1)
-def _get_llm_orchestrator():
-    return _make_llm(temperature=0.1).with_structured_output(OrchestratorOutput)
+def _extract_cot_and_answer(content: str) -> tuple[str, str]:
+    """
+    Extrai CoT e answer de uma resposta formatada como:
+    <thought>...</thought><answer>...</answer>
+    
+    Retorna (cot, answer). Se não encontrar formato, retorna ("", content).
+    """
+    import re
+    # Try to extract <thought>...</thought><answer>...</answer>
+    thought_match = re.search(r'<thought>(.*?)</thought>', content, re.DOTALL)
+    answer_match = re.search(r'<answer>(.*?)</answer>', content, re.DOTALL)
+    
+    if thought_match and answer_match:
+        cot = thought_match.group(1).strip()
+        answer = answer_match.group(1).strip()
+        return cot, answer
+    elif thought_match:
+        # Only thought found, assume rest is answer
+        cot = thought_match.group(1).strip()
+        answer = re.sub(r'<thought>.*?</thought>', '', content, flags=re.DOTALL).strip()
+        return cot, answer
+    else:
+        # No CoT format found
+        return "", content
 
-
-@lru_cache(maxsize=1)
-def _get_llm_market_data():
-    return _make_llm(temperature=0.0).bind_tools(all_tools)
-
-
-@lru_cache(maxsize=1)
-def _get_llm_features():
-    return _make_llm(temperature=0.0).bind_tools(all_tools, parallel_tool_calls=True)
-
-
-@lru_cache(maxsize=1)
-def _get_llm_risk():
-    return _make_llm(temperature=0.0).bind_tools(risk_tools)
-
-
-@lru_cache(maxsize=1)
-def _get_llm_signal():
-    return _make_llm(temperature=0.15).bind_tools(all_tools)
-
-
-@lru_cache(maxsize=1)
-def _get_llm_execution():
-    return _make_llm(temperature=0.0)  # no tools — pure reasoning
+def _get_llm_for_node(node_name: str):
+    """Retorna LLM configurado para o nó específico baseado no NODE_CONFIG."""
+    config = NODE_CONFIG.get(node_name, {"model": _BASE_MODEL, "cot": False})
+    model = config["model"]
+    
+    if node_name == "orchestrator":
+        return _make_llm(model=model, temperature=0.1).with_structured_output(OrchestratorOutput)
+    elif node_name == "market_data":
+        return _make_llm(model=model, temperature=0.0).bind_tools(all_tools)
+    elif node_name == "feature_engineering":
+        return _make_llm(model=model, temperature=0.0).bind_tools(all_tools, parallel_tool_calls=True)
+    elif node_name == "risk_agent":
+        return _make_llm(model=model, temperature=0.0).bind_tools(risk_tools)
+    elif node_name == "signal_agent":
+        return _make_llm(model=model, temperature=0.15).bind_tools(all_tools)
+    elif node_name == "risk_gate":
+        return _make_llm(model=model, temperature=0.0)  # no tools
+    elif node_name == "execution":
+        return _make_llm(model=model, temperature=0.0)  # no tools — pure reasoning
+    else:
+        return _make_llm(model=model, temperature=0.1)
 
 # ─────────────────────────────────────────────
 # 4. SYSTEM PROMPTS  (cada agente tem seu próprio)
@@ -411,8 +524,9 @@ async def _execute_tools(
         name = tc["name"]
         args = dict(tc.get("args") or {})
         # Enforce timeframe canônico
-        if force_interval and name in _INTERVAL_AWARE_TOOLS and "interval" in args:
-            if args.get("interval") != force_interval:
+        if force_interval and name in _INTERVAL_AWARE_TOOLS:
+            # Always enforce interval, even if LLM didn't provide it
+            if "interval" not in args or args.get("interval") != force_interval:
                 args["interval"] = force_interval
         # Dedup cache
         key = _cache_key(name, args)
@@ -452,12 +566,13 @@ async def _run_agent_loop(
     clear_steps: bool = False,
     force_interval: str | None = None,
     node_name: str = "unknown",
-) -> tuple[str, list[ToolMessage], list]:
+    enable_cot: bool = False,
+) -> tuple[str, str, list[ToolMessage], list]:
     """
     Loop LLM → tool call → result para um agente especializado.
     Usa APENAS a mensagem original do usuário — não o histórico acumulado
     de outros agentes (que pode conter tool_calls sem resposta).
-    Retorna (resposta_final, tool_messages_acumulados, steps_acumulados).
+    Retorna (resposta_final, cot, tool_messages_acumulados, steps_acumulados).
     Includes retry mechanism for LLM calls.
     """
     # Extrai apenas a mensagem original do usuário
@@ -465,7 +580,13 @@ async def _run_agent_loop(
 
     # Adiciona instrução explícita para chamar ferramentas
     tool_instruction = "\n\nIMPORTANTE: Você tem acesso a ferramentas. Você DEVE chamar as ferramentas apropriadas antes de fornecer sua análise final. Não responda sem chamar as ferramentas primeiro."
-    enhanced_prompt = system_prompt + tool_instruction
+    
+    # Adiciona instrução de CoT se habilitado
+    cot_instruction = ""
+    if enable_cot:
+        cot_instruction = "\n\nFORMATO DE RESPOSTA OBRIGATÓRIO:\n<thought>Resumo CONCISO do seu raciocínio (max 2-3 frases). Ex: 'Obtive o indicador X que está em Y, indicando Z.'</thought>\n<answer>Sua resposta final aqui</answer>"
+    
+    enhanced_prompt = system_prompt + tool_instruction + cot_instruction
 
     msgs: list = [SystemMessage(content=enhanced_prompt)]
     if original_query:
@@ -504,7 +625,7 @@ async def _run_agent_loop(
                 if attempt == MAX_RETRIES - 1:
                     # Fallback: return error message
                     error_msg = f"[LLM ERROR after {MAX_RETRIES} retries]: {str(e)}"
-                    return error_msg, all_tool_msgs, steps
+                    return error_msg, "", all_tool_msgs, steps
                 # Exponential backoff: 0.5s, 1s, 2s (não-bloqueante)
                 backoff_time = 0.5 * (2 ** attempt)
                 await asyncio.sleep(backoff_time)
@@ -512,7 +633,7 @@ async def _run_agent_loop(
         
         if response is None:
             error_msg = "[LLM ERROR] Failed to get response after retries"
-            return error_msg, all_tool_msgs, steps
+            return error_msg, "", all_tool_msgs, steps
             
         msgs.append(response)
         
@@ -537,11 +658,13 @@ async def _run_agent_loop(
                 content = json.dumps(response, ensure_ascii=False, indent=2)
             else:
                 content = str(response)
-            return content, all_tool_msgs, steps
+            cot, answer = _extract_cot_and_answer(content) if enable_cot else ("", content)
+            return answer, cot, all_tool_msgs, steps
         else:
             # Regular AIMessage without tool calls
             print(f"[DEBUG] No tool calls found, returning content directly")
-            return response.content, all_tool_msgs, steps
+            cot, answer = _extract_cot_and_answer(response.content) if enable_cot else ("", response.content)
+            return answer, cot, all_tool_msgs, steps
         
         # Detect no-progress loops
         if len(steps) == previous_step_count:
@@ -549,14 +672,15 @@ async def _run_agent_loop(
             if no_progress_count >= 2:
                 # No progress for 2 iterations - abort early
                 error_msg = "[AGENT LOOP] No progress detected - aborting to prevent infinite loop"
-                return error_msg, all_tool_msgs, steps
+                return error_msg, "", all_tool_msgs, steps
         else:
             no_progress_count = 0
             previous_step_count = len(steps)
 
     # Força finalização se exceder iterações
     final = await llm.ainvoke(msgs + [HumanMessage(content="Sintetize os resultados obtidos até agora.")])
-    return final.content, all_tool_msgs, steps
+    cot, answer = _extract_cot_and_answer(final.content) if enable_cot else ("", final.content)
+    return answer, cot, all_tool_msgs, steps
 
 # ─────────────────────────────────────────────
 # 6. AGENT NODES
@@ -573,7 +697,8 @@ async def orchestrator_node(state: QuantAgentState) -> dict:
     print(f"[DEBUG] Input state messages: {len(state.messages)} messages")
     msgs  = [SystemMessage(content=_ORCHESTRATOR_SYSTEM)] + state.messages
     try:
-        resp = await _get_llm_orchestrator().ainvoke(msgs)
+        llm = _get_llm_for_node("orchestrator")
+        resp = await llm.ainvoke(msgs)
         print(f"[DEBUG] Orchestrator response type: {type(resp).__name__}")
         print(f"[DEBUG] Orchestrator response: {resp}")
         # resp is now a structured OrchestratorOutput object
@@ -595,6 +720,7 @@ async def orchestrator_node(state: QuantAgentState) -> dict:
         "timeframe":    timeframe,
         "intermediate_steps_global": state.intermediate_steps_global + [("orchestrator", f"symbol={symbol}, timeframe={timeframe}")],
         "intermediate_steps_agent": [],
+        "cot":          "",
     }
 
 # Derive canonical interval from analysis timeframe (single source of truth)
@@ -604,9 +730,20 @@ _TIMEFRAME_INTERVAL = {
     AnalysisTimeframe.WEEKLY: "1D",
 }
 
+# Multi-timeframe mapping for swing trade (1D + 4H + 1H)
+_MULTI_TF_INTERVALS = {
+    TimeframeLayer.MACRO: "1D",      # Daily for regime detection
+    TimeframeLayer.SETUP: "4h",     # 4H for signal generation
+    TimeframeLayer.EXECUTION: "1h",  # 1H for execution timing
+}
+
 def _get_analysis_interval(timeframe: AnalysisTimeframe) -> str:
     """Returns the canonical data interval for a given analysis timeframe."""
     return _TIMEFRAME_INTERVAL.get(timeframe, "1h")
+
+def _get_multi_tf_interval(layer: TimeframeLayer) -> str:
+    """Returns the interval for a given multi-timeframe layer."""
+    return _MULTI_TF_INTERVALS.get(layer, "1h")
 
 @timed_async("Node: MarketData")
 async def market_data_node(state: QuantAgentState) -> dict:
@@ -618,9 +755,10 @@ async def market_data_node(state: QuantAgentState) -> dict:
         f"INTERVALO OBRIGATÓRIO: interval=\"{analysis_interval}\" — use ESTE intervalo em TODAS as ferramentas"
     )
     print(f"[DEBUG] Context: {context}")
-    content, tool_msgs, steps = await _run_agent_loop(
-        state, _get_llm_market_data(), _MARKET_DATA_SYSTEM, context,
-        force_interval=analysis_interval, node_name="MarketData"
+    node_config = NODE_CONFIG["market_data"]
+    content, cot, tool_msgs, steps = await _run_agent_loop(
+        state, _get_llm_for_node("market_data"), _MARKET_DATA_SYSTEM, context,
+        force_interval=analysis_interval, node_name="MarketData", enable_cot=node_config["cot"]
     )
     print(f"[DEBUG] Market data - steps: {len(steps)}, tool_msgs: {len(tool_msgs)}")
     print(f"[DEBUG] Market data content preview: {content[:200] if content else 'None'}")
@@ -667,12 +805,26 @@ async def market_data_node(state: QuantAgentState) -> dict:
         # If structured parsing fails, continue without anomalies
         pass
 
+    # Data consistency check: detect conflicting values from cache vs fresh calculation
+    # This prevents the RSI inconsistency issue (22.49 vs 48.91)
+    data_anomalies = []
+    if state.rsi_14 is not None:
+        # Check if RSI is in valid range
+        if state.rsi_14 < 0 or state.rsi_14 > 100:
+            data_anomalies.append(f"RSI value {state.rsi_14} out of valid range [0, 100]")
+            live_price = None  # Force recalculation on next run
+            price_change_pct = None
+
+    if data_anomalies:
+        anomalies.extend(data_anomalies)
+        print(f"[DEBUG] Data consistency anomalies detected: {data_anomalies}")
+
     print(f"[DEBUG] Market data output - live_price: {live_price}, volume_24h: {volume_24h}, price_change_pct: {price_change_pct}")
     print(f"[DEBUG] ===== MARKET DATA NODE END =====")
     return {
         **state.model_dump(),
         "messages":          state.messages + [AIMessage(content=content)],
-        "next_action":       NextAction.FEATURES,
+        "next_action":       NextAction.FEATURES_MACRO,  # Route to multi-timeframe structure
         "intermediate_steps_global": state.intermediate_steps_global + steps,
         "intermediate_steps_agent": steps,
         "anomalies_detected": anomalies,
@@ -681,7 +833,358 @@ async def market_data_node(state: QuantAgentState) -> dict:
         "price_change_pct":  price_change_pct,
         "recent_high":       recent_high,
         "recent_low":        recent_low,
+        "cot":               cot,
     }
+
+@timed_async("Node: FeatureEngineering-Macro")
+async def features_macro_node(state: QuantAgentState) -> dict:
+    """
+    Multi-timeframe: Macro layer (1D) - regime detection.
+    Defines market regime and directional bias.
+    """
+    print(f"[DEBUG] ===== FEATURES MACRO NODE START (1D) =====")
+    print(f"[DEBUG] Input symbol: {state.symbol}")
+    
+    # Use daily interval for regime detection
+    macro_interval = _get_multi_tf_interval(TimeframeLayer.MACRO)
+    context = (
+        f"Symbol: {state.symbol} | "
+        f"INTERVALO OBRIGATÓRIO: interval=\"{macro_interval}\" — Daily timeframe for regime detection"
+    )
+    print(f"[DEBUG] Context: {context}")
+    
+    node_config = NODE_CONFIG["feature_engineering"]
+    content, cot, tool_msgs, steps = await _run_agent_loop(
+        state, _get_llm_for_node("feature_engineering"), _FEATURE_SYSTEM, context,
+        force_interval=macro_interval, node_name="FeatureEngineering-Macro", enable_cot=node_config["cot"]
+    )
+    
+    # Parse macro features
+    macro_rsi_14 = state.macro_rsi_14
+    macro_macd_line = state.macro_macd_line
+    macro_macd_signal = state.macro_macd_signal
+    macro_bb_upper = state.macro_bb_upper
+    macro_bb_lower = state.macro_bb_lower
+    macro_bb_pct_b = state.macro_bb_pct_b
+    macro_regime = state.macro_regime
+    
+    for tool_name, result in steps:
+        try:
+            if "error" in result:
+                continue
+            if tool_name == "get_feature_rsi":
+                parsed = RSIOutput.model_validate_json(result)
+                macro_rsi_14 = parsed.rsi_14
+                macro_regime = parsed.regime
+            elif tool_name == "get_feature_macd":
+                parsed = MACDOutput.model_validate_json(result)
+                macro_macd_line = parsed.macd_line
+                macro_macd_signal = parsed.signal
+            elif tool_name == "get_feature_bollinger":
+                parsed = BollingerBandsOutput.model_validate_json(result)
+                macro_bb_upper = parsed.upper
+                macro_bb_lower = parsed.lower
+                # Calculate %B
+                if parsed.upper and parsed.lower and state.live_price:
+                    bandwidth = parsed.upper - parsed.lower
+                    if abs(bandwidth) > 1e-8:
+                        macro_bb_pct_b = (state.live_price - parsed.lower) / bandwidth
+                        macro_bb_pct_b = max(0.0, min(1.0, macro_bb_pct_b))
+        except Exception:
+            continue
+    
+    # Calculate macro bias based on regime
+    if macro_regime == "overbought":
+        macro_bias = "bullish_stretched"
+    elif macro_regime == "oversold":
+        macro_bias = "bearish_stretched"
+    elif macro_regime == "neutral":
+        macro_bias = "neutral"
+    else:
+        macro_bias = None
+    
+    print(f"[DEBUG] Macro features - rsi: {macro_rsi_14}, macd: {macro_macd_line}, regime: {macro_regime}, bias: {macro_bias}")
+    print(f"[DEBUG] ===== FEATURES MACRO NODE END =====")
+    
+    return {
+        **state.model_dump(),
+        "messages": state.messages + [AIMessage(content=content)],
+        "next_action": NextAction.FEATURES_SETUP,
+        "intermediate_steps_global": state.intermediate_steps_global + steps,
+        "intermediate_steps_agent": steps,
+        "macro_rsi_14": macro_rsi_14,
+        "macro_macd_line": macro_macd_line,
+        "macro_macd_signal": macro_macd_signal,
+        "macro_bb_upper": macro_bb_upper,
+        "macro_bb_lower": macro_bb_lower,
+        "macro_bb_pct_b": macro_bb_pct_b,
+        "macro_regime": macro_regime,
+        "macro_bias": macro_bias,
+        "cot": cot,
+    }
+
+
+@timed_async("Node: FeatureEngineering-Setup")
+async def features_setup_node(state: QuantAgentState) -> dict:
+    """
+    Multi-timeframe: Setup layer (4H) - signal generation.
+    Identifies concrete trading opportunities.
+    """
+    print(f"[DEBUG] ===== FEATURES SETUP NODE START (4H) =====")
+    print(f"[DEBUG] Input symbol: {state.symbol}")
+    
+    # Use 4H interval for signal generation
+    setup_interval = _get_multi_tf_interval(TimeframeLayer.SETUP)
+    context = (
+        f"Symbol: {state.symbol} | "
+        f"INTERVALO OBRIGATÓRIO: interval=\"{setup_interval}\" — 4H timeframe for signal generation"
+    )
+    print(f"[DEBUG] Context: {context}")
+    
+    node_config = NODE_CONFIG["feature_engineering"]
+    content, cot, tool_msgs, steps = await _run_agent_loop(
+        state, _get_llm_for_node("feature_engineering"), _FEATURE_SYSTEM, context,
+        force_interval=setup_interval, node_name="FeatureEngineering-Setup", enable_cot=node_config["cot"]
+    )
+    
+    # Parse setup features
+    setup_rsi_14 = state.setup_rsi_14
+    setup_macd_line = state.setup_macd_line
+    setup_macd_signal = state.setup_macd_signal
+    setup_bb_upper = state.setup_bb_upper
+    setup_bb_lower = state.setup_bb_lower
+    setup_bb_pct_b = state.setup_bb_pct_b
+    
+    for tool_name, result in steps:
+        try:
+            if "error" in result:
+                continue
+            if tool_name == "get_feature_rsi":
+                parsed = RSIOutput.model_validate_json(result)
+                setup_rsi_14 = parsed.rsi_14
+            elif tool_name == "get_feature_macd":
+                parsed = MACDOutput.model_validate_json(result)
+                setup_macd_line = parsed.macd_line
+                setup_macd_signal = parsed.signal
+            elif tool_name == "get_feature_bollinger":
+                parsed = BollingerBandsOutput.model_validate_json(result)
+                setup_bb_upper = parsed.upper
+                setup_bb_lower = parsed.lower
+                # Calculate %B
+                if parsed.upper and parsed.lower and state.live_price:
+                    bandwidth = parsed.upper - parsed.lower
+                    if abs(bandwidth) > 1e-8:
+                        setup_bb_pct_b = (state.live_price - parsed.lower) / bandwidth
+                        setup_bb_pct_b = max(0.0, min(1.0, setup_bb_pct_b))
+        except Exception:
+            continue
+    
+    print(f"[DEBUG] Setup features - rsi: {setup_rsi_14}, macd: {setup_macd_line}")
+    print(f"[DEBUG] ===== FEATURES SETUP NODE END =====")
+    
+    return {
+        **state.model_dump(),
+        "messages": state.messages + [AIMessage(content=content)],
+        "next_action": NextAction.FEATURES_EXEC,
+        "intermediate_steps_global": state.intermediate_steps_global + steps,
+        "intermediate_steps_agent": steps,
+        "setup_rsi_14": setup_rsi_14,
+        "setup_macd_line": setup_macd_line,
+        "setup_macd_signal": setup_macd_signal,
+        "setup_bb_upper": setup_bb_upper,
+        "setup_bb_lower": setup_bb_lower,
+        "setup_bb_pct_b": setup_bb_pct_b,
+        "cot": cot,
+    }
+
+
+@timed_async("Node: FeatureEngineering-Exec")
+async def features_exec_node(state: QuantAgentState) -> dict:
+    """
+    Multi-timeframe: Execution layer (1H) - timing + risk.
+    Provides execution timing and risk metrics.
+    """
+    print(f"[DEBUG] ===== FEATURES EXEC NODE START (1H) =====")
+    print(f"[DEBUG] Input symbol: {state.symbol}")
+    
+    # Use 1H interval for execution timing
+    exec_interval = _get_multi_tf_interval(TimeframeLayer.EXECUTION)
+    context = (
+        f"Symbol: {state.symbol} | "
+        f"INTERVALO OBRIGATÓRIO: interval=\"{exec_interval}\" — 1H timeframe for execution timing"
+    )
+    print(f"[DEBUG] Context: {context}")
+    
+    node_config = NODE_CONFIG["feature_engineering"]
+    content, cot, tool_msgs, steps = await _run_agent_loop(
+        state, _get_llm_for_node("feature_engineering"), _FEATURE_SYSTEM, context,
+        force_interval=exec_interval, node_name="FeatureEngineering-Exec", enable_cot=node_config["cot"]
+    )
+    
+    # Parse execution features
+    exec_rsi_14 = state.exec_rsi_14
+    exec_macd_line = state.exec_macd_line
+    exec_macd_signal = state.exec_macd_signal
+    
+    for tool_name, result in steps:
+        try:
+            if "error" in result:
+                continue
+            if tool_name == "get_feature_rsi":
+                parsed = RSIOutput.model_validate_json(result)
+                exec_rsi_14 = parsed.rsi_14
+            elif tool_name == "get_feature_macd":
+                parsed = MACDOutput.model_validate_json(result)
+                exec_macd_line = parsed.macd_line
+                exec_macd_signal = parsed.signal
+        except Exception:
+            continue
+    
+    print(f"[DEBUG] Exec features - rsi: {exec_rsi_14}")
+    print(f"[DEBUG] ===== FEATURES EXEC NODE END =====")
+    
+    return {
+        **state.model_dump(),
+        "messages": state.messages + [AIMessage(content=content)],
+        "next_action": NextAction.TREND_INTERPRET,  # Route to multi-timeframe interpretation
+        "intermediate_steps_global": state.intermediate_steps_global + steps,
+        "intermediate_steps_agent": steps,
+        "exec_rsi_14": exec_rsi_14,
+        "exec_macd_line": exec_macd_line,
+        "exec_macd_signal": exec_macd_signal,
+        "cot": cot,
+    }
+
+
+@timed_async("Node: TrendInterpretation")
+async def trend_interpret_node(state: QuantAgentState) -> dict:
+    """
+    Multi-timeframe interpretation node.
+    Applies hierarchical rules to combine macro, setup, and execution layers.
+    """
+    print(f"[DEBUG] ===== TREND INTERPRETATION NODE START =====")
+    print(f"[DEBUG] Input symbol: {state.symbol}")
+    
+    # Initialize interpreter
+    interpreter = MultiTimeframeInterpreter()
+    
+    # Determine MACD bullish status for each timeframe
+    macro_macd_bullish = state.macro_macd_line is not None and state.macro_macd_signal is not None and state.macro_macd_line > state.macro_macd_signal
+    setup_macd_bullish = state.setup_macd_line is not None and state.setup_macd_signal is not None and state.setup_macd_line > state.setup_macd_signal
+    exec_macd_bullish = state.exec_macd_line is not None and state.exec_macd_signal is not None and state.exec_macd_line > state.exec_macd_signal
+    
+    # Run multi-timeframe interpretation
+    interpretation = interpreter.interpret_multi_tf_signal(
+        # Macro (1D) - regime detection
+        macro_rsi=state.macro_rsi_14,
+        macro_macd_bullish=macro_macd_bullish,
+        macro_bb_pct_b=state.macro_bb_pct_b,
+        macro_regime=state.macro_regime,
+        # Setup (4H) - signal generation
+        setup_rsi=state.setup_rsi_14,
+        setup_macd_bullish=setup_macd_bullish,
+        setup_bb_pct_b=state.setup_bb_pct_b,
+        # Execution (1H) - timing
+        exec_rsi=state.exec_rsi_14,
+        exec_macd_bullish=exec_macd_bullish,
+        # Additional context
+        volatility_annualized=state.volatility_annualized,
+        price_change_pct=state.price_change_pct,
+    )
+    
+    print(f"[DEBUG] Trend interpretation - signal_direction: {interpretation['signal_direction']}")
+    print(f"[DEBUG] Trend interpretation - signal_type: {interpretation['signal_type']}")
+    print(f"[DEBUG] Trend interpretation - trend_state: {interpretation['trend_state']}")
+    print(f"[DEBUG] Trend interpretation - confidence: {interpretation['confidence']}")
+    print(f"[DEBUG] Trend interpretation - reasoning: {interpretation['reasoning']}")
+    print(f"[DEBUG] ===== TREND INTERPRETATION NODE END =====")
+    
+    return {
+        **state.model_dump(),
+        "messages": state.messages + [AIMessage(content=interpretation['reasoning'])],
+        "next_action": NextAction.DECISION_ENGINE,  # Route to decision engine (FINAL authority)
+        "intermediate_steps_global": state.intermediate_steps_global + [("trend_interpret", interpretation['reasoning'])],
+        "trend_state": interpretation['trend_state'],
+        "trend_direction": interpretation['signal_direction'],
+        "signal_type": interpretation['signal_type'],
+        "execution_timing": interpretation['execution_timing'],
+        "signal_direction": interpretation['signal_direction'],  # Legacy field for compatibility
+        "signal_confidence": interpretation['confidence'],  # Legacy field for compatibility
+        "cot": interpretation['reasoning'],
+    }
+
+
+@timed_async("Node: DecisionEngine")
+async def decision_engine_node(state: QuantAgentState) -> dict:
+    """
+    Decision Engine - Deterministic multi-timeframe decision layer.
+    This node has FINAL authority over MoE output.
+    """
+    print(f"[DEBUG] ===== DECISION ENGINE NODE START =====")
+    print(f"[DEBUG] Input symbol: {state.symbol}")
+    
+    # Initialize decision engine
+    engine = DecisionEngine()
+    
+    # Determine macro trend from 1D data
+    if state.macro_bias == "bullish_stretched":
+        macro_trend = MacroTrend.BULLISH
+    elif state.macro_bias == "bearish_stretched":
+        macro_trend = MacroTrend.BEARISH
+    else:
+        macro_trend = MacroTrend.NEUTRAL
+    
+    # Determine setup MACD bullish status
+    setup_macd_bullish = (
+        state.setup_macd_line is not None and 
+        state.setup_macd_signal is not None and 
+        state.setup_macd_line > state.setup_macd_signal
+    )
+    
+    # Determine execution MACD bullish status
+    exec_macd_bullish = (
+        state.exec_macd_line is not None and 
+        state.exec_macd_signal is not None and 
+        state.exec_macd_line > state.exec_macd_signal
+    )
+    
+    # Run decision engine with hierarchical rules
+    decision = engine.decide(
+        macro_trend=macro_trend,
+        macro_rsi=state.macro_rsi_14,
+        macro_bb_pct_b=state.macro_bb_pct_b,
+        setup_rsi=state.setup_rsi_14,
+        setup_macd_bullish=setup_macd_bullish,
+        exec_rsi=state.exec_rsi_14,
+        exec_macd_bullish=exec_macd_bullish,
+        volatility_annualized=state.volatility_annualized,
+        price_change_pct=state.price_change_pct,
+        moe_signal=state.moe_final_signal,  # MoE as auxiliary input
+        moe_confidence=state.moe_final_confidence,
+    )
+    
+    print(f"[DEBUG] Decision Engine - final_signal: {decision.signal.value}")
+    print(f"[DEBUG] Decision Engine - signal_type: {decision.signal_type.value}")
+    print(f"[DEBUG] Decision Engine - confidence: {decision.confidence}")
+    print(f"[DEBUG] Decision Engine - reasoning: {decision.reasoning}")
+    print(f"[DEBUG] Decision Engine - execution_timing: {decision.execution_timing}")
+    print(f"[DEBUG] ===== DECISION ENGINE NODE END =====")
+    
+    return {
+        **state.model_dump(),
+        "messages": state.messages + [AIMessage(content=decision.reasoning)],
+        "next_action": NextAction.RISK,  # Route to risk after decision
+        "intermediate_steps_global": state.intermediate_steps_global + [("decision_engine", decision.reasoning)],
+        "final_signal": decision.signal.value,
+        "final_signal_type": decision.signal_type.value,
+        "final_confidence": decision.confidence,
+        "final_reasoning": decision.reasoning,
+        # Override legacy fields with final decision
+        "signal_direction": decision.signal.value,
+        "signal_confidence": decision.confidence,
+        "cot": decision.reasoning,
+    }
+
 
 @timed_async("Node: FeatureEngineering")
 async def feature_engineering_node(state: QuantAgentState) -> dict:
@@ -695,9 +1198,10 @@ async def feature_engineering_node(state: QuantAgentState) -> dict:
         f"Anomalias: {state.anomalies_detected}"
     )
     print(f"[DEBUG] Context: {context}")
-    content, tool_msgs, steps = await _run_agent_loop(
-        state, _get_llm_features(), _FEATURE_SYSTEM, context,
-        force_interval=analysis_interval, node_name="FeatureEngineering"
+    node_config = NODE_CONFIG["feature_engineering"]
+    content, cot, tool_msgs, steps = await _run_agent_loop(
+        state, _get_llm_for_node("feature_engineering"), _FEATURE_SYSTEM, context,
+        force_interval=analysis_interval, node_name="FeatureEngineering", enable_cot=node_config["cot"]
     )
     print(f"[DEBUG] Feature engineering - steps: {len(steps)}, tool_msgs: {len(tool_msgs)}")
 
@@ -711,6 +1215,9 @@ async def feature_engineering_node(state: QuantAgentState) -> dict:
     bb_middle = state.bb_middle
     bb_lower = state.bb_lower
 
+    # Track intervals used for consistency check
+    feature_intervals = {}
+
     for tool_name, result in steps:
         print(f"[DEBUG] Processing feature tool: {tool_name}, result preview: {result[:100] if result else 'None'}")
         try:
@@ -719,19 +1226,32 @@ async def feature_engineering_node(state: QuantAgentState) -> dict:
             if tool_name == "get_feature_rsi":
                 parsed = RSIOutput.model_validate_json(result)
                 rsi_14 = parsed.rsi_14
+                feature_intervals["rsi"] = parsed.interval
             elif tool_name == "get_feature_macd":
                 parsed = MACDOutput.model_validate_json(result)
                 macd_line = parsed.macd_line
                 macd_signal = parsed.signal
                 macd_histogram = parsed.histogram
+                feature_intervals["macd"] = parsed.interval
             elif tool_name == "get_feature_bollinger":
                 parsed = BollingerBandsOutput.model_validate_json(result)
                 bb_upper = parsed.upper
                 bb_middle = parsed.middle
                 bb_lower = parsed.lower
+                feature_intervals["bollinger"] = parsed.interval
         except (json.JSONDecodeError, KeyError, TypeError, Exception):
             # Strict parsing: ignore invalid data (institutional rule)
             continue
+
+    # Timeframe consistency check
+    if feature_intervals:
+        unique_intervals = set(feature_intervals.values())
+        if len(unique_intervals) > 1:
+            print(f"[DEBUG] WARNING: Inconsistent intervals detected: {feature_intervals}")
+            # Force recalculation on next run by clearing state
+            rsi_14 = None
+            macd_line = None
+            bb_upper = None
 
     print(f"[DEBUG] Feature output - rsi: {rsi_14}, macd: {macd_line}, bb_upper: {bb_upper}")
     print(f"[DEBUG] ===== FEATURE ENGINEERING NODE END =====")
@@ -748,25 +1268,32 @@ async def feature_engineering_node(state: QuantAgentState) -> dict:
         "bb_upper":           bb_upper,
         "bb_middle":          bb_middle,
         "bb_lower":           bb_lower,
+        "cot":                cot,
     }
 
 @timed_async("Node: RiskAgent")
 async def risk_agent_node(state: QuantAgentState) -> dict:
+    """
+    Risk agent: calculates risk metrics (CVaR, Sharpe, drawdown, volatility).
+    Uses execution layer (1H) for risk metrics - multi-timeframe consistency.
+    """
     print(f"[DEBUG] ===== RISK AGENT NODE START =====")
-    print(f"[DEBUG] Input symbol: {state.symbol}, live_price: {state.live_price}")
-    # Passa contexto dos dados já coletados, mas limpa histórico de tool calls
-    analysis_interval = _get_analysis_interval(state.timeframe)
+    print(f"[DEBUG] Input symbol: {state.symbol}")
+    
+    # Use 1H interval for risk metrics (execution layer)
+    exec_interval = _get_multi_tf_interval(TimeframeLayer.EXECUTION)
     context = (
         f"Symbol: {state.symbol} | Preço: {state.live_price} | "
-        f"INTERVALO OBRIGATÓRIO: interval=\"{analysis_interval}\" — use ESTE intervalo em TODAS as ferramentas | "
+        f"INTERVALO OBRIGATÓRIO: interval=\"{exec_interval}\" — 1H timeframe for risk metrics (execution layer) | "
         f"Vol 24h: {state.volume_24h} | Variação: {state.price_change_pct}%\n"
-        f"DADOS JÁ COLETADOS: RSI={state.rsi_14}, MACD={state.macd_line}, BB={state.bb_upper}\n"
+        f"DADOS JÁ COLETADOS: RSI={state.exec_rsi_14}\n"
         f"SUA TAREFA: Calcular métricas de risco usando as ferramentas disponíveis."
     )
     print(f"[DEBUG] Context: {context}")
-    content, tool_msgs, steps = await _run_agent_loop(
-        state, _get_llm_risk(), _RISK_SYSTEM, context, clear_steps=True,
-        force_interval=analysis_interval, node_name="RiskAgent"
+    node_config = NODE_CONFIG["risk_agent"]
+    content, cot, tool_msgs, steps = await _run_agent_loop(
+        state, _get_llm_for_node("risk_agent"), _RISK_SYSTEM, context, clear_steps=True,
+        force_interval=exec_interval, node_name="RiskAgent", enable_cot=node_config["cot"]
     )
     print(f"[DEBUG] Risk agent - steps: {len(steps)}, tool_msgs: {len(tool_msgs)}")
 
@@ -779,6 +1306,9 @@ async def risk_agent_node(state: QuantAgentState) -> dict:
     volatility_annualized = state.volatility_annualized
     volatility_raw = None
     volatility_interval = None
+
+    # Track risk interval for consistency check
+    risk_interval = None
 
     for tool_name, result in steps:
         print(f"[DEBUG] Processing risk tool: {tool_name}, result preview: {result[:100] if result else 'None'}")
@@ -793,31 +1323,50 @@ async def risk_agent_node(state: QuantAgentState) -> dict:
                 max_drawdown = parsed.max_drawdown
                 volatility_raw = parsed.volatility_20d if parsed.volatility_20d is not None else parsed.volatility_21
                 volatility_interval = parsed.interval
-                print(f"[DEBUG] Parsed calculate_risk: cvar={cvar_95}, sharpe={sharpe}, drawdown={max_drawdown}")
+                risk_interval = parsed.interval
+                print(f"[DEBUG] Parsed calculate_risk: cvar={cvar_95}, sharpe={sharpe}, drawdown={max_drawdown}, interval={risk_interval}")
             elif tool_name == "get_feature_cvar":
                 parsed = CVaROutput.model_validate_json(result)
                 cvar_95 = parsed.cvar_95
-                print(f"[DEBUG] Parsed get_feature_cvar: cvar={cvar_95}")
+                risk_interval = parsed.interval
+                print(f"[DEBUG] Parsed get_feature_cvar: cvar={cvar_95}, interval={risk_interval}")
             elif tool_name == "get_feature_sharpe":
                 parsed = SharpeOutput.model_validate_json(result)
                 sharpe = parsed.sharpe
-                print(f"[DEBUG] Parsed get_feature_sharpe: sharpe={sharpe}")
+                risk_interval = parsed.interval
+                print(f"[DEBUG] Parsed get_feature_sharpe: sharpe={sharpe}, interval={risk_interval}")
             elif tool_name == "get_feature_max_drawdown":
                 parsed = MaxDrawdownOutput.model_validate_json(result)
                 max_drawdown = parsed.max_drawdown
-                print(f"[DEBUG] Parsed get_feature_max_drawdown: drawdown={max_drawdown}")
+                risk_interval = parsed.interval
+                print(f"[DEBUG] Parsed get_feature_max_drawdown: drawdown={max_drawdown}, interval={risk_interval}")
             elif tool_name == "get_feature_volatility":
                 parsed = VolatilityOutput.model_validate_json(result)
                 volatility_raw = parsed.volatility_raw
                 volatility_annualized = parsed.volatility_annualized
                 volatility_interval = parsed.data_interval
-                print(f"[DEBUG] Parsed get_feature_volatility: vol_raw={volatility_raw}, vol_ann={volatility_annualized}")
+                risk_interval = parsed.data_interval
+                print(f"[DEBUG] Parsed get_feature_volatility: vol_raw={volatility_raw}, vol_ann={volatility_annualized}, interval={risk_interval}")
         except (json.JSONDecodeError, KeyError, TypeError, Exception) as e:
             # Strict parsing: ignore invalid data (institutional rule)
             print(f"[DEBUG] Exception parsing {tool_name}: {type(e).__name__}: {e}")
             continue
 
+    # Timeframe consistency check: risk metrics must match execution layer (1H)
+    expected_interval = _get_multi_tf_interval(TimeframeLayer.EXECUTION)
+    if risk_interval and risk_interval != expected_interval:
+        print(f"[DEBUG] WARNING: Risk interval {risk_interval} != expected {expected_interval}")
+        print(f"[DEBUG] Clearing risk metrics to force recalculation with correct interval")
+        cvar_95 = None
+        sharpe = None
+        max_drawdown = None
+        volatility_annualized = None
+
     print(f"[DEBUG] Risk metrics before calculation - cvar: {cvar_95}, sharpe: {sharpe}, drawdown: {max_drawdown}, vol: {volatility_annualized}")
+
+    # Store execution layer metrics separately for multi-timeframe consistency
+    exec_sharpe = sharpe
+    exec_volatility = volatility_annualized
 
     # ─── SANITY AUDIT — proteção contra valores implausíveis do backend ───
     risk_audit_anomalies: list[str] = []
@@ -900,14 +1449,12 @@ async def risk_agent_node(state: QuantAgentState) -> dict:
         elif volatility_interval in ["1D", "1w", "1W"]:
             volatility_annualized = volatility_raw * math.sqrt(52)
         else:
-            volatility_annualized = volatility_raw
-
+            print(f"[DEBUG] Risk agent output - risk_level: {risk_level}")
     print(f"[DEBUG] ===== RISK AGENT NODE END =====")
     return {
         **state.model_dump(),
         "messages":           state.messages + [AIMessage(content=content)],
         "next_action":        NextAction.SIGNAL,
-        "risk_level":         risk_level,
         "intermediate_steps_global": state.intermediate_steps_global + steps,
         "intermediate_steps_agent": steps,
         "var_95":             var_95,
@@ -915,22 +1462,32 @@ async def risk_agent_node(state: QuantAgentState) -> dict:
         "sharpe":             sharpe,
         "max_drawdown":       max_drawdown,
         "volatility_annualized": volatility_annualized,
+        "risk_level":         risk_level,
+        "exec_sharpe":        exec_sharpe,      # Execution layer (1H) sharpe
+        "exec_volatility":    exec_volatility,  # Execution layer (1H) volatility
         "anomalies_detected": state.anomalies_detected + risk_audit_anomalies,
+        "cot":                cot,
     }
 
 @timed_async("Node: SignalAgent")
 async def signal_agent_node(state: QuantAgentState) -> dict:
     print(f"[DEBUG] ===== SIGNAL AGENT NODE START =====")
-    print(f"[DEBUG] Input symbol: {state.symbol}, risk_level: {state.risk_level}")
+    print(f"[DEBUG] Input symbol: {state.symbol}")
+    
+    # Use 4H interval for signal generation (setup layer)
+    setup_interval = _get_multi_tf_interval(TimeframeLayer.SETUP)
     context = (
-        f"Symbol: {state.symbol} | Risk level: {state.risk_level} | "
-        f"Sharpe: {state.sharpe} | Drawdown: {state.max_drawdown} | "
-        f"CVaR 95%: {state.cvar_95}"
+        f"Symbol: {state.symbol} | "
+        f"INTERVALO OBRIGATÓRIO: interval=\"{setup_interval}\" — 4H timeframe for signal generation (setup layer) | "
+        f"REGIME MACRO (1D): {state.macro_regime} | BIAS: {state.macro_bias}\n"
+        f"SETUP DATA (4H): RSI={state.setup_rsi_14}, MACD={state.setup_macd_line}\n"
+        f"SUA TAREFA: Gerar sinal de trading usando dados do timeframe 4H, respeitando o regime macro."
     )
     print(f"[DEBUG] Context: {context}")
-    content, tool_msgs, steps = await _run_agent_loop(
-        state, _get_llm_signal(), _SIGNAL_SYSTEM, context,
-        force_interval=_get_analysis_interval(state.timeframe), node_name="SignalAgent"
+    node_config = NODE_CONFIG["signal_agent"]
+    content, cot, tool_msgs, steps = await _run_agent_loop(
+        state, _get_llm_for_node("signal_agent"), _SIGNAL_SYSTEM, context,
+        force_interval=setup_interval, node_name="SignalAgent", enable_cot=node_config["cot"]
     )
     print(f"[DEBUG] Signal agent - steps: {len(steps)}, tool_msgs: {len(tool_msgs)}")
 
@@ -947,19 +1504,28 @@ async def signal_agent_node(state: QuantAgentState) -> dict:
         # If structured parsing fails, keep default
         pass
 
-    print(f"[DEBUG] Input for quant engine - rsi: {state.rsi_14}, macd: {state.macd_line}, bb: {state.bb_upper}, price: {state.live_price}")
-    # QUANTITATIVE ENGINE: Deterministic signal calculation (no LLM)
+    # QUANTITATIVE ENGINE: Deterministic signal calculation using setup layer (4H)
+    # Respect macro regime bias from 1D
+    print(f"[DEBUG] Input for quant engine (setup 4H) - rsi: {state.setup_rsi_14}, macd: {state.setup_macd_line}")
+    print(f"[DEBUG] Macro regime (1D) - regime: {state.macro_regime}, bias: {state.macro_bias}")
+    
     signal_output = compute_signal_score(
-        rsi_14=state.rsi_14,
-        macd_line=state.macd_line,
-        macd_signal=state.macd_signal,
-        bb_upper=state.bb_upper,
-        bb_lower=state.bb_lower,
+        rsi_14=state.setup_rsi_14,
+        macd_line=state.setup_macd_line,
+        macd_signal=None,  # Not available in setup layer
+        bb_upper=state.setup_bb_upper,
+        bb_lower=state.setup_bb_lower,
         live_price=state.live_price,
         price_change_pct=state.price_change_pct,
         volatility_annualized=state.volatility_annualized,
-        sharpe=state.sharpe,
+        sharpe=state.exec_sharpe,  # Use execution layer sharpe
     )
+    
+    # Apply macro regime filter: if macro is overbought + bullish, don't allow short signals
+    if state.macro_regime == "overbought" and state.macro_bias == "bullish_stretched":
+        if signal_output.direction in ["short", "weak_short"]:
+            signal_output.direction = "neutral"
+            signal_output.confidence = signal_output.confidence * 0.5  # Reduce confidence for neutral
 
     # Override regime with quantitative engine result
     regime = signal_output.regime
@@ -971,12 +1537,65 @@ async def signal_agent_node(state: QuantAgentState) -> dict:
     return {
         **state.model_dump(),
         "messages":           state.messages + [AIMessage(content=content)],
-        "next_action":        NextAction.RISK_GATE,
+        "next_action":        NextAction.MOE,
         "signal_direction":   direction,
         "regime":             regime,
         "signal_confidence":  signal_confidence,
         "intermediate_steps_global": state.intermediate_steps_global + steps,
         "intermediate_steps_agent": steps,
+        "cot":                cot,
+    }
+
+@timed_async("Node: MoE")
+async def moe_node(state: QuantAgentState) -> dict:
+    """
+    Mixture of Experts node for signal generation.
+    Combines multiple signal experts with gating network and risk layer.
+    Multi-timeframe: Uses setup layer (4H) for signal, respects macro regime (1D), uses execution risk (1H).
+    """
+    print(f"[DEBUG] ===== MOE NODE START =====")
+    print(f"[DEBUG] Input symbol: {state.symbol}")
+    print(f"[DEBUG] Macro regime (1D): {state.macro_regime}, bias: {state.macro_bias}")
+    print(f"[DEBUG] Setup data (4H): RSI={state.setup_rsi_14}, MACD={state.setup_macd_line}")
+    print(f"[DEBUG] Execution risk (1H): Sharpe={state.exec_sharpe}, Vol={state.exec_volatility}")
+    
+    # Initialize MoE layer
+    moe_layer = MoESignalLayer(gating_mode="rule_based", enable_risk_layer=True)
+    
+    # Compute MoE signal using multi-timeframe inputs
+    # Use trend_state from hierarchical interpretation instead of simple regime
+    moe_output = moe_layer.compute_signal(
+        rsi_14=state.setup_rsi_14,        # Use 4H RSI for signal
+        macd_line=state.setup_macd_line,   # Use 4H MACD for signal
+        macd_signal=state.setup_macd_signal,
+        bb_upper=state.setup_bb_upper,     # Use 4H BB for signal
+        bb_lower=state.setup_bb_lower,
+        live_price=state.live_price,
+        price_change_pct=state.price_change_pct,
+        volatility_annualized=state.exec_volatility,  # Use 1H volatility for risk
+        trend_state=state.trend_state or "neutral",   # Use hierarchical trend state for gating
+        sharpe=state.exec_sharpe,                       # Use 1H sharpe for risk layer
+    )
+    
+    print(f"[DEBUG] MoE output - signal: {moe_output.final_signal:.3f}, confidence: {moe_output.final_confidence:.3f}")
+    print(f"[DEBUG] MoE position size: {moe_output.position_size:.3f}, risk-adjusted: {moe_output.risk_adjusted_signal:.3f}")
+    print(f"[DEBUG] MoE experts: {[e.value for e in moe_output.selected_experts]}")
+    print(f"[DEBUG] ===== MOE NODE END =====")
+    
+    return {
+        **state.model_dump(),
+        "messages": state.messages + [AIMessage(content=f"MoE signal: {moe_output.final_signal:.3f}, confidence: {moe_output.final_confidence:.3f}")],
+        "next_action": NextAction.RISK_GATE,
+        "moe_final_signal": moe_output.final_signal,
+        "moe_final_confidence": moe_output.final_confidence,
+        "moe_selected_experts": [e.value for e in moe_output.selected_experts],
+        "moe_expert_weights": {k.value: v for k, v in moe_output.expert_weights.items()},
+        "moe_gating_reason": moe_output.gating_reason,
+        "moe_position_size": moe_output.position_size,
+        "moe_risk_adjusted_signal": moe_output.risk_adjusted_signal,
+        "intermediate_steps_global": state.intermediate_steps_global + [("moe", moe_output.gating_reason)],
+        "intermediate_steps_agent": [],
+        "cot": "",
     }
 
 @timed("Node: RiskGate")
@@ -1102,6 +1721,7 @@ def pre_trade_risk_gate_node(state: QuantAgentState) -> dict:
         "gate_reason":   gate_reason,
         "intermediate_steps_global": state.intermediate_steps_global + [("risk_gate", gate_reason)],
         "intermediate_steps_agent": [],
+        "cot":          "",
     }
 
 def _fmt(val, *, pct: bool = False, unit: str = "", prec: int = 4) -> str:
@@ -1206,7 +1826,14 @@ HISTÓRICO DE ANÁLISE (últimos 8 steps):
         SystemMessage(content=_EXECUTION_SYSTEM),
         HumanMessage(content=context),
     ]
-    final_response = await _get_llm_execution().ainvoke(msgs)
+    node_config = NODE_CONFIG["execution"]
+    llm = _get_llm_for_node("execution")
+    
+    # Add CoT instruction if enabled
+    if node_config["cot"]:
+        msgs.append(HumanMessage(content="\n\nFORMATO DE RESPOSTA OBRIGATÓRIO:\n<thought>Resumo CONCISO do seu raciocínio (max 2-3 frases). Ex: 'Obtive o indicador X que está em Y, indicando Z.'</thought>\n<answer>Sua resposta final aqui</answer>"))
+    
+    final_response = await llm.ainvoke(msgs)
     
     # Track execution LLM call
     cost_tracker = get_cost_tracker()
@@ -1214,7 +1841,7 @@ HISTÓRICO DE ANÁLISE (últimos 8 steps):
         metadata = final_response.response_metadata
         input_tokens = metadata.get('token_usage', {}).get('prompt_tokens', 0)
         output_tokens = metadata.get('token_usage', {}).get('completion_tokens', 0)
-        model_name = getattr(_get_llm_execution(), 'model_name', 'unknown') or getattr(_get_llm_execution(), 'model', 'unknown')
+        model_name = getattr(llm, 'model_name', 'unknown') or getattr(llm, 'model', 'unknown')
         if input_tokens > 0 or output_tokens > 0:
             cost_tracker.add_call(model_name, input_tokens, output_tokens, "Execution")
     
@@ -1232,6 +1859,10 @@ HISTÓRICO DE ANÁLISE (últimos 8 steps):
     
     # Append cost info to final response
     final_answer_with_cost = final_response.content + cost_info
+    
+    # Extract CoT if enabled
+    cot, answer = _extract_cot_and_answer(final_response.content) if node_config["cot"] else ("", final_response.content)
+    final_answer_with_cost = answer + cost_info
 
     return {
         **state.model_dump(),
@@ -1239,6 +1870,7 @@ HISTÓRICO DE ANÁLISE (últimos 8 steps):
         "next_action":  NextAction.FINALIZE,
         "final_answer": final_answer_with_cost,
         "cost_summary": cost_summary,
+        "cot":          cot,
     }
 
 def blocked_node(state: QuantAgentState) -> dict:
@@ -1269,9 +1901,15 @@ def build_quant_graph() -> Any:
     # Nodes
     workflow.add_node("orchestrator",   orchestrator_node)
     workflow.add_node("market_data",    market_data_node)
-    workflow.add_node("features",       feature_engineering_node)
+    workflow.add_node("features_macro", features_macro_node)    # 1D - regime detection
+    workflow.add_node("features_setup", features_setup_node)    # 4H - signal generation
+    workflow.add_node("features_exec",  features_exec_node)     # 1H - execution timing
+    workflow.add_node("trend_interpret", trend_interpret_node)  # Multi-timeframe hierarchical interpretation
+    workflow.add_node("decision_engine", decision_engine_node)  # Deterministic decision layer (FINAL authority)
+    workflow.add_node("features",       feature_engineering_node)  # Legacy (will be phased out)
     workflow.add_node("risk",           risk_agent_node)
     workflow.add_node("signal",         signal_agent_node)
+    workflow.add_node("moe",           moe_node)  # Auxiliary input to decision engine
     workflow.add_node("risk_gate",      pre_trade_risk_gate_node)
     workflow.add_node("execution",      execution_node)
     workflow.add_node("blocked",        blocked_node)
@@ -1280,12 +1918,15 @@ def build_quant_graph() -> Any:
     # Entry
     workflow.set_entry_point("orchestrator")
 
-    # Fixed edges (pipeline linear)
+    # Fixed edges (multi-timeframe pipeline with decision engine as FINAL authority)
     workflow.add_edge("orchestrator", "market_data")
-    workflow.add_edge("market_data",  "features")
-    workflow.add_edge("features",     "risk")
-    workflow.add_edge("risk",         "signal")
-    workflow.add_edge("signal",       "risk_gate")
+    workflow.add_edge("market_data",  "features_macro")   # 1D for regime
+    workflow.add_edge("features_macro", "features_setup")  # 4H for signal
+    workflow.add_edge("features_setup", "features_exec")   # 1H for execution
+    workflow.add_edge("features_exec",  "trend_interpret") # Hierarchical interpretation
+    workflow.add_edge("trend_interpret", "decision_engine") # Decision engine (FINAL authority)
+    workflow.add_edge("decision_engine", "risk")          # Risk uses final decision
+    workflow.add_edge("risk",         "risk_gate")        # Risk gate uses final decision (bypass signal/moe)
 
     # Conditional: risk gate → execution or blocked
     workflow.add_conditional_edges(

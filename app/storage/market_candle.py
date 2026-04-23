@@ -34,7 +34,7 @@ class MarketCandleQueries:
         
         Args:
             symbol: Trading symbol
-            interval: Time interval (1m, 5m, 15m, 1h, 4h, 1d)
+            interval: Time interval (1m, 5m, 15m, 1h, 4h, 1d, 1D)
             start_time: Start of time range
             end_time: End of time range
             limit: Maximum number of candles to return
@@ -42,6 +42,8 @@ class MarketCandleQueries:
         Returns:
             List of MarketCandle objects
         """
+        # Normalize interval to lowercase
+        interval = interval.lower()
         # Check if interval is 1m or if we need aggregation
         if interval == "1m":
             # Use covering index idx_market_candles_intraday_lookup for index-only scan
@@ -115,7 +117,7 @@ class MarketCandleQueries:
                         rows = await self.pool.fetch(sql, symbol, start_time, end_time, limit)
                     else:
                         rows = await self.pool.fetch(sql, symbol, start_time, end_time)
-            elif interval == "1d":
+            elif interval == "1d" or interval == "1D":
                 sql = """
                     SELECT 
                         symbol,
@@ -191,12 +193,14 @@ class MarketCandleQueries:
         
         Args:
             symbol: Trading symbol
-            interval: Time interval (1m, 5m, 15m, 1h, 4h, 1d)
+            interval: Time interval (1m, 5m, 15m, 1h, 4h, 1d, 1D)
             limit: Maximum number of candles to return
             
         Returns:
             List of MarketCandle objects
         """
+        # Normalize interval to lowercase
+        interval = interval.lower()
         # Check if interval is 1m or if we need aggregation
         if interval == "1m":
             # Use partial index idx_market_candles_latest for closed candles only
@@ -371,7 +375,7 @@ class MarketCandleQueries:
             bucket = "date_trunc('hour', close_time)"
         elif interval == "4h":
             bucket = "date_trunc('hour', close_time) + make_interval(hours => floor(extract(hour FROM close_time) / 4) * 4)"
-        elif interval == "1d":
+        elif interval == "1d" or interval == "1D":
             bucket = "date_trunc('day', close_time)"
         else:
             bucket = "date_trunc('hour', close_time)"  # Default to 1h

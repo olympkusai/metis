@@ -5,7 +5,7 @@ import json
 from langchain_core.tools import tool
 from app.storage.market_candle import MarketCandleQueries
 from app.storage.cache import CalculationCache
-from app.calculator.engine import CalculationEngine, CalculationRequest
+from app.calculator.engine import CalculationEngine, CalculationRequest, create_calculation_engine
 from app.calculator.types import Candle
 from app.storage.models import MarketCandle
 from app.utils.timing import timed_async
@@ -84,6 +84,9 @@ async def _get_candles_from_db(
     
     # Normalize symbol
     norm_symbol = _normalize_symbol(symbol)
+    
+    # Normalize interval to lowercase for consistency
+    interval = interval.lower()
     
     # Calculate time range based on interval
     interval_ms = {
