@@ -3,6 +3,7 @@ import sys
 
 import uvicorn
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 
 if __package__ in {None, ""}:
@@ -52,6 +53,15 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="k0s - v0.0.1", lifespan=lifespan)
+
+# Configure CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins for now - can be restricted later
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods
+    allow_headers=["*"],  # Allows all headers
+)
 
 register_routes(app)
 
