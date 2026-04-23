@@ -20,7 +20,8 @@ class MarketCandle:
     close_price: float = 0.0
     base_volume: float = 0.0
     quote_volume: float = 0.0
-    trades_count: int = 0
+    closed: bool = False
+    received_at: datetime | None = None
     
     @classmethod
     def from_record(cls, record: dict[str, Any]) -> "MarketCandle":
@@ -43,7 +44,8 @@ class MarketCandle:
             close_price=float(record.get("close_price", 0.0)),
             base_volume=float(record.get("base_volume", 0.0)),
             quote_volume=float(record.get("quote_volume", 0.0)),
-            trades_count=int(record.get("trades_count", 0)),
+            closed=record.get("closed", False),
+            received_at=record.get("received_at"),
         )
     
     def to_dict(self) -> dict[str, Any]:
@@ -63,7 +65,8 @@ class MarketCandle:
             "close_price": self.close_price,
             "base_volume": self.base_volume,
             "quote_volume": self.quote_volume,
-            "trades_count": self.trades_count,
+            "closed": self.closed,
+            "received_at": self.received_at,
         }
 
 

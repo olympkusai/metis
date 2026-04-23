@@ -28,6 +28,8 @@ import json
 import math
 from enum import Enum
 from functools import lru_cache
+from app.utils.timing import timed_async, timed
+from app.utils.cost_tracker import get_cost_tracker
 from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -449,6 +451,7 @@ async def _run_agent_loop(
     extra_context: str = "",
     clear_steps: bool = False,
     force_interval: str | None = None,
+    node_name: str = "unknown",
 ) -> tuple[str, list[ToolMessage], list]:
     """
     Loop LLM → tool call → result para um agente especializado.
@@ -485,6 +488,17 @@ async def _run_agent_loop(
         for attempt in range(MAX_RETRIES):
             try:
                 response = await llm.ainvoke(msgs, timeout=30)  # 30s timeout
+                
+                # Track token usage
+                cost_tracker = get_cost_tracker()
+                if hasattr(response, 'response_metadata'):
+                    metadata = response.response_metadata
+                    input_tokens = metadata.get('token_usage', {}).get('prompt_tokens', 0)
+                    output_tokens = metadata.get('token_usage', {}).get('completion_tokens', 0)
+                    model_name = getattr(llm, 'model_name', 'unknown') or getattr(llm, 'model', 'unknown')
+                    if input_tokens > 0 or output_tokens > 0:
+                        cost_tracker.add_call(model_name, input_tokens, output_tokens, node_name)
+                
                 break
             except Exception as e:
                 if attempt == MAX_RETRIES - 1:
@@ -548,6 +562,7 @@ async def _run_agent_loop(
 # 6. AGENT NODES
 # ─────────────────────────────────────────────
 
+@timed_async("Node: Orchestrator")
 async def orchestrator_node(state: QuantAgentState) -> dict:
     """
     Extrai intent, symbol, timeframe e define o pipeline inicial.
@@ -593,6 +608,7 @@ def _get_analysis_interval(timeframe: AnalysisTimeframe) -> str:
     """Returns the canonical data interval for a given analysis timeframe."""
     return _TIMEFRAME_INTERVAL.get(timeframe, "1h")
 
+@timed_async("Node: MarketData")
 async def market_data_node(state: QuantAgentState) -> dict:
     print(f"[DEBUG] ===== MARKET DATA NODE START =====")
     print(f"[DEBUG] Input symbol: {state.symbol}, timeframe: {state.timeframe}")
@@ -604,7 +620,7 @@ async def market_data_node(state: QuantAgentState) -> dict:
     print(f"[DEBUG] Context: {context}")
     content, tool_msgs, steps = await _run_agent_loop(
         state, _get_llm_market_data(), _MARKET_DATA_SYSTEM, context,
-        force_interval=analysis_interval,
+        force_interval=analysis_interval, node_name="MarketData"
     )
     print(f"[DEBUG] Market data - steps: {len(steps)}, tool_msgs: {len(tool_msgs)}")
     print(f"[DEBUG] Market data content preview: {content[:200] if content else 'None'}")
@@ -667,6 +683,7 @@ async def market_data_node(state: QuantAgentState) -> dict:
         "recent_low":        recent_low,
     }
 
+@timed_async("Node: FeatureEngineering")
 async def feature_engineering_node(state: QuantAgentState) -> dict:
     print(f"[DEBUG] ===== FEATURE ENGINEERING NODE START =====")
     print(f"[DEBUG] Input symbol: {state.symbol}, live_price: {state.live_price}")
@@ -680,7 +697,7 @@ async def feature_engineering_node(state: QuantAgentState) -> dict:
     print(f"[DEBUG] Context: {context}")
     content, tool_msgs, steps = await _run_agent_loop(
         state, _get_llm_features(), _FEATURE_SYSTEM, context,
-        force_interval=analysis_interval,
+        force_interval=analysis_interval, node_name="FeatureEngineering"
     )
     print(f"[DEBUG] Feature engineering - steps: {len(steps)}, tool_msgs: {len(tool_msgs)}")
 
@@ -733,6 +750,7 @@ async def feature_engineering_node(state: QuantAgentState) -> dict:
         "bb_lower":           bb_lower,
     }
 
+@timed_async("Node: RiskAgent")
 async def risk_agent_node(state: QuantAgentState) -> dict:
     print(f"[DEBUG] ===== RISK AGENT NODE START =====")
     print(f"[DEBUG] Input symbol: {state.symbol}, live_price: {state.live_price}")
@@ -748,7 +766,7 @@ async def risk_agent_node(state: QuantAgentState) -> dict:
     print(f"[DEBUG] Context: {context}")
     content, tool_msgs, steps = await _run_agent_loop(
         state, _get_llm_risk(), _RISK_SYSTEM, context, clear_steps=True,
-        force_interval=analysis_interval,
+        force_interval=analysis_interval, node_name="RiskAgent"
     )
     print(f"[DEBUG] Risk agent - steps: {len(steps)}, tool_msgs: {len(tool_msgs)}")
 
@@ -900,6 +918,7 @@ async def risk_agent_node(state: QuantAgentState) -> dict:
         "anomalies_detected": state.anomalies_detected + risk_audit_anomalies,
     }
 
+@timed_async("Node: SignalAgent")
 async def signal_agent_node(state: QuantAgentState) -> dict:
     print(f"[DEBUG] ===== SIGNAL AGENT NODE START =====")
     print(f"[DEBUG] Input symbol: {state.symbol}, risk_level: {state.risk_level}")
@@ -911,7 +930,7 @@ async def signal_agent_node(state: QuantAgentState) -> dict:
     print(f"[DEBUG] Context: {context}")
     content, tool_msgs, steps = await _run_agent_loop(
         state, _get_llm_signal(), _SIGNAL_SYSTEM, context,
-        force_interval=_get_analysis_interval(state.timeframe),
+        force_interval=_get_analysis_interval(state.timeframe), node_name="SignalAgent"
     )
     print(f"[DEBUG] Signal agent - steps: {len(steps)}, tool_msgs: {len(tool_msgs)}")
 
@@ -960,6 +979,7 @@ async def signal_agent_node(state: QuantAgentState) -> dict:
         "intermediate_steps_agent": steps,
     }
 
+@timed("Node: RiskGate")
 def pre_trade_risk_gate_node(state: QuantAgentState) -> dict:
     """
     Nó bloqueador: verifica limites antes de qualquer recomendação de execução.
@@ -1112,6 +1132,7 @@ def _coverage_summary(state: QuantAgentState) -> tuple[int, int, list[str]]:
     return len(fields) - len(missing), len(fields), missing
 
 
+@timed_async("Node: Execution")
 async def execution_node(state: QuantAgentState) -> dict:
     """
     Consolida toda a análise e gera resposta final institucional.
@@ -1186,12 +1207,38 @@ HISTÓRICO DE ANÁLISE (últimos 8 steps):
         HumanMessage(content=context),
     ]
     final_response = await _get_llm_execution().ainvoke(msgs)
+    
+    # Track execution LLM call
+    cost_tracker = get_cost_tracker()
+    if hasattr(final_response, 'response_metadata'):
+        metadata = final_response.response_metadata
+        input_tokens = metadata.get('token_usage', {}).get('prompt_tokens', 0)
+        output_tokens = metadata.get('token_usage', {}).get('completion_tokens', 0)
+        model_name = getattr(_get_llm_execution(), 'model_name', 'unknown') or getattr(_get_llm_execution(), 'model', 'unknown')
+        if input_tokens > 0 or output_tokens > 0:
+            cost_tracker.add_call(model_name, input_tokens, output_tokens, "Execution")
+    
+    # Get cost summary
+    cost_summary = cost_tracker.get_summary()
+    cost_info = f"""
+
+💰 CUSTO LLM
+  Total de chamadas: {cost_summary['total_calls']}
+  Tokens de entrada: {cost_summary['total_input_tokens']}
+  Tokens de saída: {cost_summary['total_output_tokens']}
+  Total de tokens: {cost_summary['total_tokens']}
+  Custo total: ${cost_summary['total_cost_usd']:.6f} USD
+"""
+    
+    # Append cost info to final response
+    final_answer_with_cost = final_response.content + cost_info
 
     return {
         **state.model_dump(),
         "messages":     state.messages + [final_response],
         "next_action":  NextAction.FINALIZE,
-        "final_answer": final_response.content,
+        "final_answer": final_answer_with_cost,
+        "cost_summary": cost_summary,
     }
 
 def blocked_node(state: QuantAgentState) -> dict:
