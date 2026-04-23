@@ -34,6 +34,7 @@ from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_openai import ChatOpenAI
+from langchain_ollama import ChatOllama
 from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field, ConfigDict
 
@@ -166,16 +167,23 @@ class QuantAgentState(BaseModel):
 # 3. LLM INSTANCES  (per agent, tuned separately)
 # ─────────────────────────────────────────────
 
-_BASE_MODEL = "gpt-4o"
-
-def _make_llm(temperature: float = 0.1, **kw) -> ChatOpenAI:
+def _make_llm(temperature: float = 0.1, **kw):
     settings = get_settings()
-    return ChatOpenAI(
-        model=_BASE_MODEL,
-        temperature=temperature,
-        api_key=settings.openai_api_key,
-        **kw,
-    )
+    
+    if settings.llm_provider == "ollama":
+        return ChatOllama(
+            model=settings.ollama_model,
+            base_url=settings.ollama_base_url,
+            temperature=temperature,
+            **kw,
+        )
+    else:  # openai (default)
+        return ChatOpenAI(
+            model="gpt-4o",
+            temperature=temperature,
+            api_key=settings.openai_api_key,
+            **kw,
+        )
 
 tool_map = {t.name: t for t in all_tools}
 risk_tools = [t for t in all_tools if t.name == "calculate_risk"]
@@ -487,7 +495,12 @@ async def _run_agent_loop(
         response = None
         for attempt in range(MAX_RETRIES):
             try:
-                response = await llm.ainvoke(msgs, timeout=30)  # 30s timeout
+                # ChatOllama doesn't support timeout parameter, check if it's OpenAI
+                settings = get_settings()
+                if settings.llm_provider == "ollama":
+                    response = await llm.ainvoke(msgs)
+                else:
+                    response = await llm.ainvoke(msgs, timeout=30)  # 30s timeout
                 
                 # Track token usage
                 cost_tracker = get_cost_tracker()
@@ -1034,32 +1047,31 @@ def pre_trade_risk_gate_node(state: QuantAgentState) -> dict:
             warnings.append(f"Posição reduzida para <1% devido a volatilidade/confiança")
 
     # Regra 7: Portfolio exposure (institutional portfolio constraints)
-    constraints = PortfolioConstraints(
-        max_position_size=MAX_POSITION_SIZE,
-        max_portfolio_exposure=MAX_PORTFOLIO_EXPOSURE
-    )
-    
-    # Calculate proposed position size
-    if state.signal_confidence is not None:
+    # Only check portfolio constraints if there's a valid signal (not neutral)
+    if state.signal_direction in ["long", "short"] and state.signal_confidence is not None and state.signal_confidence > 0:
+        constraints = PortfolioConstraints(
+            max_position_size=MAX_POSITION_SIZE,
+            max_portfolio_exposure=MAX_PORTFOLIO_EXPOSURE
+        )
+        
+        # Calculate proposed position size
         proposed_size = calculate_position_size(
             signal_confidence=state.signal_confidence,
             volatility_annualized=state.volatility_annualized,
             max_position_size=MAX_POSITION_SIZE
         )
-    else:
-        proposed_size = 0.0
-    
-    # Check portfolio constraints
-    portfolio_approved, portfolio_violations = check_portfolio_constraints(
-        portfolio=state.portfolio_state,
-        proposed_symbol=state.symbol,
-        proposed_size=proposed_size,
-        constraints=constraints
-    )
-    
-    if not portfolio_approved:
-        blocked = True
-        reasons.extend(portfolio_violations)
+        
+        # Check portfolio constraints
+        portfolio_approved, portfolio_violations = check_portfolio_constraints(
+            portfolio=state.portfolio_state,
+            proposed_symbol=state.symbol,
+            proposed_size=proposed_size,
+            constraints=constraints
+        )
+        
+        if not portfolio_approved:
+            blocked = True
+            reasons.extend(portfolio_violations)
 
     # Regra 8: Volatilidade excessiva
     if state.volatility_annualized and state.volatility_annualized > 1.5:  # 150% a.a.
