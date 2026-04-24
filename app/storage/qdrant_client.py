@@ -3,7 +3,7 @@
 from typing import Any, Dict, List, Optional
 from dataclasses import dataclass
 import asyncio
-from qdrant_client import QdrantClient
+from qdrant_client import QdrantClient, AsyncQdrantClient
 from qdrant_client.models import (
     Distance,
     VectorParams,
@@ -32,15 +32,22 @@ class QdrantVectorStore:
     CRYPTO_NEWS = "crypto_news"
     CONVERSATION_HISTORY = "conversation_history"
     
-    def __init__(self, url: Optional[str] = None):
+    def __init__(self, url: Optional[str] = None, api_key: Optional[str] = None):
         """Initialize Qdrant client.
         
         Args:
             url: Qdrant server URL. If None, uses from settings.
+            api_key: Qdrant API key. If None, uses from settings.
         """
         settings = get_settings()
         self.url = url or settings.qdrant_url
-        self.client = QdrantClient(url=self.url)
+        self.api_key = api_key or settings.qdrant_api_key
+        
+        # Use async client for async operations
+        if self.api_key:
+            self.client = AsyncQdrantClient(url=self.url, api_key=self.api_key)
+        else:
+            self.client = AsyncQdrantClient(url=self.url)
         self._collections_created = False
     
     async def ensure_collections(self) -> None:
@@ -55,8 +62,8 @@ class QdrantVectorStore:
         ]
         
         for collection_name, vector_size, distance in collections:
-            if not self.client.collection_exists(collection_name):
-                self.client.create_collection(
+            if not await self.client.collection_exists(collection_name):
+                await self.client.create_collection(
                     collection_name=collection_name,
                     vectors_config=VectorParams(
                         size=vector_size,
@@ -83,7 +90,7 @@ class QdrantVectorStore:
         """
         await self.ensure_collections()
         
-        self.client.upsert(
+        await self.client.upsert(
             collection_name=collection_name,
             points=[
                 PointStruct(
@@ -124,25 +131,28 @@ class QdrantVectorStore:
                     match=MatchValue(value=value),
                 )
                 for key, value in filter_payload.items()
+                if value is not None
             ]
-            query_filter = Filter(must=conditions)
+            if conditions:
+                query_filter = Filter(must=conditions)
         
-        results = self.client.search(
+        results = await self.client.query_points(
             collection_name=collection_name,
-            query_vector=query_vector,
+            query=query_vector,
             limit=limit,
             score_threshold=score_threshold,
             query_filter=query_filter,
         )
         
+        # query_points returns a QueryResponse object, iterate over points
         return [
             SearchResult(
-                id=str(hit.id),
-                score=hit.score,
-                payload=hit.payload or {},
-                vector=hit.vector,
+                id=str(point.id),
+                score=point.score if hasattr(point, 'score') else 0.0,
+                payload=point.payload or {},
+                vector=point.vector if hasattr(point, 'vector') else None,
             )
-            for hit in results
+            for point in results.points
         ]
     
     async def delete(
@@ -158,7 +168,7 @@ class QdrantVectorStore:
         """
         await self.ensure_collections()
         
-        self.client.delete(
+        await self.client.delete(
             collection_name=collection_name,
             points_selector=[point_id],
         )
@@ -180,7 +190,7 @@ class QdrantVectorStore:
         await self.ensure_collections()
         
         try:
-            result = self.client.retrieve(
+            result = await self.client.retrieve(
                 collection_name=collection_name,
                 ids=[point_id],
             )
@@ -209,7 +219,8 @@ class QdrantVectorStore:
         """
         await self.ensure_collections()
         
-        return self.client.count(collection_name).count
+        count_result = await self.client.count(collection_name)
+        return count_result.count
     
     async def clear_collection(self, collection_name: str) -> None:
         """Delete all points from a collection.
@@ -217,14 +228,17 @@ class QdrantVectorStore:
         Args:
             collection_name: Name of the collection
         """
-        if self.client.collection_exists(collection_name):
-            self.client.delete(
+        if await self.client.collection_exists(collection_name):
+            scroll_result = await self.client.scroll(
                 collection_name=collection_name,
-                points_selector=self.client.scroll(
-                    collection_name=collection_name,
-                    limit=10000,
-                )[0],
+                limit=10000,
             )
+            points = [point.id for point in scroll_result[0]]
+            if points:
+                await self.client.delete(
+                    collection_name=collection_name,
+                    points_selector=points,
+                )
 
 
 # Singleton instance

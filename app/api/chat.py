@@ -1,22 +1,73 @@
 from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from langchain_core.messages import HumanMessage
+from typing import Optional
+from langchain_core.messages import HumanMessage, AIMessage
 from app.agent.graph import get_agent_graph, QuantAgentState
+from app.memory.conversation_history import (
+    get_conversation_history,
+    MessageRole,
+)
 import json
 import asyncio
+import uuid
 
 router = APIRouter()
 
 class ChatRequest(BaseModel):
     message: str
     user_id: str
+    session_id: Optional[str] = None
 
 @router.post("/chat")
 async def chat(request: ChatRequest):
+    # Generate session_id if not provided
+    session_id = request.session_id or f"{request.user_id}:{uuid.uuid4().hex}"
+    
+    # Save user message
+    conv_history = get_conversation_history()
+    await conv_history.save_message(
+        user_id=request.user_id,
+        session_id=session_id,
+        role=MessageRole.USER,
+        content=request.message,
+    )
+    
+    # Load conversation history (20 messages from session + 10 global context)
+    session_history = await conv_history.get_conversation_history(
+        user_id=request.user_id,
+        session_id=session_id,
+        limit=20,
+    )
+    global_context = await conv_history.get_global_context(
+        user_id=request.user_id,
+        limit=10,
+        exclude_session_id=session_id,
+    )
+    
+    # Build messages list with history
+    messages = []
+    
+    # Add global context as system context
+    if global_context:
+        context_summary = "Previous conversations context:\n"
+        for msg in global_context[-5:]:  # Last 5 global messages
+            context_summary += f"{msg['role']}: {msg['content'][:200]}...\n"
+        messages.append(HumanMessage(content=context_summary))
+    
+    # Add session history
+    for msg in session_history[:-1]:  # All except the one we just saved
+        if msg['role'] == 'user':
+            messages.append(HumanMessage(content=msg['content']))
+        elif msg['role'] == 'assistant':
+            messages.append(AIMessage(content=msg['content']))
+    
+    # Add current message
+    messages.append(HumanMessage(content=request.message))
+    
     agent = get_agent_graph()
     initial_state = QuantAgentState(
-        messages=[HumanMessage(content=request.message)],
+        messages=messages,
         user_id=request.user_id,
     )
     # recursion_limit = 8 nós × max 6 iterações internas + margem
@@ -43,6 +94,20 @@ async def chat(request: ChatRequest):
         "gate_reason":        final_state.get("gate_reason"),
         "anomalies_detected": final_state.get("anomalies_detected", []),
     }
+    
+    # Save assistant response with complete metadata
+    await conv_history.save_message(
+        user_id=request.user_id,
+        session_id=session_id,
+        role=MessageRole.ASSISTANT,
+        content=final_answer,
+        metadata={
+            "pipeline_summary": pipeline_meta,
+            "reasoning_steps": reasoning_steps,
+            "tools_used": [step[0] for step in intermediate_steps],
+            "chain_of_thought": cot,
+        },
+    )
 
     return {
         "response":    final_answer,
@@ -50,6 +115,7 @@ async def chat(request: ChatRequest):
         "tools_used":  [step[0] for step in intermediate_steps],
         "pipeline":    pipeline_meta,
         "thought":     cot,
+        "session_id":  session_id,
     }
 
 
@@ -57,10 +123,54 @@ async def chat(request: ChatRequest):
 async def streaming_chat(request: ChatRequest):
     """Streaming endpoint that emits each node execution as an SSE event."""
     
+    # Generate session_id if not provided
+    session_id = request.session_id or f"{request.user_id}:{uuid.uuid4().hex}"
+    
+    # Save user message
+    conv_history = get_conversation_history()
+    await conv_history.save_message(
+        user_id=request.user_id,
+        session_id=session_id,
+        role=MessageRole.USER,
+        content=request.message,
+    )
+    
     async def event_generator():
+        # Load conversation history (20 messages from session + 10 global context)
+        session_history = await conv_history.get_conversation_history(
+            user_id=request.user_id,
+            session_id=session_id,
+            limit=20,
+        )
+        global_context = await conv_history.get_global_context(
+            user_id=request.user_id,
+            limit=10,
+            exclude_session_id=session_id,
+        )
+        
+        # Build messages list with history
+        messages = []
+        
+        # Add global context as system context
+        if global_context:
+            context_summary = "Previous conversations context:\n"
+            for msg in global_context[-5:]:  # Last 5 global messages
+                context_summary += f"{msg['role']}: {msg['content'][:200]}...\n"
+            messages.append(HumanMessage(content=context_summary))
+        
+        # Add session history
+        for msg in session_history[:-1]:  # All except the one we just saved
+            if msg['role'] == 'user':
+                messages.append(HumanMessage(content=msg['content']))
+            elif msg['role'] == 'assistant':
+                messages.append(AIMessage(content=msg['content']))
+        
+        # Add current message
+        messages.append(HumanMessage(content=request.message))
+        
         agent = get_agent_graph()
         initial_state = QuantAgentState(
-            messages=[HumanMessage(content=request.message)],
+            messages=messages,
             user_id=request.user_id,
         )
         
@@ -180,8 +290,21 @@ async def streaming_chat(request: ChatRequest):
                 "gate_reason": accumulated_state.get("gate_reason"),
                 "anomalies_detected": accumulated_state.get("anomalies_detected", []),
             },
-            "timestamp": asyncio.get_event_loop().time()
+            "timestamp": asyncio.get_event_loop().time(),
+            "session_id": session_id,
         }
+        
+        # Save assistant response with complete metadata
+        await conv_history.save_message(
+            user_id=request.user_id,
+            session_id=session_id,
+            role=MessageRole.ASSISTANT,
+            content=accumulated_state.get("final_answer", ""),
+            metadata={
+                "pipeline_summary": final_event["pipeline"],
+                "chain_of_thought": accumulated_state.get("cot", ""),
+            },
+        )
         
         yield f"data: {json.dumps(final_event)}\n\n"
     
