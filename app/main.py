@@ -57,7 +57,10 @@ app = FastAPI(title="k0s - v0.0.1", lifespan=lifespan)
 # Configure CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins for now - can be restricted later
+    allow_origins=[
+        "http://localhost:8080",
+        "https://k0s.app",
+    ],
     allow_credentials=True,
     allow_methods=["*"],  # Allows all methods
     allow_headers=["*"],  # Allows all headers
@@ -75,4 +78,4 @@ async def health():
 
 
 if __name__ == "__main__":
-    uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=False)
+    uvicorn.run("app.main:app", host="0.0.0.0", port=8082, reload=False)
