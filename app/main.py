@@ -60,6 +60,7 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:8080",
         "https://k0s.app",
+        "https://www.k0s.app",
     ],
     allow_credentials=True,
     allow_methods=["*"],  # Allows all methods
