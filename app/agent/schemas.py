@@ -139,6 +139,59 @@ class EMAReturnOutput(BaseModel):
     _timing: Optional[dict] = None
 
 
+class ApolloConfidenceExplanation(BaseModel):
+    """Structured output for Apollo confidence explanation."""
+    model_mape: Optional[float] = None
+    period_volatility: Optional[float] = None
+    data_quality: Optional[str] = None
+
+
+class ApolloPredictionOutput(BaseModel):
+    """Structured output for Apollo prediction endpoint."""
+    symbol: str
+    period_start: str
+    period_end: str
+    data_points: int
+    current_price: float
+    predicted_price: float
+    direction: Literal["UP", "DOWN", "FLAT"]
+    confidence: float
+    confidence_explanation: ApolloConfidenceExplanation = Field(default_factory=ApolloConfidenceExplanation)
+
+
+class ApolloTrainingOutput(BaseModel):
+    """Structured output for Apollo training endpoint."""
+    message: str
+    symbol: str
+    lookback_days: int
+    status: str
+    note: Optional[str] = None
+
+
+class ApolloBacktestRange(BaseModel):
+    """Structured output for Apollo backtest date range."""
+    min: str
+    max: str
+
+
+class ApolloBacktestPeriod(BaseModel):
+    """Structured output for a single Apollo backtest period."""
+    period: str
+    start_date: str
+    end_date: str
+    data_points: int
+    current_price: float
+    predicted_price: float
+
+
+class ApolloBacktestOutput(BaseModel):
+    """Structured output for Apollo backtest endpoint."""
+    symbol: str
+    date_range: ApolloBacktestRange
+    periods_tested: int
+    results: list[ApolloBacktestPeriod] = Field(default_factory=list)
+
+
 # ─────────────────────────────────────────────
 # Agent Output Schemas
 # ─────────────────────────────────────────────

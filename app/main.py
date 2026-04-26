@@ -12,6 +12,7 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.api import register_routes
+from app.apollo_client import close_apollo_client
 from app.config import get_settings
 from app.storage import DatabasePool
 from app.storage.migrations import run_migrations
@@ -50,6 +51,7 @@ async def lifespan(app: FastAPI):
     if _db_pool:
         await _db_pool.close()
         print("[MAIN] Database pool closed")
+    await close_apollo_client()
 
 
 app = FastAPI(title="k0s - v0.0.1", lifespan=lifespan)

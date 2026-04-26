@@ -93,6 +93,15 @@ async def chat(request: ChatRequest):
         "gate_approved":      final_state.get("gate_approved"),
         "gate_reason":        final_state.get("gate_reason"),
         "anomalies_detected": final_state.get("anomalies_detected", []),
+        "forecast": {
+            "status": final_state.get("forecast_status"),
+            "direction": final_state.get("forecast_direction"),
+            "confidence": final_state.get("forecast_confidence"),
+            "predicted_price": final_state.get("forecast_predicted_price"),
+            "return_pct": final_state.get("forecast_return_pct"),
+            "actionable": final_state.get("forecast_actionable"),
+            "warnings": final_state.get("forecast_warnings", []),
+        },
     }
     
     # Save assistant response with complete metadata

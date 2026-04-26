@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+from datetime import UTC, datetime
 from enum import Enum
 from functools import lru_cache
 from app.utils.timing import timed_async, timed
@@ -38,8 +39,18 @@ from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field, ConfigDict
 
 from app.tools import all_tools
+from app.apollo_client import ApolloApiError, get_apollo_client
 from app.config import get_settings
+from app.agent.forecasting import (
+    assess_forecast_quality,
+    build_prediction_window,
+    calculate_error_pct,
+    calculate_return_pct,
+    overlay_forecast_on_signal,
+)
 from app.agent.schemas import (
+    ApolloBacktestOutput,
+    ApolloPredictionOutput,
     OrchestratorOutput,
     MarketDataOutput,
     FeatureEngineeringOutput,
@@ -110,6 +121,7 @@ class NextAction(str, Enum):
     FEATURES_MACRO  = "features_macro"   # Daily features
     FEATURES_SETUP  = "features_setup"   # 4H features
     FEATURES_EXEC   = "features_exec"    # 1H features
+    FORECAST       = "forecast"
     TREND_INTERPRET = "trend_interpret"   # Multi-timeframe interpretation
     DECISION_ENGINE = "decision_engine"   # Deterministic decision layer (FINAL authority)
     RISK           = "risk"
@@ -209,6 +221,24 @@ class QuantAgentState(BaseModel):
     exec_volatility:    float | None       = None
     exec_timing:        str | None         = None   # "entry" | "wait" | "exit"
 
+    # Apollo ML forecast context
+    forecast_period_start: str | None      = None
+    forecast_period_end:   str | None      = None
+    forecast_data_points:  int | None      = None
+    forecast_current_price: float | None   = None
+    forecast_predicted_price: float | None = None
+    forecast_direction:    str | None      = None
+    forecast_confidence:   float | None    = None
+    forecast_model_mape:   float | None    = None
+    forecast_period_volatility: float | None = None
+    forecast_data_quality: str | None      = None
+    forecast_return_pct:   float | None    = None
+    forecast_backtest_error_pct: float | None = None
+    forecast_training_attempts: int        = 0
+    forecast_actionable:  bool             = False
+    forecast_status:      str              = "not_requested"
+    forecast_warnings:    list[str]        = Field(default_factory=list)
+
     # Signal context (legacy, will be phased out)
     regime:             str | None         = None   # "trending" | "ranging" | "breakout"
     signal_direction:   str | None         = None   # "long" | "short" | "neutral"
@@ -253,6 +283,7 @@ NODE_CONFIG = {
     "risk_agent": {"model": "gpt-4o-mini", "cot": True},
     "signal_agent": {"model": "gpt-4o", "cot": True},
     "moe": {"model": "gpt-4o-mini", "cot": False},  # Deterministic, no LLM
+    "forecast": {"model": "none", "cot": False},
     "risk_gate": {"model": "gpt-4o", "cot": True},
     "execution": {"model": "gpt-4o", "cot": True},
 }
@@ -475,6 +506,11 @@ para o usuário com:
    • Use 1/4 Kelly para conservadorismo institucional
 6. ALERTAS: anomalias detectadas, riscos não cobertos, limitações da análise
 7. DISCLAIMER: "Análise quantitativa — não é recomendação de investimento"
+
+MODELO PREDITIVO (AUXILIAR):
+• Trate o forecast de ML como sinal secundário, nunca como fonte única.
+• Se confiança, MAPE ou qualidade de dados estiverem ruins, diga explicitamente que o forecast não é acionável.
+• Se houver conflito entre sinais técnicos e forecast, reporte o conflito em ALERTAS.
 
 REGRAS CRÍTICAS ANTI-ALUCINAÇÃO:
 • Se um campo aparece como "(não coletado)" no contexto, reporte-o como indisponível.
@@ -1046,13 +1082,180 @@ async def features_exec_node(state: QuantAgentState) -> dict:
     return {
         **state.model_dump(),
         "messages": state.messages + [AIMessage(content=content)],
-        "next_action": NextAction.TREND_INTERPRET,  # Route to multi-timeframe interpretation
+        "next_action": NextAction.FORECAST,  # Route to forecast before interpretation
         "intermediate_steps_global": state.intermediate_steps_global + steps,
         "intermediate_steps_agent": steps,
         "exec_rsi_14": exec_rsi_14,
         "exec_macd_line": exec_macd_line,
         "exec_macd_signal": exec_macd_signal,
         "cot": cot,
+    }
+
+
+async def _run_apollo_backtest_with_polling(symbol: str) -> tuple[ApolloBacktestOutput, int]:
+    """Run or poll Apollo backtest until it is available or timeout expires."""
+    settings = get_settings()
+    client = get_apollo_client()
+    deadline = datetime.now(UTC).timestamp() + settings.apollo_train_timeout_seconds
+    polls = 0
+
+    while True:
+        polls += 1
+        try:
+            result = await client.backtest(
+                symbol=symbol,
+                num_periods=settings.apollo_backtest_periods,
+            )
+            return result, polls
+        except ApolloApiError as exc:
+            if datetime.now(UTC).timestamp() >= deadline:
+                raise ApolloApiError(
+                    f"Apollo backtest não ficou disponível a tempo: {exc}",
+                    status_code=exc.status_code,
+                    payload=exc.payload,
+                ) from exc
+            await asyncio.sleep(settings.apollo_poll_interval_seconds)
+
+
+@timed_async("Node: Forecast")
+async def forecast_node(state: QuantAgentState) -> dict:
+    """Apollo forecast node with safe training/backtest fallback."""
+    settings = get_settings()
+    client = get_apollo_client()
+    window = build_prediction_window(
+        lookback_days=settings.apollo_prediction_lookback_days,
+    )
+
+    warnings = list(state.forecast_warnings)
+    training_attempts = 0
+    backtest_error_pct: float | None = None
+    prediction: ApolloPredictionOutput | None = None
+    status = "ready"
+    action_step = "apollo_predict"
+
+    try:
+        prediction = await client.predict(
+            symbol=state.symbol,
+            start_date=window.start_date,
+            end_date=window.end_date,
+        )
+    except ApolloApiError as exc:
+        if not exc.missing_model:
+            warnings.append(f"forecast indisponível: {exc}")
+            status = "unavailable"
+        else:
+            status = "training_required"
+            action_step = "apollo_train"
+            for attempt in range(1, settings.apollo_train_max_attempts + 1):
+                try:
+                    training_attempts = attempt
+                    train_result = await client.train(
+                        symbol=state.symbol,
+                        lookback_days=settings.apollo_train_lookback_days,
+                    )
+                    warnings.append(
+                        f"treino Apollo iniciado (tentativa {attempt}/{settings.apollo_train_max_attempts}): {train_result.status}"
+                    )
+                    backtest_result, _ = await _run_apollo_backtest_with_polling(state.symbol)
+                    if len(backtest_result.results) < settings.apollo_backtest_periods:
+                        warnings.append("backtest Apollo retornou menos períodos que o esperado")
+                        continue
+                    last_period = backtest_result.results[-1]
+                    backtest_error_pct = calculate_error_pct(
+                        last_period.current_price,
+                        last_period.predicted_price,
+                    )
+                    if backtest_error_pct is None:
+                        warnings.append("não foi possível calcular erro do quinto período do backtest")
+                        continue
+                    if backtest_error_pct <= settings.apollo_backtest_error_threshold_pct:
+                        prediction = await client.predict(
+                            symbol=state.symbol,
+                            start_date=window.start_date,
+                            end_date=window.end_date,
+                        )
+                        status = "trained_and_validated"
+                        action_step = "apollo_backtest"
+                        break
+                    warnings.append(
+                        "backtest Apollo reprovado no 5o período "
+                        f"({backtest_error_pct:.2f}% > {settings.apollo_backtest_error_threshold_pct:.2f}%)"
+                    )
+                except ApolloApiError as train_exc:
+                    warnings.append(f"falha Apollo na tentativa {attempt}: {train_exc}")
+                    status = "training_error"
+            if prediction is None:
+                warnings.append("forecast Apollo descartado após limite de retreinos")
+                status = "validation_failed"
+
+    if prediction is None:
+        return {
+            **state.model_dump(),
+            "messages": state.messages + [AIMessage(content="Apollo forecast indisponível ou não confiável.")],
+            "next_action": NextAction.TREND_INTERPRET,
+            "intermediate_steps_global": state.intermediate_steps_global + [(
+                action_step,
+                status if not warnings else " | ".join(warnings[-3:]),
+            )],
+            "forecast_period_start": window.start_date,
+            "forecast_period_end": window.end_date,
+            "forecast_training_attempts": training_attempts,
+            "forecast_backtest_error_pct": backtest_error_pct,
+            "forecast_status": status,
+            "forecast_warnings": warnings,
+            "forecast_actionable": False,
+            "cot": "",
+        }
+
+    forecast_return_pct = calculate_return_pct(
+        prediction.current_price,
+        prediction.predicted_price,
+    )
+    model_mape = prediction.confidence_explanation.model_mape
+    data_quality = prediction.confidence_explanation.data_quality
+    quality = assess_forecast_quality(
+        confidence=prediction.confidence,
+        model_mape=model_mape,
+        data_quality=data_quality,
+        data_points=prediction.data_points,
+        predicted_return_pct=forecast_return_pct,
+        confidence_threshold=settings.apollo_confidence_threshold,
+        mape_threshold=settings.apollo_mape_threshold,
+    )
+    warnings.extend(quality.warnings)
+    if status == "ready":
+        status = "ready_existing_model" if quality.actionable else "low_quality"
+    elif status == "trained_and_validated" and not quality.actionable:
+        status = "trained_but_low_quality"
+
+    summary = (
+        f"Apollo {prediction.direction} | conf={prediction.confidence:.1%} | "
+        f"ret={(forecast_return_pct if forecast_return_pct is not None else 0.0):.2f}% | "
+        f"mape={model_mape if model_mape is not None else -1:.2f}"
+    )
+
+    return {
+        **state.model_dump(),
+        "messages": state.messages + [AIMessage(content=summary)],
+        "next_action": NextAction.TREND_INTERPRET,
+        "intermediate_steps_global": state.intermediate_steps_global + [(action_step, summary)],
+        "forecast_period_start": prediction.period_start,
+        "forecast_period_end": prediction.period_end,
+        "forecast_data_points": prediction.data_points,
+        "forecast_current_price": prediction.current_price,
+        "forecast_predicted_price": prediction.predicted_price,
+        "forecast_direction": prediction.direction,
+        "forecast_confidence": prediction.confidence,
+        "forecast_model_mape": model_mape,
+        "forecast_period_volatility": prediction.confidence_explanation.period_volatility,
+        "forecast_data_quality": data_quality,
+        "forecast_return_pct": forecast_return_pct,
+        "forecast_backtest_error_pct": backtest_error_pct,
+        "forecast_training_attempts": training_attempts,
+        "forecast_status": status,
+        "forecast_actionable": quality.actionable,
+        "forecast_warnings": warnings,
+        "cot": "",
     }
 
 
@@ -1162,6 +1365,28 @@ async def decision_engine_node(state: QuantAgentState) -> dict:
         moe_signal=state.moe_final_signal,  # MoE as auxiliary input
         moe_confidence=state.moe_final_confidence,
     )
+
+    forecast_quality = assess_forecast_quality(
+        confidence=state.forecast_confidence,
+        model_mape=state.forecast_model_mape,
+        data_quality=state.forecast_data_quality,
+        data_points=state.forecast_data_points,
+        predicted_return_pct=state.forecast_return_pct,
+        confidence_threshold=get_settings().apollo_confidence_threshold,
+        mape_threshold=get_settings().apollo_mape_threshold,
+    )
+    overlay_signal, overlay_confidence, overlay_reason = overlay_forecast_on_signal(
+        signal=decision.signal.value,
+        confidence=decision.confidence,
+        forecast_quality=forecast_quality,
+        predicted_return_pct=state.forecast_return_pct,
+    )
+    if overlay_signal != decision.signal.value or overlay_confidence != decision.confidence:
+        decision.signal = FinalSignal(overlay_signal)
+        decision.confidence = overlay_confidence
+        decision.reasoning = f"{decision.reasoning} | Overlay ML: {overlay_reason}"
+    elif state.forecast_confidence is not None:
+        decision.reasoning = f"{decision.reasoning} | Overlay ML: {overlay_reason}"
     
     print(f"[DEBUG] Decision Engine - final_signal: {decision.signal.value}")
     print(f"[DEBUG] Decision Engine - signal_type: {decision.signal_type.value}")
@@ -1814,6 +2039,21 @@ SINAL
 QUALIDADE DOS DADOS
   Anomalias:       {state.anomalies_detected or 'Nenhuma'}
 
+MODELO PREDITIVO (APOLLO)
+  Status:          {state.forecast_status}
+  Janela:          {state.forecast_period_start or '(não coletado)'} -> {state.forecast_period_end or '(não coletado)'}
+  Data points:     {state.forecast_data_points if state.forecast_data_points is not None else '(não coletado)'}
+  Current price:   {_fmt(state.forecast_current_price, prec=2)}
+  Predicted price: {_fmt(state.forecast_predicted_price, prec=2)}
+  Direção ML:      {state.forecast_direction or '(não coletado)'}
+  Forecast ret.:   {_fmt(state.forecast_return_pct, prec=2)}%
+  Confiança ML:    {_fmt(state.forecast_confidence, pct=True)}
+  MAPE modelo:     {_fmt(state.forecast_model_mape, prec=2)}%
+  Qualidade dados: {state.forecast_data_quality or '(não coletado)'}
+  Acionável:       {state.forecast_actionable}
+  Backtest p5 err: {_fmt(state.forecast_backtest_error_pct, prec=2)}%
+  Avisos ML:       {state.forecast_warnings or 'Nenhum'}
+
 RISK GATE
   Aprovado:        {state.gate_approved}
   Motivo:          {state.gate_reason}
@@ -1904,6 +2144,7 @@ def build_quant_graph() -> Any:
     workflow.add_node("features_macro", features_macro_node)    # 1D - regime detection
     workflow.add_node("features_setup", features_setup_node)    # 4H - signal generation
     workflow.add_node("features_exec",  features_exec_node)     # 1H - execution timing
+    workflow.add_node("forecast",       forecast_node)          # Apollo ML forecast
     workflow.add_node("trend_interpret", trend_interpret_node)  # Multi-timeframe hierarchical interpretation
     workflow.add_node("decision_engine", decision_engine_node)  # Deterministic decision layer (FINAL authority)
     workflow.add_node("features",       feature_engineering_node)  # Legacy (will be phased out)
@@ -1923,7 +2164,8 @@ def build_quant_graph() -> Any:
     workflow.add_edge("market_data",  "features_macro")   # 1D for regime
     workflow.add_edge("features_macro", "features_setup")  # 4H for signal
     workflow.add_edge("features_setup", "features_exec")   # 1H for execution
-    workflow.add_edge("features_exec",  "trend_interpret") # Hierarchical interpretation
+    workflow.add_edge("features_exec",  "forecast")        # Apollo forecast
+    workflow.add_edge("forecast",       "trend_interpret") # Hierarchical interpretation
     workflow.add_edge("trend_interpret", "decision_engine") # Decision engine (FINAL authority)
     workflow.add_edge("decision_engine", "risk")          # Risk uses final decision
     workflow.add_edge("risk",         "risk_gate")        # Risk gate uses final decision (bypass signal/moe)
