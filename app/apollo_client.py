@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from typing import Any, Optional
 
 import httpx
@@ -14,6 +15,8 @@ from app.agent.schemas import (
     ApolloTrainingOutput,
 )
 from app.config import get_settings
+
+logger = logging.getLogger(__name__)
 
 
 class ApolloApiError(RuntimeError):
@@ -85,16 +88,23 @@ class ApolloApiClient:
         start_date: str,
         end_date: str,
     ) -> ApolloPredictionOutput:
-        data = await self._request_json(
-            "POST",
-            "/ml/predict",
-            json_body={
-                "symbol": symbol,
-                "start_date": start_date,
-                "end_date": end_date,
-            },
-        )
-        return ApolloPredictionOutput.model_validate(data)
+        logger.info(f"[APOLLO] Iniciando predict para {symbol} | período: {start_date} até {end_date}")
+        try:
+            data = await self._request_json(
+                "POST",
+                "/ml/predict",
+                json_body={
+                    "symbol": symbol,
+                    "start_date": start_date,
+                    "end_date": end_date,
+                },
+            )
+            result = ApolloPredictionOutput.model_validate(data)
+            logger.info(f"[APOLLO] ✅ Predict bem-sucedido | {symbol} | direção: {result.direction} | confiança: {result.confidence:.1%}")
+            return result
+        except Exception as e:
+            logger.error(f"[APOLLO] ❌ Predict falhou para {symbol}: {str(e)}")
+            raise
 
     async def train(
         self,
@@ -105,18 +115,25 @@ class ApolloApiClient:
         tft_max_epochs: int = 10,
         xgb_n_estimators: int = 200,
     ) -> ApolloTrainingOutput:
-        data = await self._request_json(
-            "POST",
-            "/ml/train",
-            json_body={
-                "symbol": symbol,
-                "lookback_days": lookback_days,
-                "use_walk_forward": use_walk_forward,
-                "tft_max_epochs": tft_max_epochs,
-                "xgb_n_estimators": xgb_n_estimators,
-            },
-        )
-        return ApolloTrainingOutput.model_validate(data)
+        logger.info(f"[APOLLO] Iniciando train para {symbol} | lookback: {lookback_days} dias")
+        try:
+            data = await self._request_json(
+                "POST",
+                "/ml/train",
+                json_body={
+                    "symbol": symbol,
+                    "lookback_days": lookback_days,
+                    "use_walk_forward": use_walk_forward,
+                    "tft_max_epochs": tft_max_epochs,
+                    "xgb_n_estimators": xgb_n_estimators,
+                },
+            )
+            result = ApolloTrainingOutput.model_validate(data)
+            logger.info(f"[APOLLO] ✅ Train iniciado | {symbol} | status: {result.status}")
+            return result
+        except Exception as e:
+            logger.error(f"[APOLLO] ❌ Train falhou para {symbol}: {str(e)}")
+            raise
 
     async def backtest(
         self,
@@ -124,15 +141,22 @@ class ApolloApiClient:
         symbol: str,
         num_periods: int = 5,
     ) -> ApolloBacktestOutput:
-        data = await self._request_json(
-            "POST",
-            "/ml/backtest",
-            params={
-                "symbol": symbol,
-                "num_periods": str(num_periods),
-            },
-        )
-        return ApolloBacktestOutput.model_validate(data)
+        logger.info(f"[APOLLO] Iniciando backtest para {symbol} | períodos: {num_periods}")
+        try:
+            data = await self._request_json(
+                "POST",
+                "/ml/backtest",
+                params={
+                    "symbol": symbol,
+                    "num_periods": str(num_periods),
+                },
+            )
+            result = ApolloBacktestOutput.model_validate(data)
+            logger.info(f"[APOLLO] ✅ Backtest concluído | {symbol} | períodos testados: {result.periods_tested}")
+            return result
+        except Exception as e:
+            logger.error(f"[APOLLO] ❌ Backtest falhou para {symbol}: {str(e)}")
+            raise
 
     async def _request_json(
         self,
@@ -146,8 +170,15 @@ class ApolloApiClient:
         url = f"{self.base_url}{path}"
         last_error: Exception | None = None
 
+        logger.debug(f"[APOLLO] HTTP {method} {url}")
+        if json_body:
+            logger.debug(f"[APOLLO] Body: {json.dumps(json_body, indent=2)}")
+        if params:
+            logger.debug(f"[APOLLO] Params: {params}")
+
         for attempt in range(2):
             try:
+                logger.debug(f"[APOLLO] Tentativa {attempt + 1}/2")
                 response = await client.request(
                     method,
                     url,
@@ -155,20 +186,30 @@ class ApolloApiClient:
                     params=params,
                     headers={"Content-Type": "application/json"},
                 )
+                logger.debug(f"[APOLLO] Status HTTP: {response.status_code}")
+
                 if response.is_error:
+                    error_msg = self._extract_error_message(response)
+                    logger.error(f"[APOLLO] ❌ Erro HTTP {response.status_code} | {error_msg}")
                     raise ApolloApiError(
-                        self._extract_error_message(response),
+                        error_msg,
                         status_code=response.status_code,
                         payload=self._safe_json(response),
                     )
-                return self._safe_json(response)
+
+                result = self._safe_json(response)
+                logger.debug(f"[APOLLO] ✅ Resposta bem-sucedida")
+                return result
             except (httpx.RemoteProtocolError, httpx.WriteError, httpx.ReadError, httpx.ConnectError) as exc:
+                logger.warning(f"[APOLLO] ⚠️ Erro de transporte na tentativa {attempt + 1}: {type(exc).__name__}: {str(exc)}")
                 last_error = exc
                 await self.close()
                 client = await self._get_client()
-            except ApolloApiError:
+            except ApolloApiError as e:
+                logger.error(f"[APOLLO] ❌ Erro da API: {str(e)}")
                 raise
 
+        logger.error(f"[APOLLO] ❌ Falha após 2 tentativas: {last_error}")
         raise ApolloApiError(f"Apollo transport error: {last_error}")
 
     @staticmethod

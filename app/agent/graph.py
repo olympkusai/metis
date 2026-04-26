@@ -1169,11 +1169,16 @@ async def _run_apollo_backtest_with_polling(symbol: str) -> tuple[ApolloBacktest
 @timed_async("Node: Forecast")
 async def forecast_node(state: QuantAgentState) -> dict:
     """Apollo forecast node with safe training/backtest fallback."""
+    import logging
+    logger = logging.getLogger(__name__)
+
+    logger.info(f"[FORECAST] Iniciando nó de forecast para {state.symbol}")
     settings = get_settings()
     client = get_apollo_client()
     window = build_prediction_window(
         lookback_days=settings.apollo_prediction_lookback_days,
     )
+    logger.info(f"[FORECAST] Janela de predição: {window.start_date} até {window.end_date}")
 
     warnings = list(state.forecast_warnings)
     training_attempts = 0
@@ -1183,29 +1188,37 @@ async def forecast_node(state: QuantAgentState) -> dict:
     action_step = "apollo_predict"
 
     try:
+        logger.info(f"[FORECAST] Chamando Apollo predict para {state.symbol}")
         prediction = await client.predict(
             symbol=state.symbol,
             start_date=window.start_date,
             end_date=window.end_date,
         )
+        logger.info(f"[FORECAST] ✅ Predict retornou: {prediction.direction} com {prediction.confidence:.1%} confiança")
     except ApolloApiError as exc:
+        logger.error(f"[FORECAST] ❌ Erro Apollo: {str(exc)} (status: {exc.status_code}, missing_model: {exc.missing_model})")
         if not exc.missing_model:
             warnings.append(f"forecast indisponível: {exc}")
             status = "unavailable"
+            logger.error(f"[FORECAST] Forecast indisponível, status: {status}")
         else:
             status = "training_required"
             action_step = "apollo_train"
+            logger.warning(f"[FORECAST] Modelo não encontrado, iniciando treinamento...")
             for attempt in range(1, settings.apollo_train_max_attempts + 1):
                 try:
                     training_attempts = attempt
+                    logger.info(f"[FORECAST] Tentativa de treinamento {attempt}/{settings.apollo_train_max_attempts}")
                     train_result = await client.train(
                         symbol=state.symbol,
                         lookback_days=settings.apollo_train_lookback_days,
                     )
+                    logger.info(f"[FORECAST] ✅ Treinamento iniciado: {train_result.status}")
                     warnings.append(
                         f"treino Apollo iniciado (tentativa {attempt}/{settings.apollo_train_max_attempts}): {train_result.status}"
                     )
-                    backtest_result, _ = await _run_apollo_backtest_with_polling(state.symbol)
+                    backtest_result, polls = await _run_apollo_backtest_with_polling(state.symbol)
+                    logger.info(f"[FORECAST] ✅ Backtest concluído após {polls} polls | períodos: {backtest_result.periods_tested}")
                     if len(backtest_result.results) < settings.apollo_backtest_periods:
                         warnings.append("backtest Apollo retornou menos períodos que o esperado")
                         continue
@@ -1306,6 +1319,8 @@ async def forecast_node(state: QuantAgentState) -> dict:
         "forecast_warnings": warnings,
         "cot": "",
     }
+
+    logger.info(f"[FORECAST] ✅ Nó concluído | status: {status} | acionável: {quality.actionable} | avisos: {len(warnings)}")
 
 
 @timed_async("Node: TrendInterpretation")
