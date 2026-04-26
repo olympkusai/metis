@@ -1549,10 +1549,12 @@ async def feature_engineering_node(state: QuantAgentState) -> dict:
 @timed_async("Node: ForecastQuestion")
 async def forecast_question_node(state: QuantAgentState) -> dict:
     """Responde perguntas simples sobre previsões futuras do Apollo."""
-    if not state.forecast_confidence:
+    if not state.forecast_confidence and state.forecast_status not in ["ready_existing_model", "trained_and_validated"]:
+        fallback = f"A previsão do Apollo não está disponível: {state.forecast_status}. "
+        fallback += "Verifique a disponibilidade do serviço Apollo e tente novamente."
         return {
             **state.model_dump(),
-            "final_answer": "Desculpe, não há previsão disponível no momento. Tente novamente mais tarde.",
+            "final_answer": fallback,
         }
 
     settings = get_settings()
@@ -2270,8 +2272,14 @@ def build_quant_graph() -> Any:
     # Conditional: forecast → question answering or full analysis
     def route_after_forecast(state: QuantAgentState) -> str:
         msg = (state.messages[-1].content if state.messages else "").lower()
-        simple_forecast_keywords = ["como vai", "prevê", "forecast", "quando", "próximo", "amanhã", "tomorrow", "predict"]
-        if any(kw in msg for kw in simple_forecast_keywords) and state.forecast_confidence:
+        simple_forecast_keywords = [
+            "como vai", "como estará", "prevê", "forecast", "quando", "próximo",
+            "amanhã", "tomorrow", "predict", "previsão", "vai estar", "estará",
+            "qual é a previsão", "preço do", "preço para", "valor para"
+        ]
+        # Se é pergunta simples sobre forecast, roteia direto (mesmo sem confiança)
+        is_simple_question = any(kw in msg for kw in simple_forecast_keywords)
+        if is_simple_question:
             return "forecast_question"
         return "trend_interpret"
 
