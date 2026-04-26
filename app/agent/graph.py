@@ -284,6 +284,7 @@ NODE_CONFIG = {
     "signal_agent": {"model": "gpt-4o", "cot": True},
     "moe": {"model": "gpt-4o-mini", "cot": False},  # Deterministic, no LLM
     "forecast": {"model": "none", "cot": False},
+    "forecast_question": {"model": "gpt-4o-mini", "cot": False},
     "risk_gate": {"model": "gpt-4o", "cot": True},
     "execution": {"model": "gpt-4o", "cot": True},
 }
@@ -520,6 +521,54 @@ REGRAS CRÍTICAS ANTI-ALUCINAÇÃO:
 • NÃO invente valores. NÃO extrapole. Sintetize apenas o que está no contexto.
 
 Tom: analista institucional sênior. Preciso, direto, sem jargão desnecessário.
+""".strip()
+
+_FORECAST_RESPONSE_SYSTEM = """
+Você é um assistente especializado em análise de previsões de machine learning para ativos cripto.
+
+CONTEXTO:
+O modelo Apollo foi treinado com dados históricos usando técnicas de Time Series Forecasting (TFT + XGBoost).
+Você tem acesso a:
+- Previsão de preço para um período específico
+- Nível de confiança do modelo (0-100%)
+- Erro médio do modelo (MAPE - Mean Absolute Percentage Error)
+- Qualidade dos dados de treinamento
+- Volatilidade histórica do período
+
+DIRETRIZES PARA RESPOSTA:
+
+1. AVALIAÇÃO DE QUALIDADE
+   • Confiança >= 60% E MAPE <= 2.5% E Data Quality = "good" → Forecast é ACIONÁVEL
+   • Qualquer condição fora disso → Forecast é AUXILIAR apenas, nunca use como decisão única
+
+2. INTERPRETAÇÃO DO VIÉS DIRECIONAL
+   • DOWN: preço previsto < preço atual (retorno negativo esperado)
+   • UP: preço previsto > preço atual (retorno positivo esperado)
+   • FLAT: variação < 0.5% em ambas as direções
+
+3. ESTRUTURA DE RESPOSTA
+   a) STATUS DO FORECAST: Está acionável? Qualidade dos dados?
+   b) PREVISÃO DIRECIONAL: Qual é a direção prevista e o retorno esperado?
+   c) CONFIANÇA: Nível de confiança com contexto (se baixa, explique)
+   d) LIMITAÇÕES: Cite explicitamente qualquer fraqueza (MAPE alto, confiança baixa, dados limitados)
+   e) DISCLAIMER: "Esta é uma previsão de ML — não substitui análise técnica completa nem é recomendação de investimento"
+
+4. LINGUAGEM
+   • Use tom profissional mas acessível
+   • Sempre cite os números (confiança, MAPE, preço previsto)
+   • Seja honesto sobre limitações — nunca "venda" a previsão como certa
+   • Se pergunta for sobre período muito curto (< 30 dias), avise que modelo é mais confiável para períodos maiores
+
+5. EXEMPLO DE BOA RESPOSTA:
+   "O modelo Apollo prevê Bitcoin DOWN com retorno estimado de -4.3% para o período 2026-01-01 até 2026-04-25.
+   - Confiança: 60.9% (marginal, acima do mínimo)
+   - Erro histórico (MAPE): 1.86% (excelente, bem abaixo do limite)
+   - Qualidade dados: Good
+   - Volatilidade esperada: 2.91%
+
+   ⚠️ IMPORTANTE: Este é um sinal auxiliar baseado em ML. Não use como única base para decisão."
+
+FERRAMENTAS: Nenhuma — use apenas o contexto de forecast fornecido
 """.strip()
 
 # ─────────────────────────────────────────────
@@ -1496,6 +1545,57 @@ async def feature_engineering_node(state: QuantAgentState) -> dict:
         "cot":                cot,
     }
 
+
+@timed_async("Node: ForecastQuestion")
+async def forecast_question_node(state: QuantAgentState) -> dict:
+    """Responde perguntas simples sobre previsões futuras do Apollo."""
+    if not state.forecast_confidence:
+        return {
+            **state.model_dump(),
+            "final_answer": "Desculpe, não há previsão disponível no momento. Tente novamente mais tarde.",
+        }
+
+    settings = get_settings()
+    forecast_summary = f"""
+PREVISÃO APOLLO:
+- Símbolo: {state.symbol}
+- Período: {state.forecast_period_start} até {state.forecast_period_end}
+- Direção: {state.forecast_direction}
+- Preço Atual: ${state.forecast_current_price:.2f if state.forecast_current_price else 'N/A'}
+- Preço Previsto: ${state.forecast_predicted_price:.2f if state.forecast_predicted_price else 'N/A'}
+- Retorno Esperado: {state.forecast_return_pct:.2f if state.forecast_return_pct is not None else 'N/A'}%
+- Confiança: {state.forecast_confidence:.1%}
+- MAPE do Modelo: {state.forecast_model_mape:.2f if state.forecast_model_mape is not None else 'N/A'}%
+- Qualidade dos Dados: {state.forecast_data_quality or 'N/A'}
+- Volatilidade: {state.forecast_period_volatility:.2f if state.forecast_period_volatility else 'N/A'}%
+- Acionável: {state.forecast_actionable}
+- Data Points: {state.forecast_data_points}
+- Status: {state.forecast_status}
+- Avisos: {'; '.join(state.forecast_warnings) if state.forecast_warnings else 'Nenhum'}
+
+CRITÉRIOS DE QUALIDADE:
+- Threshold Confiança: >= {settings.apollo_confidence_threshold:.0%}
+- Threshold MAPE: <= {settings.apollo_mape_threshold:.2f}%
+"""
+
+    user_question = state.messages[-1].content if state.messages else ""
+    llm = _make_llm(model="gpt-4o-mini", temperature=0.1)
+
+    try:
+        response = await llm.ainvoke([
+            {"role": "system", "content": _FORECAST_RESPONSE_SYSTEM},
+            {"role": "user", "content": f"{user_question}\n\n{forecast_summary}"}
+        ])
+        final_answer = response.content if hasattr(response, 'content') else str(response)
+    except Exception as e:
+        final_answer = f"Erro ao processar previsão: {str(e)}"
+
+    return {
+        **state.model_dump(),
+        "final_answer": final_answer,
+        "messages": state.messages + [AIMessage(content=final_answer)],
+    }
+
 @timed_async("Node: RiskAgent")
 async def risk_agent_node(state: QuantAgentState) -> dict:
     """
@@ -2154,6 +2254,7 @@ def build_quant_graph() -> Any:
     workflow.add_node("risk_gate",      pre_trade_risk_gate_node)
     workflow.add_node("execution",      execution_node)
     workflow.add_node("blocked",        blocked_node)
+    workflow.add_node("forecast_question", forecast_question_node)  # Simple forecast Q&A
     workflow.add_node("finalize",       finalize_node)
 
     # Entry
@@ -2165,7 +2266,24 @@ def build_quant_graph() -> Any:
     workflow.add_edge("features_macro", "features_setup")  # 4H for signal
     workflow.add_edge("features_setup", "features_exec")   # 1H for execution
     workflow.add_edge("features_exec",  "forecast")        # Apollo forecast
-    workflow.add_edge("forecast",       "trend_interpret") # Hierarchical interpretation
+
+    # Conditional: forecast → question answering or full analysis
+    def route_after_forecast(state: QuantAgentState) -> str:
+        msg = (state.messages[-1].content if state.messages else "").lower()
+        simple_forecast_keywords = ["como vai", "prevê", "forecast", "quando", "próximo", "amanhã", "tomorrow", "predict"]
+        if any(kw in msg for kw in simple_forecast_keywords) and state.forecast_confidence:
+            return "forecast_question"
+        return "trend_interpret"
+
+    workflow.add_conditional_edges(
+        "forecast",
+        route_after_forecast,
+        {
+            "forecast_question": "forecast_question",
+            "trend_interpret": "trend_interpret",
+        },
+    )
+
     workflow.add_edge("trend_interpret", "decision_engine") # Decision engine (FINAL authority)
     workflow.add_edge("decision_engine", "risk")          # Risk uses final decision
     workflow.add_edge("risk",         "risk_gate")        # Risk gate uses final decision (bypass signal/moe)
@@ -2183,6 +2301,7 @@ def build_quant_graph() -> Any:
     # Terminal nodes → finalize → END
     workflow.add_edge("execution", "finalize")
     workflow.add_edge("blocked",   "finalize")
+    workflow.add_edge("forecast_question", "finalize")
     workflow.add_edge("finalize",  END)
 
     return workflow.compile()
