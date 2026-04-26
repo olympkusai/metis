@@ -54,11 +54,6 @@ from app.agent.schemas import (
     ApolloBacktestOutput,
     ApolloPredictionOutput,
     OrchestratorOutput,
-    MarketDataOutput,
-    FeatureEngineeringOutput,
-    RiskAgentOutput,
-    SignalAgentOutput,
-    RiskGateOutput,
     LivePriceOutput,
     IndicatorsOutput,
     RSIOutput,
@@ -1874,7 +1869,7 @@ async def trend_interpret_node(state: QuantAgentState) -> dict:
     return {
         **state.model_dump(),
         "messages": state.messages + [AIMessage(content=interpretation['reasoning'])],
-        "next_action": NextAction.DECISION_ENGINE,  # Route to decision engine (FINAL authority)
+        "next_action": NextAction.SIGNAL,  # Route to signal_agent (then moe → decision_engine)
         "intermediate_steps_global": state.intermediate_steps_global + [("trend_interpret", interpretation['reasoning'])],
         "trend_state": interpretation['trend_state'],
         "trend_direction": interpretation['signal_direction'],
@@ -2336,7 +2331,7 @@ async def risk_agent_node(state: QuantAgentState) -> dict:
     return {
         **state.model_dump(),
         "messages":           state.messages + [AIMessage(content=content)],
-        "next_action":        NextAction.SIGNAL,
+        "next_action":        NextAction.RISK_GATE,
         "intermediate_steps_global": state.intermediate_steps_global + steps,
         "intermediate_steps_agent": steps,
         "var_95":             var_95,
@@ -2469,7 +2464,7 @@ async def moe_node(state: QuantAgentState) -> dict:
     return {
         **state.model_dump(),
         "messages": state.messages + [AIMessage(content=f"MoE signal: {moe_output.final_signal:.3f}, confidence: {moe_output.final_confidence:.3f}")],
-        "next_action": NextAction.RISK_GATE,
+        "next_action": NextAction.DECISION_ENGINE,  # MoE feeds into decision_engine (FINAL authority)
         "moe_final_signal": moe_output.final_signal,
         "moe_final_confidence": moe_output.final_confidence,
         "moe_selected_experts": [e.value for e in moe_output.selected_experts],
@@ -2785,6 +2780,52 @@ def finalize_node(state: QuantAgentState) -> dict:
 # 7. GRAPH ASSEMBLY
 # ─────────────────────────────────────────────
 
+# Roteamento condicional após o nó `forecast`. Mantido em nível de módulo
+# (não como closure dentro de `build_quant_graph`) para permitir testes
+# diretos e travar a regressão em que o pipeline lia `messages[-1]`
+# (uma AIMessage upstream) em vez da pergunta original do usuário.
+_FORECAST_FUTURE_KEYWORDS: tuple[str, ...] = (
+    "como vai", "como estara", "preve", "forecast", "quando", "proximo",
+    "amanha", "tomorrow", "predict", "previsao", "vai estar", "estara",
+    "qual e a previsao", "proximas", "semana que vem", "proximo mes",
+    "futuro", "future",
+)
+
+_FORECAST_CURRENT_PRICE_KEYWORDS: tuple[str, ...] = (
+    "agora", "atualmente", "neste momento", "no momento", "esta em",
+    "qual e o preco", "como esta", "currently", "now",
+)
+
+
+def route_after_forecast(state: QuantAgentState) -> str:
+    """Decide se a pergunta corrente do usuário pede previsão futura
+    (`forecast_question`) ou contexto/preço atual (`trend_interpret`).
+
+    Olha a ÚLTIMA `HumanMessage` em `state.messages` (não a última
+    mensagem absoluta — esta já é uma `AIMessage` produzida pelos
+    nós upstream do pipeline; nem a primeira `HumanMessage` —
+    em conversas multi-turno o `chat.py` injeta histórico/contexto
+    como `HumanMessage` antes da pergunta corrente).
+
+    Texto é normalizado (lowercase, sem acentos, sem pontuação)
+    antes de comparar com as keywords, para tolerar variações como
+    "amanhã"/"amanha", "previsão"/"previsao".
+    """
+    original = next(
+        (m for m in reversed(state.messages) if isinstance(m, HumanMessage)),
+        None,
+    )
+    msg = _normalize_text(original.content if original else "")
+
+    if any(kw in msg for kw in _FORECAST_CURRENT_PRICE_KEYWORDS):
+        return "trend_interpret"
+
+    if any(kw in msg for kw in _FORECAST_FUTURE_KEYWORDS):
+        return "forecast_question"
+
+    return "trend_interpret"
+
+
 def build_quant_graph() -> Any:
     workflow = StateGraph(QuantAgentState)
 
@@ -2835,32 +2876,6 @@ def build_quant_graph() -> Any:
     workflow.add_edge("features_exec",  "forecast")        # Apollo forecast
 
     # Conditional: forecast → question answering or full analysis
-    def route_after_forecast(state: QuantAgentState) -> str:
-        msg = (state.messages[-1].content if state.messages else "").lower()
-
-        # Palavras-chave que indicam previsão FUTURA (próximos dias/semanas)
-        future_forecast_keywords = [
-            "como vai", "como estará", "prevê", "forecast", "quando", "próximo",
-            "amanhã", "tomorrow", "predict", "previsão", "vai estar", "estará",
-            "qual é a previsão", "próximas", "semana que vem", "próximo mês"
-        ]
-
-        # Palavras-chave que indicam pergunta sobre PREÇO ATUAL (excluem forecast)
-        current_price_keywords = [
-            "agora", "atualmente", "neste momento", "no momento", "está em",
-            "qual é o preço", "como está", "atualmente", "currently", "now"
-        ]
-
-        # Se pergunta menciona "agora" ou "atualmente", NÃO é forecast
-        if any(kw in msg for kw in current_price_keywords):
-            return "trend_interpret"
-
-        # Se é pergunta sobre previsão futura, roteia para forecast_question
-        if any(kw in msg for kw in future_forecast_keywords):
-            return "forecast_question"
-
-        return "trend_interpret"
-
     workflow.add_conditional_edges(
         "forecast",
         route_after_forecast,
@@ -2870,9 +2885,15 @@ def build_quant_graph() -> Any:
         },
     )
 
-    workflow.add_edge("trend_interpret", "decision_engine") # Decision engine (FINAL authority)
-    workflow.add_edge("decision_engine", "risk")          # Risk uses final decision
-    workflow.add_edge("risk",         "risk_gate")        # Risk gate uses final decision (bypass signal/moe)
+    # Pipeline: trend_interpret → signal → moe → decision_engine → risk → risk_gate
+    # Rationale: signal/moe alimentam o decision_engine (FINAL authority) com
+    # moe_final_signal/confidence ANTES dele decidir. Assim o decision_engine
+    # realmente tem a palavra final e não é sobrescrito por nós downstream.
+    workflow.add_edge("trend_interpret", "signal")        # Signal agent: alpha generation
+    workflow.add_edge("signal",         "moe")            # Mixture of Experts: combine signals
+    workflow.add_edge("moe",            "decision_engine") # Decision engine (FINAL authority)
+    workflow.add_edge("decision_engine","risk")           # Risk uses final decision
+    workflow.add_edge("risk",           "risk_gate")       # Risk gate: pre-trade checks
 
     # Conditional: risk gate → execution or blocked
     workflow.add_conditional_edges(

@@ -122,23 +122,6 @@ class MaxDrawdownOutput(BaseModel):
     _timing: Optional[dict] = None
 
 
-class SMAOutput(BaseModel):
-    """Structured output for SMA."""
-    symbol: str
-    interval: str
-    period: int
-    sma: float
-    _timing: Optional[dict] = None
-
-
-class EMAReturnOutput(BaseModel):
-    """Structured output for EMA of returns."""
-    symbol: str
-    interval: str
-    ema_return_60: float
-    _timing: Optional[dict] = None
-
-
 class ApolloConfidenceExplanation(BaseModel):
     """Structured output for Apollo confidence explanation."""
     model_mape: Optional[float] = None
@@ -204,72 +187,3 @@ class OrchestratorOutput(BaseModel):
     context: str = ""
 
 
-class MarketDataOutput(BaseModel):
-    """Structured output for Market Data agent."""
-    symbol: str
-    timeframe: str
-    live_price: float
-    volume_24h: float
-    price_change_pct: float
-    anomalies: list[str] = Field(default_factory=list)
-    analysis: str = ""  # LLM narrative analysis
-
-
-class FeatureEngineeringOutput(BaseModel):
-    """Structured output for Feature Engineering agent."""
-    symbol: str
-    timeframe: str
-    rsi_14: float
-    rsi_regime: Literal["overbought", "oversold", "neutral"]
-    macd_line: float
-    macd_signal: float
-    macd_histogram: float
-    macd_crossover: Optional[Literal["bullish", "bearish", "none"]] = None
-    bb_upper: float
-    bb_middle: float
-    bb_lower: float
-    bb_pct_b: float
-    analysis: str = ""  # LLM narrative analysis
-
-
-class RiskAgentOutput(BaseModel):
-    """Structured output for Risk agent."""
-    symbol: str
-    risk_level: Literal["low", "moderate", "high", "extreme"]
-    var_95: Optional[float] = None
-    cvar_95: float
-    sharpe: float
-    max_drawdown: float
-    volatility_annualized: float
-    reasoning: str = ""  # LLM narrative analysis
-
-
-class SignalAgentOutput(BaseModel):
-    """Structured output for Signal agent."""
-    symbol: str
-    regime: Literal["trending", "ranging", "breakout"]
-    signal_direction: Literal["long", "short", "neutral"]
-    signal_confidence: float  # 0.0 to 1.0
-    indicator_convergence: int  # Number of convergent indicators
-    reasoning: str = ""  # LLM narrative analysis
-
-
-class RiskGateOutput(BaseModel):
-    """Structured output for Risk Gate."""
-    approved: bool
-    reason: str
-    blocked_by: list[str] = Field(default_factory=list)
-    warnings: list[str] = Field(default_factory=list)
-
-
-class ExecutionOutput(BaseModel):
-    """Structured output for Execution layer."""
-    symbol: str
-    timeframe: str
-    executive_summary: str
-    technical_analysis: str
-    risk_metrics: str
-    signal: str
-    sizing_suggestion: Optional[str] = None
-    alerts: list[str] = Field(default_factory=list)
-    disclaimer: str = "Análise quantitativa — não é recomendação de investimento"
