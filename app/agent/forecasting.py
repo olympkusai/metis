@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -24,16 +27,27 @@ def build_prediction_window(
     reference_time: datetime | None = None,
     lookback_days: int = 115,
 ) -> PredictionWindow:
-    """Build a stable, completed-day prediction window for Apollo."""
+    """Build a stable, completed-day prediction window for Apollo.
+
+    Garante janela mínima de 60 dias.
+    """
+    # Validar mínimo de 60 dias
+    effective_lookback = max(lookback_days, 60)
+    if effective_lookback > lookback_days:
+        logger.warning(f"[WINDOW] lookback_days={lookback_days} é menor que mínimo (60), usando 60")
+
     now = reference_time.astimezone(UTC) if reference_time else datetime.now(UTC)
     end_day = (now - timedelta(days=1)).date()
-    start_day = end_day - timedelta(days=max(lookback_days - 1, 0))
+    start_day = end_day - timedelta(days=effective_lookback - 1)
     start_dt = datetime(start_day.year, start_day.month, start_day.day, 0, 0, 0, tzinfo=UTC)
     end_dt = datetime(end_day.year, end_day.month, end_day.day, 23, 59, 59, tzinfo=UTC)
-    return PredictionWindow(
+
+    window = PredictionWindow(
         start_date=start_dt.strftime("%Y-%m-%dT%H:%M:%S"),
         end_date=end_dt.strftime("%Y-%m-%dT%H:%M:%S"),
     )
+    logger.info(f"[WINDOW] Janela criada com {effective_lookback} dias | {window.start_date} até {window.end_date}")
+    return window
 
 
 def calculate_error_pct(current_price: float | None, predicted_price: float | None) -> float | None:
