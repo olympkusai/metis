@@ -1097,6 +1097,7 @@ async def features_exec_node(state: QuantAgentState) -> dict:
     Multi-timeframe: Execution layer (1H) - timing + risk.
     Provides execution timing and risk metrics.
     """
+    print("\n🟢🟢🟢 FEATURES EXEC NODE SENDO EXECUTADO!!! 🟢🟢🟢\n")
     print(f"[DEBUG] ===== FEATURES EXEC NODE START (1H) =====")
     print(f"[DEBUG] Input symbol: {state.symbol}")
     
@@ -1177,16 +1178,25 @@ async def _run_apollo_backtest_with_polling(symbol: str) -> tuple[ApolloBacktest
 @timed_async("Node: Forecast")
 async def forecast_node(state: QuantAgentState) -> dict:
     """Apollo forecast node with safe training/backtest fallback."""
+    print("\n🔴🔴🔴 FORECAST NODE SENDO EXECUTADO!!! 🔴🔴🔴\n")
     import logging
     logger = logging.getLogger(__name__)
 
     logger.info(f"[FORECAST] Iniciando nó de forecast para {state.symbol}")
     settings = get_settings()
     client = get_apollo_client()
+    print(f"\n[FORECAST] 🔍 apollo_prediction_lookback_days={settings.apollo_prediction_lookback_days}")
     window = build_prediction_window(
         lookback_days=settings.apollo_prediction_lookback_days,
     )
     logger.info(f"[FORECAST] Janela de predição: {window.start_date} até {window.end_date}")
+
+    # Log detalhado das datas para debug
+    from datetime import datetime
+    start = datetime.fromisoformat(window.start_date.replace('Z', '+00:00'))
+    end = datetime.fromisoformat(window.end_date.replace('Z', '+00:00'))
+    days_diff = (end - start).days
+    print(f"[FORECAST] ✅ CHAMANDO APOLLO: start={window.start_date} | end={window.end_date} | diff={days_diff} dias")
 
     warnings = list(state.forecast_warnings)
     training_attempts = 0
@@ -1196,7 +1206,7 @@ async def forecast_node(state: QuantAgentState) -> dict:
     action_step = "apollo_predict"
 
     try:
-        logger.info(f"[FORECAST] Chamando Apollo predict para {state.symbol}")
+        logger.info(f"[FORECAST] Chamando Apollo predict para {state.symbol} com {days_diff} dias")
         prediction = await client.predict(
             symbol=state.symbol,
             start_date=window.start_date,

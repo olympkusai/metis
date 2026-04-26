@@ -25,28 +25,29 @@ class ForecastQuality:
 def build_prediction_window(
     *,
     reference_time: datetime | None = None,
-    lookback_days: int = 115,
+    lookback_days: int = 60,
 ) -> PredictionWindow:
-    """Build a stable, completed-day prediction window for Apollo.
+    """Build prediction window: ontem até N dias atrás.
 
-    Garante janela mínima de 60 dias.
+    Apollo é responsável por agregar dados de 1m para período adequado.
     """
-    # Validar mínimo de 60 dias
-    effective_lookback = max(lookback_days, 60)
-    if effective_lookback > lookback_days:
-        logger.warning(f"[WINDOW] lookback_days={lookback_days} é menor que mínimo (60), usando 60")
-
     now = reference_time.astimezone(UTC) if reference_time else datetime.now(UTC)
-    end_day = (now - timedelta(days=1)).date()
-    start_day = end_day - timedelta(days=effective_lookback - 1)
+    print(f"[WINDOW] 🔍 DEBUG: now={now} | lookback_days={lookback_days}")
+
+    end_day = (now - timedelta(days=1)).date()  # Ontem (dia completo)
+    start_day = end_day - timedelta(days=lookback_days)  # N dias atrás
+    print(f"[WINDOW] 🔍 DEBUG: end_day={end_day} | start_day={start_day}")
+
     start_dt = datetime(start_day.year, start_day.month, start_day.day, 0, 0, 0, tzinfo=UTC)
     end_dt = datetime(end_day.year, end_day.month, end_day.day, 23, 59, 59, tzinfo=UTC)
+    print(f"[WINDOW] 🔍 DEBUG: start_dt={start_dt} | end_dt={end_dt}")
 
     window = PredictionWindow(
         start_date=start_dt.strftime("%Y-%m-%dT%H:%M:%S"),
         end_date=end_dt.strftime("%Y-%m-%dT%H:%M:%S"),
     )
-    logger.info(f"[WINDOW] Janela criada com {effective_lookback} dias | {window.start_date} até {window.end_date}")
+    days_calc = (end_dt - start_dt).days
+    print(f"[WINDOW] ✅ RESULTADO: {window.start_date} até {window.end_date} | dias={days_calc}")
     return window
 
 

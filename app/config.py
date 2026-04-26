@@ -11,7 +11,7 @@ class Settings(BaseSettings):
     qdrant_api_key: Optional[str] = Field(default=None, description="Qdrant API Key")
     api_base_url: HttpUrl = Field(default="https://api.k0s.app/api/v1", description="API base URL")
     apollo_base_url: str = Field(default="http://apollo.internal:8000", description="Apollo ML API base URL")
-    apollo_prediction_lookback_days: int = Field(default=115, description="Lookback window in days for Apollo predictions")
+    apollo_prediction_lookback_days: int = Field(default=60, description="Lookback window in days for Apollo predictions")
     apollo_train_lookback_days: int = Field(default=365, description="Lookback window in days for Apollo model training")
     apollo_backtest_periods: int = Field(default=5, description="Number of periods to request in Apollo backtests")
     apollo_backtest_error_threshold_pct: float = Field(default=2.5, description="Maximum allowed fifth-period backtest error percentage")
