@@ -525,15 +525,22 @@ Tom: analista institucional sênior. Preciso, direto, sem jargão desnecessário
 
 _FORECAST_RESPONSE_SYSTEM = """
 Você é um assistente especializado em análise de previsões de machine learning para ativos cripto.
+ESCOPO: Responde APENAS sobre previsões FUTURAS (amanhã, próximos dias/semanas).
+
+⚠️ IMPORTANTE - LIMITES DO ESCOPO:
+- NÃO responda perguntas sobre preço ATUAL, preço AGORA, ou status PRESENTE
+- NÃO responda sobre análise técnica, indicadores ou sinais de trading
+- NÃO responda sobre qualidade de dados passados ou histórico de performance
+- Se pergunta é sobre preço atual: "Essa é uma pergunta sobre preço atual. Para isso, use análise técnica ou dados em tempo real. O Apollo é especializado em previsões futuras."
 
 CONTEXTO:
 O modelo Apollo foi treinado com dados históricos usando técnicas de Time Series Forecasting (TFT + XGBoost).
 Você tem acesso a:
-- Previsão de preço para um período específico
+- Previsão de preço para um período específico (FUTURO)
 - Nível de confiança do modelo (0-100%)
 - Erro médio do modelo (MAPE - Mean Absolute Percentage Error)
 - Qualidade dos dados de treinamento
-- Volatilidade histórica do período
+- Volatilidade esperada do período
 
 DIRETRIZES PARA RESPOSTA:
 
@@ -550,8 +557,9 @@ DIRETRIZES PARA RESPOSTA:
    a) STATUS DO FORECAST: Está acionável? Qualidade dos dados?
    b) PREVISÃO DIRECIONAL: Qual é a direção prevista e o retorno esperado?
    c) CONFIANÇA: Nível de confiança com contexto (se baixa, explique)
-   d) LIMITAÇÕES: Cite explicitamente qualquer fraqueza (MAPE alto, confiança baixa, dados limitados)
-   e) DISCLAIMER: "Esta é uma previsão de ML — não substitui análise técnica completa nem é recomendação de investimento"
+   d) PERÍODO: Sempre cite o período da previsão (de X até Y)
+   e) LIMITAÇÕES: Cite explicitamente qualquer fraqueza (MAPE alto, confiança baixa, dados limitados)
+   f) DISCLAIMER: "Esta é uma previsão de ML — não substitui análise técnica completa nem é recomendação de investimento"
 
 4. LINGUAGEM
    • Use tom profissional mas acessível
@@ -560,7 +568,7 @@ DIRETRIZES PARA RESPOSTA:
    • Se pergunta for sobre período muito curto (< 30 dias), avise que modelo é mais confiável para períodos maiores
 
 5. EXEMPLO DE BOA RESPOSTA:
-   "O modelo Apollo prevê Bitcoin DOWN com retorno estimado de -4.3% para o período 2026-01-01 até 2026-04-25.
+   "O modelo Apollo prevê Bitcoin DOWN com retorno estimado de -4.3% para o período de 2026-04-26 até 2026-05-25.
    - Confiança: 60.9% (marginal, acima do mínimo)
    - Erro histórico (MAPE): 1.86% (excelente, bem abaixo do limite)
    - Qualidade dados: Good
@@ -1564,6 +1572,20 @@ async def feature_engineering_node(state: QuantAgentState) -> dict:
 @timed_async("Node: ForecastQuestion")
 async def forecast_question_node(state: QuantAgentState) -> dict:
     """Responde perguntas simples sobre previsões futuras do Apollo."""
+    user_question = (state.messages[-1].content if state.messages else "").lower()
+
+    # Validação: rejeita perguntas sobre preço ATUAL
+    current_price_keywords = [
+        "agora", "atualmente", "neste momento", "no momento", "está em",
+        "qual é o preço", "como está", "currently", "now", "qual o preço atual"
+    ]
+    if any(kw in user_question for kw in current_price_keywords):
+        return {
+            **state.model_dump(),
+            "final_answer": "Essa é uma pergunta sobre preço atual. O Apollo é especializado em previsões futuras (amanhã, próximos dias/semanas). Para preço em tempo real, use dados de mercado diretos.",
+            "messages": state.messages + [AIMessage(content="Essa é uma pergunta sobre preço atual. O Apollo é especializado em previsões futuras (amanhã, próximos dias/semanas). Para preço em tempo real, use dados de mercado diretos.")],
+        }
+
     if not state.forecast_confidence and state.forecast_status not in ["ready_existing_model", "trained_and_validated"]:
         fallback = f"A previsão do Apollo não está disponível: {state.forecast_status}. "
         fallback += "Verifique a disponibilidade do serviço Apollo e tente novamente."
@@ -1595,13 +1617,13 @@ CRITÉRIOS DE QUALIDADE:
 - Threshold MAPE: <= {settings.apollo_mape_threshold:.2f}%
 """
 
-    user_question = state.messages[-1].content if state.messages else ""
+    user_question_original = state.messages[-1].content if state.messages else ""
     llm = _make_llm(model="gpt-4o-mini", temperature=0.1)
 
     try:
         response = await llm.ainvoke([
             {"role": "system", "content": _FORECAST_RESPONSE_SYSTEM},
-            {"role": "user", "content": f"{user_question}\n\n{forecast_summary}"}
+            {"role": "user", "content": f"{user_question_original}\n\n{forecast_summary}"}
         ])
         final_answer = response.content if hasattr(response, 'content') else str(response)
     except Exception as e:
@@ -2287,15 +2309,28 @@ def build_quant_graph() -> Any:
     # Conditional: forecast → question answering or full analysis
     def route_after_forecast(state: QuantAgentState) -> str:
         msg = (state.messages[-1].content if state.messages else "").lower()
-        simple_forecast_keywords = [
+
+        # Palavras-chave que indicam previsão FUTURA (próximos dias/semanas)
+        future_forecast_keywords = [
             "como vai", "como estará", "prevê", "forecast", "quando", "próximo",
             "amanhã", "tomorrow", "predict", "previsão", "vai estar", "estará",
-            "qual é a previsão", "preço do", "preço para", "valor para"
+            "qual é a previsão", "próximas", "semana que vem", "próximo mês"
         ]
-        # Se é pergunta simples sobre forecast, roteia direto (mesmo sem confiança)
-        is_simple_question = any(kw in msg for kw in simple_forecast_keywords)
-        if is_simple_question:
+
+        # Palavras-chave que indicam pergunta sobre PREÇO ATUAL (excluem forecast)
+        current_price_keywords = [
+            "agora", "atualmente", "neste momento", "no momento", "está em",
+            "qual é o preço", "como está", "atualmente", "currently", "now"
+        ]
+
+        # Se pergunta menciona "agora" ou "atualmente", NÃO é forecast
+        if any(kw in msg for kw in current_price_keywords):
+            return "trend_interpret"
+
+        # Se é pergunta sobre previsão futura, roteia para forecast_question
+        if any(kw in msg for kw in future_forecast_keywords):
             return "forecast_question"
+
         return "trend_interpret"
 
     workflow.add_conditional_edges(
