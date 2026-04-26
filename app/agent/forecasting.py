@@ -25,29 +25,29 @@ class ForecastQuality:
 def build_prediction_window(
     *,
     reference_time: datetime | None = None,
-    lookback_days: int = 60,
+    lookback_days: int = 90,
 ) -> PredictionWindow:
-    """Build prediction window: ontem até N dias atrás.
+    """Build prediction window: ontem até N dias atrás (inclusivo).
 
-    Apollo é responsável por agregar dados de 1m para período adequado.
+    A janela cobre `lookback_days` dias completos terminando em `end_day` (último
+    dia completo, i.e., ontem). Por exemplo, com `lookback_days=115` e
+    referência em `2026-04-26`, a janela é `[2026-01-01, 2026-04-25]` — exatamente
+    115 dias inclusivos.
     """
     now = reference_time.astimezone(UTC) if reference_time else datetime.now(UTC)
-    print(f"[WINDOW] 🔍 DEBUG: now={now} | lookback_days={lookback_days}")
+    end_day = (now - timedelta(days=1)).date()
+    # `lookback_days - 1` porque o intervalo é inclusivo em ambos os extremos
+    # (e.g., 115 dias = de end_day até end_day - 114 dias).
+    start_day = end_day - timedelta(days=lookback_days - 1)
 
-    end_day = (now - timedelta(days=1)).date()  # Ontem (dia completo)
-    start_day = end_day - timedelta(days=lookback_days)  # N dias atrás
-    print(f"[WINDOW] 🔍 DEBUG: end_day={end_day} | start_day={start_day}")
-
-    start_dt = datetime(start_day.year, start_day.month, start_day.day, 0, 0, 0, tzinfo=UTC)
-    end_dt = datetime(end_day.year, end_day.month, end_day.day, 23, 59, 59, tzinfo=UTC)
-    print(f"[WINDOW] 🔍 DEBUG: start_dt={start_dt} | end_dt={end_dt}")
+    start_dt = datetime(start_day.year, start_day.month, start_day.day, 0, 0, 0)
+    end_dt = datetime(end_day.year, end_day.month, end_day.day, 23, 59, 59)
 
     window = PredictionWindow(
         start_date=start_dt.strftime("%Y-%m-%dT%H:%M:%S"),
         end_date=end_dt.strftime("%Y-%m-%dT%H:%M:%S"),
     )
-    days_calc = (end_dt - start_dt).days
-    print(f"[WINDOW] ✅ RESULTADO: {window.start_date} até {window.end_date} | dias={days_calc}")
+    print(f"[WINDOW] {window.start_date} até {window.end_date} ({lookback_days}d)", flush=True)
     return window
 
 
@@ -100,8 +100,22 @@ def assess_forecast_quality(
         elif predicted_return_pct < -0.5:
             direction_bias = "bearish"
 
+    # Forecast é acionável se:
+    # 1. Tem uma direção clara (bullish/bearish), OU
+    # 2. Passa nos thresholds principais (confiança e MAPE), MESMO COM outros warnings
+    has_confidence_warning = any("confiança baixa" in w for w in warnings)
+    has_mape_warning = any("MAPE acima do limite" in w for w in warnings)
+    has_critical_warning = has_confidence_warning or has_mape_warning
+
+    is_actionable = (
+        direction_bias != "neutral" and not has_critical_warning
+    ) or (
+        # Alternativa: aceita sem avisos críticos, mesmo se direction_bias neutral
+        not has_critical_warning and len([w for w in warnings if "confiança" in w or "MAPE" in w]) == 0
+    )
+
     return ForecastQuality(
-        actionable=not warnings and direction_bias != "neutral",
+        actionable=is_actionable,
         warnings=warnings,
         direction_bias=direction_bias,
     )

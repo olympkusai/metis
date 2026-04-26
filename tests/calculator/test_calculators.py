@@ -24,11 +24,21 @@ from app.calculator.aggregation import aggregate_ohlcv, INTERVAL_TO_MINUTES
 
 
 def generate_test_candles(count: int) -> list[Candle]:
-    """Generate test candles with realistic price movements."""
+    """Generate test candles with realistic price movements.
+
+    Base time is aligned to the top of an hour to make aggregation tests
+    deterministic regardless of when the suite runs. Without this alignment,
+    100 candles of 1m starting at e.g. 19:34 would span 3 distinct hours
+    (19:34→20:33→21:13), breaking aggregate_1h's expectation of ≤2 buckets.
+    """
     candles: list[Candle] = []
     base_price = 100.0
-    base_time = datetime.now() - timedelta(minutes=count)
-    
+    # Align to top of an hour `ceil(count/60)` hours in the past to ensure
+    # candles partition cleanly into hourly buckets.
+    now = datetime.now().replace(minute=0, second=0, microsecond=0)
+    hours_back = max(1, (count + 59) // 60)  # ceiling division
+    base_time = now - timedelta(hours=hours_back)
+
     for i in range(count):
         # Simulate realistic price movement
         change = (base_price * 0.01) * ((i % 3) - 1) / 3  # Small random movement

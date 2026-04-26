@@ -135,6 +135,7 @@ class ApolloApiClient:
             logger.error(f"[APOLLO] ❌ Train falhou para {symbol}: {str(e)}")
             raise
 
+
     async def backtest(
         self,
         *,

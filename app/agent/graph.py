@@ -26,6 +26,8 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import re
+import unicodedata
 from datetime import UTC, datetime
 from enum import Enum
 from functools import lru_cache
@@ -269,6 +271,8 @@ class QuantAgentState(BaseModel):
 
     # Chain-of-thought (per node, for streaming)
     cot:                str                = ""
+    # Reasoning trail: cumulative <thought> de cada nó, alimenta nós downstream
+    reasoning_trail:    list[tuple[str, str]] = Field(default_factory=list)
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -277,15 +281,15 @@ class QuantAgentState(BaseModel):
 # ─────────────────────────────────────────────
 
 NODE_CONFIG = {
-    "orchestrator": {"model": "gpt-4o-mini", "cot": True},
+    "orchestrator": {"model": "gpt-4o-mini", "cot": False},
     "market_data": {"model": "gpt-4o-mini", "cot": True},
     "feature_engineering": {"model": "gpt-4o-mini", "cot": True},
     "risk_agent": {"model": "gpt-4o-mini", "cot": True},
     "signal_agent": {"model": "gpt-4o", "cot": True},
     "moe": {"model": "gpt-4o-mini", "cot": False},  # Deterministic, no LLM
     "forecast": {"model": "none", "cot": False},
-    "forecast_question": {"model": "gpt-4o-mini", "cot": False},
-    "risk_gate": {"model": "gpt-4o", "cot": True},
+    "forecast_question": {"model": "gpt-4o-mini", "cot": True},
+    "risk_gate": {"model": "gpt-4o", "cot": False},
     "execution": {"model": "gpt-4o", "cot": True},
 }
 
@@ -332,6 +336,19 @@ def _extract_cot_and_answer(content: str) -> tuple[str, str]:
         # No CoT format found
         return "", content
 
+
+def _append_reasoning(
+    trail: list[tuple[str, str]],
+    node_name: str,
+    cot: str,
+) -> list[tuple[str, str]]:
+    """Append a node's CoT to the reasoning trail, ignoring empty thoughts."""
+    cot = (cot or "").strip()
+    if not cot:
+        return trail
+    return trail + [(node_name, cot)]
+
+
 def _get_llm_for_node(node_name: str):
     """Retorna LLM configurado para o nó específico baseado no NODE_CONFIG."""
     config = NODE_CONFIG.get(node_name, {"model": _BASE_MODEL, "cot": False})
@@ -358,8 +375,26 @@ def _get_llm_for_node(node_name: str):
 # 4. SYSTEM PROMPTS  (cada agente tem seu próprio)
 # ─────────────────────────────────────────────
 
+_SCOPE_VALIDATION = """
+Você é um validador de escopo para um assistente de análise de criptomoedas.
+
+RESPONDA COM APENAS: "CRYPTO_OK", "OUT_OF_SCOPE", ou "EDUCATION_OK"
+
+✅ CRYPTO_OK: Pergunta é sobre análise técnica, previsão ou trading de criptomoedas
+✅ EDUCATION_OK: Pergunta é educacional sobre cripto (blockchain, DeFi, tokenomics, etc)
+❌ OUT_OF_SCOPE: Pergunta é sobre mercados tradicionais (ações, bonds, forex, commodities não-cripto)
+
+EXEMPLOS:
+- "Como vai estar o Bitcoin amanhã?" → CRYPTO_OK
+- "Explique o que é DeFi" → EDUCATION_OK
+- "Qual ação comprar?" → OUT_OF_SCOPE
+- "EUR/USD vai subir?" → OUT_OF_SCOPE
+- "O que é staking em Ethereum?" → EDUCATION_OK
+- "Análise técnica de Solana" → CRYPTO_OK
+""".strip()
+
 _ORCHESTRATOR_SYSTEM = """
-Você é o Orchestrator de um sistema multi-agente de análise quantitativa institucional.
+Você é o Orchestrator de um sistema multi-agente de análise quantitativa para criptomoedas.
 Seu papel é EXCLUSIVAMENTE rotear e sintetizar — não analisar dados diretamente.
 
 PIPELINE OBRIGATÓRIO:
@@ -493,90 +528,77 @@ FERRAMENTAS: Nenhuma - use dados do contexto
 """.strip()
 
 _EXECUTION_SYSTEM = """
-Você é o Execution Layer de um fundo quantitativo.
+Você é um ESPECIALISTA EM INVESTIMENTOS em criptomoedas — atua como analista sênior buy-side respondendo a um investidor sobre o estado atual do ativo / mercado.
 
-Dado o contexto completo (mercado, features, risco, sinal), monte a resposta final
-para o usuário com:
+OBJETIVO: produzir uma análise de mercado/cripto orientada à TOMADA DE DECISÃO de investimento, baseada nos dados quantitativos coletados (preço, indicadores técnicos, risco, regime, sinal). Este NÃO é um fluxo de previsão futura — para previsão existe outro fluxo dedicado.
 
-1. RESUMO EXECUTIVO (2-3 linhas): situação atual do ativo
-2. ANÁLISE TÉCNICA: indicadores chave com valores normalizados e interpretação
-3. MÉTRICAS DE RISCO: VaR, Sharpe, drawdown com contexto histórico
-4. SINAL: direção, regime, confiança — com fundamentação
-5. SIZING SUGERIDO (se perguntado): baseado no risk_level e Kelly Criterion parcial
-   • Kelly fraction = (p × b - q) / b, onde b = payoff ratio, p = win_rate estimado
-   • Use 1/4 Kelly para conservadorismo institucional
-6. ALERTAS: anomalias detectadas, riscos não cobertos, limitações da análise
-7. DISCLAIMER: "Análise quantitativa — não é recomendação de investimento"
+ESTRUTURA RECOMENDADA (adapte ao contexto, não force seções vazias):
+1. LEITURA DO ATIVO: tese em uma frase (ex.: "BTC opera lateralizado em zona de acumulação após pullback").
+2. NÚMEROS QUE IMPORTAM: cite apenas os relevantes (preço, variação 24h, volume, RSI, MACD, %B, volatilidade).
+3. INTERPRETAÇÃO DE INVESTIMENTO: o que esses números dizem para um investidor — força/fraqueza, regime (trending/ranging/breakout), divergências, qualidade do sinal.
+4. RISCO: classifique (baixo/moderado/alto/extremo) com base em VaR, CVaR, drawdown, vol anualizada e Sharpe; explique a implicação para position sizing e exposição.
+5. CONCLUSÃO ACIONÁVEL: viés (bullish/bearish/neutro), em qual cenário a tese se invalida, o que monitorar.
 
-MODELO PREDITIVO (AUXILIAR):
-• Trate o forecast de ML como sinal secundário, nunca como fonte única.
-• Se confiança, MAPE ou qualidade de dados estiverem ruins, diga explicitamente que o forecast não é acionável.
-• Se houver conflito entre sinais técnicos e forecast, reporte o conflito em ALERTAS.
+POSTURA DO ESPECIALISTA:
+• Pondere retorno × risco — não recomende às cegas.
+• Cite SEMPRE números específicos do contexto; nunca generalize ("alto", "baixo") sem o valor.
+• Trate conflito entre indicadores como informação útil, não como ruído.
+• Se um campo aparece como "(não coletado)" ou None: omita em silêncio.
+• Tom profissional e direto; sem jargão desnecessário; sem emojis em excesso.
 
-REGRAS CRÍTICAS ANTI-ALUCINAÇÃO:
-• Se um campo aparece como "(não coletado)" no contexto, reporte-o como indisponível.
-• Se um campo tem valor numérico, USE-O. NUNCA afirme que um dado está
-  indisponível se ele está preenchido no contexto.
-• Se há anomalias listadas (incluindo ajustes do sanity audit), mencione-as em ALERTAS.
-• NÃO invente valores. NÃO extrapole. Sintetize apenas o que está no contexto.
+NÃO FAÇA:
+• Não trate este fluxo como previsão futura — não invente target ou horizonte.
+• Não diga que "não há dado" quando o número está no contexto.
+• Não repita disclaimers no meio do texto.
 
-Tom: analista institucional sênior. Preciso, direto, sem jargão desnecessário.
+ENCERRAMENTO OBRIGATÓRIO (uma linha, no final): "Análise quantitativa — não é recomendação de investimento."
 """.strip()
 
 _FORECAST_RESPONSE_SYSTEM = """
-Você é um assistente especializado em análise de previsões de machine learning para ativos cripto.
-ESCOPO: Responde APENAS sobre previsões FUTURAS (amanhã, próximos dias/semanas).
+Você responde EXCLUSIVAMENTE sobre uma PREVISÃO de preço gerada pelo modelo Apollo (TFT + XGBoost). A pergunta é sobre o futuro do ativo — sua resposta deve ser sobre A PREVISÃO, não sobre análise técnica geral.
 
-⚠️ IMPORTANTE - LIMITES DO ESCOPO:
-- NÃO responda perguntas sobre preço ATUAL, preço AGORA, ou status PRESENTE
-- NÃO responda sobre análise técnica, indicadores ou sinais de trading
-- NÃO responda sobre qualidade de dados passados ou histórico de performance
-- Se pergunta é sobre preço atual: "Essa é uma pergunta sobre preço atual. Para isso, use análise técnica ou dados em tempo real. O Apollo é especializado em previsões futuras."
+A RESPOSTA TEM QUE COBRIR (nesta ordem):
+1. VALOR ESTIMADO — preço previsto e variação % esperada (forecast_predicted_price, forecast_return_pct).
+2. A QUE CORRESPONDE — janela/horizonte (forecast_period_start → forecast_period_end), preço de partida (forecast_current_price), direção (forecast_direction).
+3. RISCOS DA ANÁLISE — confiança do modelo (forecast_confidence), MAPE histórico, erro do backtest, qualidade dos dados, volatilidade do período, avisos. Diga claramente: ACIONÁVEL ou apenas REFERÊNCIA.
 
-CONTEXTO:
-O modelo Apollo foi treinado com dados históricos usando técnicas de Time Series Forecasting (TFT + XGBoost).
-Você tem acesso a:
-- Previsão de preço para um período específico (FUTURO)
-- Nível de confiança do modelo (0-100%)
-- Erro médio do modelo (MAPE - Mean Absolute Percentage Error)
-- Qualidade dos dados de treinamento
-- Volatilidade esperada do período
+CRITÉRIO DE ACIONABILIDADE:
+• Use o campo `forecast_actionable` quando presente.
+• Caso contrário: acionável se confiança ≥ threshold E MAPE ≤ threshold E qualidade ok; senão é apenas referência.
 
-DIRETRIZES PARA RESPOSTA:
+FORMATO DE SAÍDA OBRIGATÓRIO (CoT é breve; o foco é a previsão):
+<thought>2-3 frases sobre como você leu os dados de previsão. Não repita números aqui.</thought>
+<answer>
+Resposta direta sobre a previsão, contendo:
+- Valor estimado (preço previsto e retorno esperado em %).
+- Janela/horizonte e preço de partida.
+- Direção (alta/baixa/neutro).
+- Riscos: confiança, MAPE, qualidade dos dados, volatilidade, avisos. Veredicto: acionável vs referência.
+- Encerre com: "Previsão de modelo — não é recomendação de investimento."
+</answer>
 
-1. AVALIAÇÃO DE QUALIDADE
-   • Confiança >= 60% E MAPE <= 2.5% E Data Quality = "good" → Forecast é ACIONÁVEL
-   • Qualquer condição fora disso → Forecast é AUXILIAR apenas, nunca use como decisão única
+REGRAS DURAS:
+• NÃO faça análise técnica completa (RSI/MACD/Bollinger) — esse é outro fluxo. Cite indicadores só se reforçarem o veredicto sobre a previsão.
+• NÃO invente números fora do contexto.
+• Campos "(não coletado)" ou None: marque como indisponível, não chute.
+• Se o modelo falhou (`forecast_status` indica erro): explique brevemente por quê e não simule um forecast.
+• Precisão: USD com 2 casas, % com 2 casas, confiança em porcentagem.
+""".strip()
 
-2. INTERPRETAÇÃO DO VIÉS DIRECIONAL
-   • DOWN: preço previsto < preço atual (retorno negativo esperado)
-   • UP: preço previsto > preço atual (retorno positivo esperado)
-   • FLAT: variação < 0.5% em ambas as direções
+_EDUCATION_SYSTEM = """
+Você é um educador especializado em criptomoedas. A pergunta é CONCEITUAL/EDUCATIVA (blockchain, DeFi, tokenomics, staking, consenso, forks, NFTs, smart contracts) — não envolve análise de preço nem previsão.
 
-3. ESTRUTURA DE RESPOSTA
-   a) STATUS DO FORECAST: Está acionável? Qualidade dos dados?
-   b) PREVISÃO DIRECIONAL: Qual é a direção prevista e o retorno esperado?
-   c) CONFIANÇA: Nível de confiança com contexto (se baixa, explique)
-   d) PERÍODO: Sempre cite o período da previsão (de X até Y)
-   e) LIMITAÇÕES: Cite explicitamente qualquer fraqueza (MAPE alto, confiança baixa, dados limitados)
-   f) DISCLAIMER: "Esta é uma previsão de ML — não substitui análise técnica completa nem é recomendação de investimento"
+OBJETIVO: explicar com clareza, profundidade adequada e exemplos concretos.
 
-4. LINGUAGEM
-   • Use tom profissional mas acessível
-   • Sempre cite os números (confiança, MAPE, preço previsto)
-   • Seja honesto sobre limitações — nunca "venda" a previsão como certa
-   • Se pergunta for sobre período muito curto (< 30 dias), avise que modelo é mais confiável para períodos maiores
+DIRETRIZES:
+• Comece direto pela definição/resposta — sem introdução vazia.
+• Use exemplos reais (Bitcoin, Ethereum, casos conhecidos) quando ajudar.
+• Parágrafos curtos; lista só se houver 3+ itens distintos.
+• Se a pergunta for ambígua (ex.: "fork" pode ser hard/soft), aborde as variações relevantes.
+• Não invente números nem cite preços — este fluxo é educacional.
+• Tom didático e profissional, sem condescendência.
 
-5. EXEMPLO DE BOA RESPOSTA:
-   "O modelo Apollo prevê Bitcoin DOWN com retorno estimado de -4.3% para o período de 2026-04-26 até 2026-05-25.
-   - Confiança: 60.9% (marginal, acima do mínimo)
-   - Erro histórico (MAPE): 1.86% (excelente, bem abaixo do limite)
-   - Qualidade dados: Good
-   - Volatilidade esperada: 2.91%
-
-   ⚠️ IMPORTANTE: Este é um sinal auxiliar baseado em ML. Não use como única base para decisão."
-
-FERRAMENTAS: Nenhuma — use apenas o contexto de forecast fornecido
+ESCOPO: somente cripto. Se a pergunta sair desse escopo, redirecione brevemente.
 """.strip()
 
 # ─────────────────────────────────────────────
@@ -684,6 +706,13 @@ async def _run_agent_loop(
     msgs: list = [SystemMessage(content=enhanced_prompt)]
     if original_query:
         msgs.append(original_query)
+
+    # Injeta raciocínio acumulado dos agentes upstream (se houver)
+    if state.reasoning_trail:
+        trail_block = "RACIOCÍNIO DOS AGENTES ANTERIORES (use como contexto, não copie literalmente):\n" + \
+            "\n".join(f"  [{name}] {thought}" for name, thought in state.reasoning_trail)
+        msgs.append(HumanMessage(content=trail_block))
+
     if extra_context:
         msgs.append(HumanMessage(content=f"[CONTEXTO DO PIPELINE]\n{extra_context}"))
 
@@ -779,29 +808,471 @@ async def _run_agent_loop(
 # 6. AGENT NODES
 # ─────────────────────────────────────────────
 
+# ───── Intent classification (deterministic, token-based) ──────
+# Saudações puras: a frase normalizada inteira deve casar com uma destas.
+_PURE_GREETINGS: frozenset[str] = frozenset({
+    # PT-BR
+    "eae", "eai", "e ai", "oi", "oii", "ola", "opa", "salve", "fala", "fala ai", "fala mano",
+    "tudo bem", "tudo bom", "como vai", "como esta", "como voce esta", "como vc esta",
+    "beleza", "blz", "tmj",
+    "eae tudo bem", "eae tudo bom", "oi tudo bem", "oi tudo bom",
+    "ola tudo bem", "ola tudo bom", "opa tudo bem", "opa tudo bom",
+    "eae mano", "oi mano", "fala mano",
+    "bom dia", "boa tarde", "boa noite",
+    # EN
+    "hi", "hi there", "hello", "hello there", "hey", "hey there", "sup", "yo",
+    "how are you", "how are you doing", "whats up", "what is up",
+    "good morning", "good afternoon", "good evening",
+})
+
+# Tokens (palavras inteiras após normalização) que indicam intent técnico/cripto.
+# Presença de QUALQUER um destes cancela classificação como saudação.
+_TECHNICAL_TOKENS: frozenset[str] = frozenset({
+    # Símbolos e ativos
+    "btc", "btcusdt", "btcusd", "bitcoin",
+    "eth", "ethusdt", "ethusd", "ethereum", "ether",
+    "sol", "solusdt", "solana",
+    "ada", "cardano", "xrp", "ripple", "doge", "dogecoin",
+    "bnb", "matic", "polygon", "avax", "avalanche", "dot", "polkadot",
+    "link", "chainlink", "ltc", "litecoin", "usdt", "usdc", "dai", "busd",
+    "shib", "shiba", "atom", "cosmos", "near", "ftm", "fantom",
+    "altcoin", "altcoins", "memecoin", "stablecoin", "shitcoin",
+    # Preço / mercado
+    "preco", "precos", "price", "prices", "cotacao", "cotacoes", "valor",
+    "mercado", "market", "exchange", "binance", "coinbase", "kraken",
+    "volume", "liquidez", "liquidity", "market cap", "marketcap",
+    # Análise / sinais
+    "analise", "analises", "analisar", "analyze", "analysis",
+    "previsao", "previsoes", "forecast", "forecasts",
+    "predict", "prediction", "preve", "prever", "preveja",
+    "indicador", "indicadores", "indicator", "indicators",
+    "rsi", "macd", "bollinger", "ema", "sma", "vwap", "atr", "adx", "stoch",
+    "sinal", "sinais", "signal", "signals", "setup",
+    "tendencia", "trend", "regime", "padrao", "pattern",
+    "volatilidade", "volatility", "momentum",
+    "suporte", "resistencia", "support", "resistance",
+    "candle", "candles", "candlestick", "grafico", "chart", "charts",
+    # Trading
+    "comprar", "vender", "buy", "sell", "trade", "trader", "trading",
+    "long", "short", "scalp", "scalping", "swing", "daytrade", "hodl",
+    "alta", "baixa", "subir", "cair", "subindo", "caindo",
+    "bull", "bear", "bullish", "bearish", "breakout", "breakdown",
+    "stop", "loss", "gain", "alvo", "target", "entrada", "saida",
+    "leverage", "alavancagem", "futures", "futuros", "spot",
+    # Risco
+    "risco", "risk", "drawdown", "sharpe", "var", "cvar", "exposicao",
+    # Tempo / forecast
+    "amanha", "tomorrow", "futuro", "future", "proximo", "proxima",
+    "agora", "currently", "atualmente",
+    "semana", "week", "mes", "month", "dia", "day", "hoje", "today",
+    # Educação cripto
+    "blockchain", "defi", "tokenomics", "staking", "yield", "farming",
+    "wallet", "carteira", "halving", "fork", "consensus", "consenso",
+    "nft", "dao", "dex", "cex", "smart", "contract", "contrato",
+    "mining", "minerar", "mineracao", "mempool", "gas",
+})
+
+# Frases compostas (multi-palavra) que indicam intent técnico mesmo sem token único.
+_TECHNICAL_PHRASES: tuple[str, ...] = (
+    "neste momento", "no momento", "qual e o", "qual e a",
+    "como esta o", "como esta a", "como vai o", "como vai a",
+    "vai estar", "vai subir", "vai cair", "vai chegar", "vai bater",
+    "what is the", "how is the", "is going to", "will be",
+    "smart contract", "day trade", "qual a previsao", "qual e a previsao",
+)
+
+
+def _normalize_text(text: str) -> str:
+    """Normaliza texto: lowercase + sem acentos + sem pontuação + whitespace colapsado."""
+    if not text:
+        return ""
+    text = text.lower().strip()
+    text = unicodedata.normalize("NFD", text)
+    text = "".join(c for c in text if unicodedata.category(c) != "Mn")
+    text = re.sub(r"[^\w\s]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+# Starters de saudação: prefixos que iniciam saudações conhecidas.
+_GREETING_STARTERS: tuple[str, ...] = (
+    "eae", "eai", "oi", "ola", "opa", "salve", "fala",
+    "hey", "hi", "hello", "yo", "sup",
+    "bom dia", "boa tarde", "boa noite",
+    "good morning", "good afternoon", "good evening",
+    "tudo bem", "tudo bom", "como vai", "como esta", "como voce esta", "como vc esta",
+    "beleza", "blz",
+)
+
+
+def _classify_intent(question: Any) -> str:
+    """
+    Classifica a intenção do usuário de forma determinística e robusta.
+
+    Retorna:
+        "greeting": saudação pura, sem intent técnico
+        "task":     pergunta com intent técnico (análise, forecast, educação cripto, etc)
+
+    Política: quando em dúvida, retorna "task" (segurança — não bloqueia análise).
+    Ordem de prioridade:
+        1. Saudação pura conhecida (frase exata) → greeting
+        2. Token técnico presente → task
+        3. Frase composta técnica → task
+        4. Começa com starter de saudação e é curta → greeting
+        5. Default → task
+    """
+    if not question or not str(question).strip():
+        return "greeting"
+
+    normalized = _normalize_text(str(question))
+    if not normalized:
+        return "greeting"
+
+    tokens = set(normalized.split())
+
+    # 1) Frase inteira é saudação pura conhecida → greeting (prioridade máxima)
+    #    Necessário ANTES do check de tokens técnicos porque "bom dia" tem token "dia"
+    #    que está na blacklist (contexto temporal), mas "bom dia" sozinho é saudação.
+    if normalized in _PURE_GREETINGS:
+        return "greeting"
+
+    # 2) Tokens técnicos: presença de qualquer um → task
+    if tokens & _TECHNICAL_TOKENS:
+        return "task"
+
+    # 3) Frases compostas técnicas → task
+    for phrase in _TECHNICAL_PHRASES:
+        if phrase in normalized:
+            return "task"
+
+    # 4) Começa com starter de saudação E é curta (≤6 tokens) → greeting
+    for starter in _GREETING_STARTERS:
+        if normalized == starter or normalized.startswith(starter + " "):
+            if len(tokens) <= 6:
+                return "greeting"
+
+    # 5) Default: assume task (mais seguro — não bloqueia análise por engano)
+    return "task"
+
+
+# ───── Symbol extraction (alias → canonical ticker) ─────────────
+# NOTA (2026-04): O quote pair (USDT) está hardcoded como default.
+# FUTURO: deve ser lido das configurações do usuário (e.g., user.preferred_quote
+# = "USDT" | "USDC" | "BRL" | "BUSD"). Quando essa config existir, substituir
+# `_DEFAULT_QUOTE` por uma leitura de `state.user_id` → settings.
+_DEFAULT_QUOTE: str = "USDT"
+
+# Mapeamento alias (nome ou ticker curto) → ticker base canônico (sem quote).
+# Sempre adicionar novos aliases em lowercase.
+_SYMBOL_ALIASES: dict[str, str] = {
+    # BTC family
+    "btc": "BTC", "bitcoin": "BTC", "xbt": "BTC",
+    # ETH family
+    "eth": "ETH", "ethereum": "ETH", "ether": "ETH",
+    # Top 20
+    "sol": "SOL", "solana": "SOL",
+    "ada": "ADA", "cardano": "ADA",
+    "xrp": "XRP", "ripple": "XRP",
+    "doge": "DOGE", "dogecoin": "DOGE",
+    "bnb": "BNB", "binance": "BNB",
+    "matic": "MATIC", "polygon": "MATIC",
+    "avax": "AVAX", "avalanche": "AVAX",
+    "dot": "DOT", "polkadot": "DOT",
+    "link": "LINK", "chainlink": "LINK",
+    "ltc": "LTC", "litecoin": "LTC",
+    "shib": "SHIB", "shiba": "SHIB",
+    "atom": "ATOM", "cosmos": "ATOM",
+    "near": "NEAR",
+    "ftm": "FTM", "fantom": "FTM",
+    "trx": "TRX", "tron": "TRX",
+    "uni": "UNI", "uniswap": "UNI",
+    "aave": "AAVE",
+    "arb": "ARB", "arbitrum": "ARB",
+    "op": "OP", "optimism": "OP",
+    "sui": "SUI",
+    "apt": "APT", "aptos": "APT",
+    "bch": "BCH",
+    "etc": "ETC",
+    "fil": "FIL", "filecoin": "FIL",
+    "icp": "ICP",
+    "inj": "INJ", "injective": "INJ",
+    "tia": "TIA", "celestia": "TIA",
+    "sei": "SEI",
+    "pepe": "PEPE",
+    "wif": "WIF",
+    "bonk": "BONK",
+    "ondo": "ONDO",
+    "rndr": "RNDR", "render": "RNDR",
+    "fet": "FET", "fetch": "FET",
+}
+
+# Quote currencies aceitas em tickers já formatados.
+_KNOWN_QUOTES: tuple[str, ...] = ("USDT", "USDC", "BUSD", "DAI", "USD", "BRL", "EUR")
+
+
+def _extract_symbol(text: str, default_quote: str = _DEFAULT_QUOTE) -> str | None:
+    """
+    Extrai símbolo canônico da pergunta do usuário (e.g., "bitcoin" → "BTCUSDT").
+
+    Estratégia:
+        1. Procura ticker já formatado (BTCUSDT, ETH/USDT, etc) → preserva
+        2. Procura nome/alias (bitcoin, btc, ethereum) → adiciona quote default
+        3. Não encontrou → retorna None (caller usa default ou LLM)
+
+    Args:
+        text: pergunta do usuário
+        default_quote: moeda quote para complementar tickers nus.
+            FUTURO: deve vir das configurações do usuário.
+
+    Retorna:
+        Ticker canônico em uppercase (e.g., "BTCUSDT") ou None.
+    """
+    if not text:
+        return None
+
+    normalized = _normalize_text(text)
+    if not normalized:
+        return None
+
+    # 1) Ticker já formatado (e.g., btcusdt, ethusdc) — match no texto inteiro
+    quotes_pattern = "|".join(re.escape(q.lower()) for q in _KNOWN_QUOTES)
+    full_ticker_pattern = re.compile(
+        rf"\b([a-z0-9]{{2,10}})({quotes_pattern})\b",
+        re.IGNORECASE,
+    )
+    match = full_ticker_pattern.search(normalized)
+    if match:
+        base = match.group(1).upper()
+        quote = match.group(2).upper()
+        # Evita falso positivo: base não pode ser palavra comum
+        if base.lower() not in {"the", "for", "with", "que", "com", "para"}:
+            return f"{base}{quote}"
+
+    # 2) Nome ou ticker curto via alias map
+    tokens = normalized.split()
+    for token in tokens:
+        if token in _SYMBOL_ALIASES:
+            base = _SYMBOL_ALIASES[token]
+            return f"{base}{default_quote}"
+
+    return None
+
+
+# ───── Timeframe extraction (palavras-chave temporais → AnalysisTimeframe) ─────
+# Tokens de palavra única que mapeiam diretamente para um timeframe.
+_INTRADAY_TOKENS: frozenset[str] = frozenset({
+    "scalp", "scalping", "intraday",
+    "minuto", "minutos", "minute", "minutes", "min",
+    "1min", "5min", "15min", "1m", "5m", "15m",
+})
+
+_DAILY_TOKENS: frozenset[str] = frozenset({
+    "hoje", "today", "amanha", "tomorrow", "ontem", "yesterday",
+    "diario", "diaria", "daily", "swing",
+    "1d", "1h", "4h",
+    "dia", "day", "horas", "hour", "hours", "hora",
+    # "agora" / "atualmente" → DAILY (preço atual com contexto diário, não scalp)
+    "agora", "atualmente", "currently", "now",
+})
+
+_WEEKLY_TOKENS: frozenset[str] = frozenset({
+    "semana", "semanal", "week", "weekly", "1w",
+    "mes", "mensal", "month", "monthly", "1mo",
+    "trimestre", "quarter", "quarterly",
+    "ano", "anual", "year", "yearly", "annual",
+})
+
+# Frases compostas (multi-palavra) que mapeiam para timeframe.
+_TIMEFRAME_PHRASES: tuple[tuple[str, str], ...] = (
+    # WEEKLY (longo prazo)
+    ("proxima semana", "weekly"),
+    ("proximo mes", "weekly"),
+    ("next week", "weekly"),
+    ("next month", "weekly"),
+    ("longo prazo", "weekly"),
+    ("long term", "weekly"),
+    ("este mes", "weekly"),
+    ("this month", "weekly"),
+    # DAILY (médio prazo)
+    ("esta semana", "daily"),
+    ("this week", "daily"),
+    ("proximas horas", "daily"),
+    ("proximas 24 horas", "daily"),
+    ("next 24 hours", "daily"),
+    ("curto prazo", "daily"),
+    ("short term", "daily"),
+    # INTRADAY (curtíssimo)
+    ("proximos minutos", "intraday"),
+    ("next minutes", "intraday"),
+    ("agora mesmo", "intraday"),
+    ("right now", "intraday"),
+    ("day trade", "intraday"),
+)
+
+
+def _extract_timeframe_hint(text: str) -> AnalysisTimeframe | None:
+    """
+    Heurística para detectar AnalysisTimeframe a partir de palavras-chave temporais.
+
+    Prioridade (do mais específico para o mais genérico):
+        1. Frases compostas (e.g., "próxima semana", "longo prazo")
+        2. Tokens individuais (em ordem WEEKLY → INTRADAY → DAILY)
+
+    Retorna:
+        AnalysisTimeframe ou None se nenhuma pista clara foi encontrada.
+    """
+    if not text:
+        return None
+
+    normalized = _normalize_text(text)
+    if not normalized:
+        return None
+
+    # 1) Frases compostas (mais específicas) — primeiro match vence
+    for phrase, tf_value in _TIMEFRAME_PHRASES:
+        if phrase in normalized:
+            return AnalysisTimeframe(tf_value)
+
+    tokens = set(normalized.split())
+
+    # 2) Tokens — ordem importa: WEEKLY (mais raro/específico) → INTRADAY → DAILY
+    if tokens & _WEEKLY_TOKENS:
+        return AnalysisTimeframe.WEEKLY
+    if tokens & _INTRADAY_TOKENS:
+        return AnalysisTimeframe.INTRADAY
+    if tokens & _DAILY_TOKENS:
+        return AnalysisTimeframe.DAILY
+
+    return None
+
+
 @timed_async("Node: Orchestrator")
 async def orchestrator_node(state: QuantAgentState) -> dict:
     """
-    Extrai intent, symbol, timeframe e define o pipeline inicial.
-    Uses structured output from LLM.
+    Valida escopo (cripto vs tradicional) e depois extrai intent, symbol, timeframe.
     """
     print(f"[DEBUG] ===== ORCHESTRATOR NODE START =====")
+
+    # Validar escopo primeiro
+    user_question = (state.messages[-1].content if state.messages else "")
+
+    # Detecção determinística de intent (substitui heurística por substring)
+    intent = _classify_intent(user_question)
+    print(f"[DEBUG] Intent classification - question: '{user_question}' | intent: {intent}")
+
+    if intent == "greeting":
+        print(f"[DEBUG] Detected casual greeting, responding...")
+        casual_response = (
+            "Eae! 👋 Tudo bem por aqui! 🚀\n\n"
+            "Sou um assistente especializado em análise de **criptomoedas**. Posso ajudar com:\n\n"
+            "📊 **Análise técnica** - Indicadores, padrões, sinais\n"
+            "🔮 **Previsões** - Forecast de preço com ML\n"
+            "📚 **Educação** - Blockchain, DeFi, tokenomics\n"
+            "📈 **Trading** - Análise de risco, timing\n\n"
+            "Tem alguma pergunta sobre cripto? 🚀"
+        )
+        return {
+            **state.model_dump(),
+            "final_answer": casual_response,
+            "next_action": NextAction.FINALIZE,
+            "messages": state.messages + [AIMessage(content=casual_response)],
+        }
+
+    # Use a simple LLM without structured output for scope validation
+    simple_llm = _make_llm(model="gpt-4o-mini", temperature=0)
+
+    scope_validation = await simple_llm.ainvoke([
+        SystemMessage(content=_SCOPE_VALIDATION),
+        HumanMessage(content=user_question)
+    ])
+    scope_result = scope_validation.content.strip().upper()
+
+    # Se fora do escopo, rejeitar
+    if scope_result == "OUT_OF_SCOPE":
+        rejection_msg = (
+            "Desculpa! Sou especializado em análise de **criptomoedas** (Bitcoin, Ethereum, etc).\n\n"
+            "Não consigo ajudar com:\n"
+            "❌ Mercados tradicionais (ações, bonds)\n"
+            "❌ Forex\n"
+            "❌ Commodities não-cripto\n\n"
+            "Mas posso ajudar com:\n"
+            "✅ Análise técnica de cripto\n"
+            "✅ Previsões de preço\n"
+            "✅ Educação sobre blockchain, DeFi, etc\n\n"
+            "Tem alguma pergunta sobre criptomoedas? 🚀"
+        )
+        return {
+            **state.model_dump(),
+            "final_answer": rejection_msg,
+            "next_action": NextAction.FINALIZE,
+            "messages": state.messages + [AIMessage(content=rejection_msg)],
+        }
+
+    # Se é educação, rotear para mode "education" (sem pipeline completo)
+    if scope_result == "EDUCATION_OK":
+        education_response = await simple_llm.ainvoke([
+            SystemMessage(content=_EDUCATION_SYSTEM),
+            HumanMessage(content=user_question)
+        ])
+        return {
+            **state.model_dump(),
+            "final_answer": education_response.content,
+            "next_action": NextAction.FINALIZE,
+            "messages": state.messages + [AIMessage(content=education_response.content)],
+        }
+
+    # Caso contrário (CRYPTO_OK), continuar com pipeline normal
+    print(f"[DEBUG] Scope validation: {scope_result}")
     print(f"[DEBUG] Input state symbol: {state.symbol}")
-    print(f"[DEBUG] Input state messages: {len(state.messages)} messages")
-    msgs  = [SystemMessage(content=_ORCHESTRATOR_SYSTEM)] + state.messages
-    try:
+
+    # ───── Heurística determinística (primeira linha de defesa) ─────
+    # Extrai símbolo e timeframe da pergunta antes do LLM. Mais rápido,
+    # determinístico e robusto contra alucinações. O LLM só é chamado se
+    # a heurística não conseguir extrair ambos.
+    # FUTURO: o quote pair (USDT) deve vir das configurações do usuário.
+    heuristic_symbol = _extract_symbol(user_question)
+    heuristic_timeframe = _extract_timeframe_hint(user_question)
+    print(
+        f"[DEBUG] Heuristic extraction - symbol: {heuristic_symbol}, "
+        f"timeframe: {heuristic_timeframe}"
+    )
+
+    if heuristic_symbol and heuristic_timeframe:
+        # Heurística completa — pula LLM (latência + custo)
+        symbol = heuristic_symbol
+        timeframe = heuristic_timeframe
+        print(f"[DEBUG] Orchestrator: heurística completa, pulando LLM")
+    else:
+        # Heurística incompleta — usa LLM para preencher os gaps
         llm = _get_llm_for_node("orchestrator")
-        resp = await llm.ainvoke(msgs)
-        print(f"[DEBUG] Orchestrator response type: {type(resp).__name__}")
-        print(f"[DEBUG] Orchestrator response: {resp}")
-        # resp is now a structured OrchestratorOutput object
-        symbol = resp.symbol or state.symbol
-        timeframe = AnalysisTimeframe(resp.timeframe) if resp.timeframe else state.timeframe
-    except Exception as e:
-        print(f"[DEBUG] Orchestrator exception: {e}")
-        # Fallback to defaults if structured parsing fails
-        symbol = state.symbol or "BTCUSDT"
-        timeframe = state.timeframe or AnalysisTimeframe.DAILY
+        msgs = [SystemMessage(content=_ORCHESTRATOR_SYSTEM)] + state.messages
+        try:
+            resp = await llm.ainvoke(msgs)
+            print(f"[DEBUG] Orchestrator response type: {type(resp).__name__}")
+            llm_symbol = (resp.symbol or "").strip()
+            llm_timeframe: AnalysisTimeframe | None = (
+                AnalysisTimeframe(resp.timeframe) if resp.timeframe else None
+            )
+            # Prioridade: heurística > LLM > state > default
+            symbol = heuristic_symbol or llm_symbol or state.symbol or f"BTC{_DEFAULT_QUOTE}"
+            timeframe = (
+                heuristic_timeframe
+                or llm_timeframe
+                or state.timeframe
+                or AnalysisTimeframe.DAILY
+            )
+        except Exception as e:
+            print(f"[DEBUG] Orchestrator LLM exception: {e}")
+            # Fallback: heurística > state > default
+            symbol = heuristic_symbol or state.symbol or f"BTC{_DEFAULT_QUOTE}"
+            timeframe = heuristic_timeframe or state.timeframe or AnalysisTimeframe.DAILY
+
+    # Normaliza símbolo final (uppercase, garante quote pair)
+    symbol = (symbol or "").strip().upper()
+    if symbol and not any(symbol.endswith(q) for q in _KNOWN_QUOTES):
+        # FUTURO: usar quote do user config em vez de _DEFAULT_QUOTE
+        symbol = f"{symbol}{_DEFAULT_QUOTE}"
+
     print(f"[DEBUG] Orchestrator output - symbol: {symbol}, timeframe: {timeframe}")
     print(f"[DEBUG] ===== ORCHESTRATOR NODE END =====")
 
@@ -927,6 +1398,7 @@ async def market_data_node(state: QuantAgentState) -> dict:
         "recent_high":       recent_high,
         "recent_low":        recent_low,
         "cot":               cot,
+        "reasoning_trail":   _append_reasoning(state.reasoning_trail, "market_data", cot),
     }
 
 @timed_async("Node: FeatureEngineering-Macro")
@@ -1014,6 +1486,7 @@ async def features_macro_node(state: QuantAgentState) -> dict:
         "macro_regime": macro_regime,
         "macro_bias": macro_bias,
         "cot": cot,
+        "reasoning_trail": _append_reasoning(state.reasoning_trail, "features_macro", cot),
     }
 
 
@@ -1088,6 +1561,7 @@ async def features_setup_node(state: QuantAgentState) -> dict:
         "setup_bb_lower": setup_bb_lower,
         "setup_bb_pct_b": setup_bb_pct_b,
         "cot": cot,
+        "reasoning_trail": _append_reasoning(state.reasoning_trail, "features_setup", cot),
     }
 
 
@@ -1097,7 +1571,6 @@ async def features_exec_node(state: QuantAgentState) -> dict:
     Multi-timeframe: Execution layer (1H) - timing + risk.
     Provides execution timing and risk metrics.
     """
-    print("\n🟢🟢🟢 FEATURES EXEC NODE SENDO EXECUTADO!!! 🟢🟢🟢\n")
     print(f"[DEBUG] ===== FEATURES EXEC NODE START (1H) =====")
     print(f"[DEBUG] Input symbol: {state.symbol}")
     
@@ -1147,6 +1620,7 @@ async def features_exec_node(state: QuantAgentState) -> dict:
         "exec_macd_line": exec_macd_line,
         "exec_macd_signal": exec_macd_signal,
         "cot": cot,
+        "reasoning_trail": _append_reasoning(state.reasoning_trail, "features_exec", cot),
     }
 
 
@@ -1178,25 +1652,38 @@ async def _run_apollo_backtest_with_polling(symbol: str) -> tuple[ApolloBacktest
 @timed_async("Node: Forecast")
 async def forecast_node(state: QuantAgentState) -> dict:
     """Apollo forecast node with safe training/backtest fallback."""
-    print("\n🔴🔴🔴 FORECAST NODE SENDO EXECUTADO!!! 🔴🔴🔴\n")
     import logging
     logger = logging.getLogger(__name__)
 
-    logger.info(f"[FORECAST] Iniciando nó de forecast para {state.symbol}")
+    print(f"[FORECAST] Iniciando para {state.symbol}", flush=True)
     settings = get_settings()
     client = get_apollo_client()
-    print(f"\n[FORECAST] 🔍 apollo_prediction_lookback_days={settings.apollo_prediction_lookback_days}")
     window = build_prediction_window(
         lookback_days=settings.apollo_prediction_lookback_days,
     )
-    logger.info(f"[FORECAST] Janela de predição: {window.start_date} até {window.end_date}")
 
-    # Log detalhado das datas para debug
-    from datetime import datetime
-    start = datetime.fromisoformat(window.start_date.replace('Z', '+00:00'))
-    end = datetime.fromisoformat(window.end_date.replace('Z', '+00:00'))
-    days_diff = (end - start).days
-    print(f"[FORECAST] ✅ CHAMANDO APOLLO: start={window.start_date} | end={window.end_date} | diff={days_diff} dias")
+    # Guard: símbolo vazio/inválido — aborta antes de chamar Apollo (que falharia com 400)
+    raw_symbol = (state.symbol or "").strip().upper()
+    if not raw_symbol:
+        warning = "forecast pulado: símbolo não identificado"
+        print(f"[FORECAST] ⚠️  {warning}", flush=True)
+        logger.warning(f"[FORECAST] {warning}")
+        return {
+            **state.model_dump(),
+            "messages": state.messages + [AIMessage(content="Apollo forecast indisponível: símbolo não identificado.")],
+            "next_action": NextAction.TREND_INTERPRET,
+            "intermediate_steps_global": state.intermediate_steps_global + [("apollo_predict", warning)],
+            "forecast_period_start": window.start_date,
+            "forecast_period_end": window.end_date,
+            "forecast_status": "unavailable",
+            "forecast_warnings": list(state.forecast_warnings) + [warning],
+            "forecast_actionable": False,
+            "cot": "",
+        }
+
+    # Normaliza símbolo para o formato que Apollo espera (ex: BTC -> BTCUSDT)
+    apollo_symbol = raw_symbol if raw_symbol.endswith("USDT") else f"{raw_symbol}USDT"
+    print(f"[FORECAST] Apollo predict: symbol={apollo_symbol} | start={window.start_date} | end={window.end_date}", flush=True)
 
     warnings = list(state.forecast_warnings)
     training_attempts = 0
@@ -1206,9 +1693,9 @@ async def forecast_node(state: QuantAgentState) -> dict:
     action_step = "apollo_predict"
 
     try:
-        logger.info(f"[FORECAST] Chamando Apollo predict para {state.symbol} com {days_diff} dias")
+        logger.info(f"[FORECAST] Chamando Apollo predict para {apollo_symbol}")
         prediction = await client.predict(
-            symbol=state.symbol,
+            symbol=apollo_symbol,
             start_date=window.start_date,
             end_date=window.end_date,
         )
@@ -1228,14 +1715,14 @@ async def forecast_node(state: QuantAgentState) -> dict:
                     training_attempts = attempt
                     logger.info(f"[FORECAST] Tentativa de treinamento {attempt}/{settings.apollo_train_max_attempts}")
                     train_result = await client.train(
-                        symbol=state.symbol,
+                        symbol=apollo_symbol,
                         lookback_days=settings.apollo_train_lookback_days,
                     )
                     logger.info(f"[FORECAST] ✅ Treinamento iniciado: {train_result.status}")
                     warnings.append(
                         f"treino Apollo iniciado (tentativa {attempt}/{settings.apollo_train_max_attempts}): {train_result.status}"
                     )
-                    backtest_result, polls = await _run_apollo_backtest_with_polling(state.symbol)
+                    backtest_result, polls = await _run_apollo_backtest_with_polling(apollo_symbol)
                     logger.info(f"[FORECAST] ✅ Backtest concluído após {polls} polls | períodos: {backtest_result.periods_tested}")
                     if len(backtest_result.results) < settings.apollo_backtest_periods:
                         warnings.append("backtest Apollo retornou menos períodos que o esperado")
@@ -1250,7 +1737,7 @@ async def forecast_node(state: QuantAgentState) -> dict:
                         continue
                     if backtest_error_pct <= settings.apollo_backtest_error_threshold_pct:
                         prediction = await client.predict(
-                            symbol=state.symbol,
+                            symbol=apollo_symbol,
                             start_date=window.start_date,
                             end_date=window.end_date,
                         )
@@ -1576,6 +2063,7 @@ async def feature_engineering_node(state: QuantAgentState) -> dict:
         "bb_middle":          bb_middle,
         "bb_lower":           bb_lower,
         "cot":                cot,
+        "reasoning_trail":    _append_reasoning(state.reasoning_trail, "feature_engineering", cot),
     }
 
 
@@ -1605,24 +2093,40 @@ async def forecast_question_node(state: QuantAgentState) -> dict:
         }
 
     settings = get_settings()
+
+    def _f(value, fmt: str = "{:.2f}", suffix: str = "") -> str:
+        if value is None:
+            return "(indisponível)"
+        try:
+            return fmt.format(value) + suffix
+        except (ValueError, TypeError):
+            return str(value)
+
+    confidence_str = (
+        f"{state.forecast_confidence * 100:.1f}%"
+        if state.forecast_confidence is not None else "(indisponível)"
+    )
+    backtest_err_str = _f(state.forecast_backtest_error_pct, "{:.2f}", "%")
+
     forecast_summary = f"""
 PREVISÃO APOLLO:
 - Símbolo: {state.symbol}
-- Período: {state.forecast_period_start} até {state.forecast_period_end}
-- Direção: {state.forecast_direction}
-- Preço Atual: ${state.forecast_current_price:.2f if state.forecast_current_price else 'N/A'}
-- Preço Previsto: ${state.forecast_predicted_price:.2f if state.forecast_predicted_price else 'N/A'}
-- Retorno Esperado: {state.forecast_return_pct:.2f if state.forecast_return_pct is not None else 'N/A'}%
-- Confiança: {state.forecast_confidence:.1%}
-- MAPE do Modelo: {state.forecast_model_mape:.2f if state.forecast_model_mape is not None else 'N/A'}%
-- Qualidade dos Dados: {state.forecast_data_quality or 'N/A'}
-- Volatilidade: {state.forecast_period_volatility:.2f if state.forecast_period_volatility else 'N/A'}%
+- Janela: {state.forecast_period_start or '(indisponível)'} → {state.forecast_period_end or '(indisponível)'}
+- Direção: {state.forecast_direction or '(indisponível)'}
+- Preço Atual: {_f(state.forecast_current_price, '${:,.2f}')}
+- Preço Previsto: {_f(state.forecast_predicted_price, '${:,.2f}')}
+- Retorno Esperado: {_f(state.forecast_return_pct, '{:.2f}', '%')}
+- Confiança: {confidence_str}
+- MAPE do Modelo: {_f(state.forecast_model_mape, '{:.2f}', '%')}
+- Erro do Backtest (p5): {backtest_err_str}
+- Qualidade dos Dados: {state.forecast_data_quality or '(indisponível)'}
+- Volatilidade do Período: {_f(state.forecast_period_volatility, '{:.2f}', '%')}
+- Data Points: {state.forecast_data_points if state.forecast_data_points is not None else '(indisponível)'}
 - Acionável: {state.forecast_actionable}
-- Data Points: {state.forecast_data_points}
 - Status: {state.forecast_status}
 - Avisos: {'; '.join(state.forecast_warnings) if state.forecast_warnings else 'Nenhum'}
 
-CRITÉRIOS DE QUALIDADE:
+CRITÉRIOS DE QUALIDADE (referência):
 - Threshold Confiança: >= {settings.apollo_confidence_threshold:.0%}
 - Threshold MAPE: <= {settings.apollo_mape_threshold:.2f}%
 """
@@ -1630,18 +2134,22 @@ CRITÉRIOS DE QUALIDADE:
     user_question_original = state.messages[-1].content if state.messages else ""
     llm = _make_llm(model="gpt-4o-mini", temperature=0.1)
 
+    cot = ""
     try:
         response = await llm.ainvoke([
             {"role": "system", "content": _FORECAST_RESPONSE_SYSTEM},
             {"role": "user", "content": f"{user_question_original}\n\n{forecast_summary}"}
         ])
-        final_answer = response.content if hasattr(response, 'content') else str(response)
+        raw_content = response.content if hasattr(response, 'content') else str(response)
+        cot, final_answer = _extract_cot_and_answer(raw_content)
     except Exception as e:
         final_answer = f"Erro ao processar previsão: {str(e)}"
 
     return {
         **state.model_dump(),
         "final_answer": final_answer,
+        "cot": cot,
+        "reasoning_trail": _append_reasoning(state.reasoning_trail, "forecast_question", cot),
         "messages": state.messages + [AIMessage(content=final_answer)],
     }
 
@@ -1841,6 +2349,7 @@ async def risk_agent_node(state: QuantAgentState) -> dict:
         "exec_volatility":    exec_volatility,  # Execution layer (1H) volatility
         "anomalies_detected": state.anomalies_detected + risk_audit_anomalies,
         "cot":                cot,
+        "reasoning_trail":    _append_reasoning(state.reasoning_trail, "risk_agent", cot),
     }
 
 @timed_async("Node: SignalAgent")
@@ -1918,6 +2427,7 @@ async def signal_agent_node(state: QuantAgentState) -> dict:
         "intermediate_steps_global": state.intermediate_steps_global + steps,
         "intermediate_steps_agent": steps,
         "cot":                cot,
+        "reasoning_trail":    _append_reasoning(state.reasoning_trail, "signal_agent", cot),
     }
 
 @timed_async("Node: MoE")
@@ -2209,6 +2719,9 @@ RISK GATE
 
 HISTÓRICO DE ANÁLISE (últimos 8 steps):
 {chr(10).join(f'  [{k}] {v[:120]}' for k, v in state.intermediate_steps_global[-8:])}
+
+RACIOCÍNIO DOS AGENTES (use como insumo, não copie literalmente):
+{chr(10).join(f'  [{name}] {thought}' for name, thought in state.reasoning_trail) if state.reasoning_trail else '  (nenhum)'}
 """.strip()
 
     msgs = [
@@ -2234,32 +2747,20 @@ HISTÓRICO DE ANÁLISE (últimos 8 steps):
         if input_tokens > 0 or output_tokens > 0:
             cost_tracker.add_call(model_name, input_tokens, output_tokens, "Execution")
     
-    # Get cost summary
+    # Cost summary is tracked internally but not shown to the user.
     cost_summary = cost_tracker.get_summary()
-    cost_info = f"""
 
-💰 CUSTO LLM
-  Total de chamadas: {cost_summary['total_calls']}
-  Tokens de entrada: {cost_summary['total_input_tokens']}
-  Tokens de saída: {cost_summary['total_output_tokens']}
-  Total de tokens: {cost_summary['total_tokens']}
-  Custo total: ${cost_summary['total_cost_usd']:.6f} USD
-"""
-    
-    # Append cost info to final response
-    final_answer_with_cost = final_response.content + cost_info
-    
     # Extract CoT if enabled
     cot, answer = _extract_cot_and_answer(final_response.content) if node_config["cot"] else ("", final_response.content)
-    final_answer_with_cost = answer + cost_info
 
     return {
         **state.model_dump(),
         "messages":     state.messages + [final_response],
         "next_action":  NextAction.FINALIZE,
-        "final_answer": final_answer_with_cost,
+        "final_answer": answer,
         "cost_summary": cost_summary,
         "cot":          cot,
+        "reasoning_trail": _append_reasoning(state.reasoning_trail, "execution", cot),
     }
 
 def blocked_node(state: QuantAgentState) -> dict:
@@ -2309,8 +2810,25 @@ def build_quant_graph() -> Any:
     # Entry
     workflow.set_entry_point("orchestrator")
 
+    # Conditional: orchestrator pode finalizar cedo (saudação / out-of-scope / educação)
+    # ou prosseguir para o pipeline completo. RESPEITA o next_action setado pelo nó.
+    def route_after_orchestrator(state: QuantAgentState) -> str:
+        # Se o orchestrator já produziu uma resposta final (saudação/escopo/educação),
+        # vai direto para finalize — não roda o pipeline de análise.
+        if state.next_action == NextAction.FINALIZE:
+            return "finalize"
+        return "market_data"
+
+    workflow.add_conditional_edges(
+        "orchestrator",
+        route_after_orchestrator,
+        {
+            "finalize": "finalize",
+            "market_data": "market_data",
+        },
+    )
+
     # Fixed edges (multi-timeframe pipeline with decision engine as FINAL authority)
-    workflow.add_edge("orchestrator", "market_data")
     workflow.add_edge("market_data",  "features_macro")   # 1D for regime
     workflow.add_edge("features_macro", "features_setup")  # 4H for signal
     workflow.add_edge("features_setup", "features_exec")   # 1H for execution

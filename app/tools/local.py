@@ -73,44 +73,110 @@ async def _get_candles_from_db(
     interval: str,
     count: int = 100
 ) -> list[Candle]:
-    """Get candles from database using MarketCandleQueries.
-    
-    Aggregation is handled in SQL for optimal performance.
+    """Get candles from database and aggregate to requested interval.
+
+    Database always contains 1m candles. Aggregation is done in-memory.
     """
     if _db_pool is None:
         raise RuntimeError("Database pool not configured. Call set_db_pool() first.")
-    
+
     queries = MarketCandleQueries(_db_pool)
-    
-    # Normalize symbol
     norm_symbol = _normalize_symbol(symbol)
-    
-    # Normalize interval to lowercase for consistency
     interval = interval.lower()
-    
-    # Calculate time range based on interval
-    interval_ms = {
-        "1m": 1 * 60 * 1000,
-        "5m": 5 * 60 * 1000,
-        "15m": 15 * 60 * 1000,
-        "1h": 60 * 60 * 1000,
-        "4h": 4 * 60 * 60 * 1000,
-        "1d": 24 * 60 * 60 * 1000,
-    }.get(interval, 60 * 60 * 1000)
-    
+
+    # Mapping: desired interval -> minutes per candle
+    minutes_per_interval = {
+        "1m": 1,
+        "5m": 5,
+        "15m": 15,
+        "1h": 60,
+        "4h": 240,
+        "1d": 1440,
+    }
+
+    minutes_needed = minutes_per_interval.get(interval, 60)
+
+    # Always fetch 1m candles from DB
+    # For aggregation, we need: count * minutes_needed
+    candles_1m_needed = count * minutes_needed + 100  # +100 buffer for alignment
+
     end_time = datetime.now()
-    start_time = end_time - timedelta(milliseconds=count * interval_ms)
-    
-    # Get candles (SQL handles aggregation if needed)
+    start_time = end_time - timedelta(minutes=candles_1m_needed)
+
+    # Fetch 1m candles from database
     market_candles = await queries.get_candles(
         symbol=norm_symbol,
-        interval=interval,
+        interval="1m",  # Always fetch 1m from DB
         start_time=start_time,
         end_time=end_time,
-        limit=count
+        limit=candles_1m_needed
     )
-    
-    return _convert_market_candles_to_candles(market_candles)
+
+    if not market_candles:
+        return []
+
+    # If requested interval is 1m, return as-is
+    if interval == "1m":
+        return _convert_market_candles_to_candles(market_candles[-count:])
+
+    # Aggregate 1m candles to requested interval
+    aggregated = []
+    current_group = []
+    current_bucket_start = None
+
+    for mc in market_candles:
+        if current_bucket_start is None:
+            # Align to interval boundary
+            timestamp = int(mc.open_time.timestamp())
+            bucket_size_sec = minutes_needed * 60
+            bucket_start_sec = (timestamp // bucket_size_sec) * bucket_size_sec
+            current_bucket_start = datetime.fromtimestamp(bucket_start_sec)
+
+        bucket_end = current_bucket_start + timedelta(minutes=minutes_needed)
+
+        # If candle belongs to current bucket, add it
+        if mc.open_time < bucket_end:
+            current_group.append(mc)
+        else:
+            # Aggregate current group and start new one
+            if current_group:
+                agg = _aggregate_candles_1m(current_group, norm_symbol, interval)
+                aggregated.append(agg)
+            current_group = [mc]
+            current_bucket_start = bucket_end
+
+    # Don't forget last group
+    if current_group:
+        agg = _aggregate_candles_1m(current_group, norm_symbol, interval)
+        aggregated.append(agg)
+
+    return _convert_market_candles_to_candles(aggregated[-count:])
+
+
+def _aggregate_candles_1m(candles_1m: list[MarketCandle], symbol: str, interval: str) -> MarketCandle:
+    """Aggregate 1m candles into higher timeframe."""
+    if not candles_1m:
+        raise ValueError("Cannot aggregate empty candle list")
+
+    open_price = candles_1m[0].open_price
+    close_price = candles_1m[-1].close_price
+    high_price = max(c.high_price for c in candles_1m)
+    low_price = min(c.low_price for c in candles_1m)
+    base_volume = sum(c.base_volume for c in candles_1m)
+    quote_volume = sum(c.quote_volume for c in candles_1m)
+
+    return MarketCandle(
+        symbol=symbol,
+        interval=interval,
+        open_time=candles_1m[0].open_time,
+        close_time=candles_1m[-1].close_time,
+        open_price=open_price,
+        high_price=high_price,
+        low_price=low_price,
+        close_price=close_price,
+        base_volume=base_volume,
+        quote_volume=quote_volume,
+    )
 
 
 @tool
@@ -235,7 +301,7 @@ async def calculate_risk(symbol: str, interval: str = "1m") -> str:
 @tool
 @timed_async("Tool: get_feature_rsi")
 async def get_feature_rsi(symbol: str, interval: str = "1m") -> str:
-    """Get RSI using local CalculationEngine (NO EXTERNAL API)."""
+    """Get RSI (Relative Strength Index) using local CalculationEngine. Supports intervals: 1m, 5m, 15m, 1h, 4h, 1d."""
     try:
         norm_symbol = _normalize_symbol(symbol)
         
@@ -288,7 +354,7 @@ async def get_feature_rsi(symbol: str, interval: str = "1m") -> str:
 @tool
 @timed_async("Tool: get_feature_macd")
 async def get_feature_macd(symbol: str, interval: str = "1m") -> str:
-    """Get MACD using local CalculationEngine (NO EXTERNAL API)."""
+    """Get MACD (Moving Average Convergence Divergence) using local CalculationEngine. Supports intervals: 1m, 5m, 15m, 1h, 4h, 1d."""
     try:
         norm_symbol = _normalize_symbol(symbol)
         
@@ -343,7 +409,7 @@ async def get_feature_macd(symbol: str, interval: str = "1m") -> str:
 @tool
 @timed_async("Tool: get_feature_bollinger")
 async def get_feature_bollinger(symbol: str, interval: str = "1m") -> str:
-    """Get Bollinger Bands using local CalculationEngine (NO EXTERNAL API)."""
+    """Get Bollinger Bands using local CalculationEngine. Supports intervals: 1m, 5m, 15m, 1h, 4h, 1d."""
     try:
         norm_symbol = _normalize_symbol(symbol)
         
@@ -407,7 +473,7 @@ async def get_feature_bollinger(symbol: str, interval: str = "1m") -> str:
 @tool
 @timed_async("Tool: get_feature_volatility")
 async def get_feature_volatility(symbol: str, interval: str = "1m") -> str:
-    """Get volatility using local CalculationEngine (NO EXTERNAL API)."""
+    """Get volatility metrics using local CalculationEngine. Supports intervals: 1m, 5m, 15m, 1h, 4h, 1d."""
     try:
         norm_symbol = _normalize_symbol(symbol)
         engine = get_calculation_engine()
