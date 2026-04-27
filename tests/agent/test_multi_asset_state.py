@@ -10,7 +10,7 @@ Cobre:
 from __future__ import annotations
 
 import pytest
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from app.agent.graph import (
     AnalysisTimeframe,
@@ -19,6 +19,7 @@ from app.agent.graph import (
     RiskLevel,
     _extract_all_symbols,
     _extract_symbol,
+    _latest_user_message,
     _patch_asset,
     _render_asset_block,
     _resolve_symbols,
@@ -211,3 +212,124 @@ class TestRenderAssetBlock:
         # Valores presentes:
         assert "42000" in block
         assert "1.500" in block  # sharpe rendered with prec=3
+
+
+class TestSymbolHeuristicCoverage:
+    """A heurística determinística cobre canônicos e aliases conhecidos.
+    Typos arbitrários (ex.: 'etherium') são tratados pelo LLM normalizador
+    no orchestrator — vide TestComparativeIntent e o fluxo do orchestrator_node."""
+
+    def test_canonical_names_recognized(self):
+        # Os aliases canônicos devem continuar funcionando perfeitamente.
+        assert _extract_all_symbols("compare ethereum vs bitcoin") == ["ETHUSDT", "BTCUSDT"]
+
+    def test_typo_falls_through_to_llm(self):
+        # Typo "etherium" NÃO está no alias map por design — não queremos
+        # listar typos manualmente. A heurística devolve só BTC; é o
+        # orchestrator que aciona o LLM normalizador para resgatar ETH.
+        assert _extract_all_symbols(
+            "compare bitcoin com etherium hoje?"
+        ) == ["BTCUSDT"]
+
+
+class TestComparativeIntent:
+    """Detecção heurística de pergunta comparativa. É o gatilho que decide
+    se vale a pena chamar o LLM normalizador para resgatar typos no segundo
+    ativo (ex.: 'bitcoin vs etherium' → heurística pega só BTC, LLM resgata ETH)."""
+
+    def test_versus_token(self):
+        from app.agent.graph import _has_comparative_intent
+        assert _has_comparative_intent("bitcoin vs ethereum")
+        assert _has_comparative_intent("BTC versus ETH")
+
+    def test_compare_verb(self):
+        from app.agent.graph import _has_comparative_intent
+        assert _has_comparative_intent("compare bitcoin com etherium")
+        assert _has_comparative_intent("comparar BTC e SOL")
+
+    def test_better_than_phrase(self):
+        from app.agent.graph import _has_comparative_intent
+        assert _has_comparative_intent("XRP é melhor que Chainlink?")
+        assert _has_comparative_intent("ETH is better than BTC")
+
+    def test_or_token(self):
+        from app.agent.graph import _has_comparative_intent
+        assert _has_comparative_intent("compro BTC ou ETH?")
+
+    def test_non_comparative_returns_false(self):
+        from app.agent.graph import _has_comparative_intent
+        assert not _has_comparative_intent("como está o bitcoin?")
+        assert not _has_comparative_intent("qual o preço do ETH?")
+        assert not _has_comparative_intent("explica o que é DeFi")
+
+    def test_empty_text_returns_false(self):
+        from app.agent.graph import _has_comparative_intent
+        assert not _has_comparative_intent("")
+        assert not _has_comparative_intent(None)  # type: ignore[arg-type]
+
+
+class TestLatestUserMessage:
+    """Regressão crítica: `_run_agent_loop` antes pegava a PRIMEIRA HumanMessage,
+    que era o summary de contexto histórico injetado pelo `chat.py`. Resultado:
+    todos os agentes downstream recebiam a "pergunta" errada e ignoravam o
+    pedido atual do usuário."""
+
+    def test_returns_none_when_no_messages(self):
+        assert _latest_user_message([]) is None
+
+    def test_returns_none_when_only_ai_messages(self):
+        assert _latest_user_message([AIMessage(content="oi"), AIMessage(content="tchau")]) is None
+
+    def test_returns_only_human_message(self):
+        msg = HumanMessage(content="oi")
+        assert _latest_user_message([msg]) is msg
+
+    def test_picks_last_human_when_multiple(self):
+        first = HumanMessage(content="pergunta antiga")
+        second = HumanMessage(content="pergunta NOVA")
+        result = _latest_user_message([first, AIMessage(content="resposta"), second])
+        assert result is second
+        assert result.content == "pergunta NOVA"
+
+    def test_ignores_ai_messages_after_last_human(self):
+        # Esse é o cenário real: o pipeline empilha AIMessages depois da
+        # pergunta atual. messages[-1] seria uma AIMessage do orchestrator/etc.
+        current = HumanMessage(content="pergunta atual")
+        messages = [
+            HumanMessage(content="Previous conversations context: ..."),  # summary
+            HumanMessage(content="oi"),                                    # turno antigo
+            AIMessage(content="Olá, como posso ajudar?"),
+            current,                                                       # pergunta atual
+            AIMessage(content="Routed to BTCUSDT"),                        # orchestrator
+            AIMessage(content="MarketData output"),                        # market_data
+        ]
+        assert _latest_user_message(messages) is current
+
+    def test_chat_py_scenario_with_history_and_current_question(self):
+        """Simula EXATAMENTE o que `chat.py` constrói antes de invocar o graph.
+
+        Antes do fix, o pipeline pegava a primeira HumanMessage (summary de
+        contexto), e por isso não conseguia ver a pergunta real do usuário.
+        """
+        messages = [
+            # 1) summary de global_context
+            HumanMessage(content="Previous conversations context:\nuser: olá...\nassistant: oi...\n"),
+            # 2) histórico de sessão (turno N-1)
+            HumanMessage(content="oi"),
+            AIMessage(content="Olá! Como posso ajudar?"),
+            # 3) pergunta corrente
+            HumanMessage(content="pode comparar o desempenho do bitcoin com etherium hoje?"),
+        ]
+        latest = _latest_user_message(messages)
+        assert latest is not None
+        assert "etherium" in latest.content
+        # E NÃO o summary nem a pergunta antiga.
+        assert "Previous conversations" not in latest.content
+        assert latest.content != "oi"
+
+    def test_handles_system_messages_interleaved(self):
+        # SystemMessage não é HumanMessage; deve ser ignorada.
+        sys = SystemMessage(content="você é um agente")
+        h = HumanMessage(content="qual o preço do BTC?")
+        assert _latest_user_message([sys, h]) is h
+        assert _latest_user_message([h, sys]) is h

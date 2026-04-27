@@ -180,9 +180,20 @@ class ApolloBacktestOutput(BaseModel):
 # ─────────────────────────────────────────────
 
 class OrchestratorOutput(BaseModel):
-    """Structured output for Orchestrator agent."""
+    """Structured output for Orchestrator agent.
+
+    `symbols` é a lista completa de ativos mencionados na pergunta (em ordem
+    de aparição). O LLM deve normalizar typos (ex: "etherium" → "ETH",
+    "bitkoin" → "BTC") e devolver apenas o ticker base em UPPERCASE
+    (sem quote: "BTC", não "BTCUSDT" — o quote é adicionado depois).
+    O primeiro item é o ATIVO PRIMÁRIO (foco da decisão direcional).
+
+    `symbol` (singular) é mantido por compatibilidade e deve sempre ser igual
+    a `symbols[0]` quando `symbols` não estiver vazio.
+    """
     next_agent: Literal["market_data", "features_macro", "features_setup", "features_exec", "risk", "signal", "risk_gate", "execution", "finalize", "blocked"]
     symbol: str
+    symbols: list[str] = Field(default_factory=list)
     timeframe: Literal["intraday", "daily", "weekly"]
     context: str = ""
 

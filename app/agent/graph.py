@@ -280,8 +280,9 @@ class QuantAgentState(BaseModel):
 
     # Chain-of-thought (per node, for streaming)
     cot:                str                = ""
-    # Reasoning trail: cumulative <thought> de cada nó, alimenta nós downstream
-    reasoning_trail:    list[tuple[str, str]] = Field(default_factory=list)
+    # Reasoning trail: cumulative <thought> de cada nó, alimenta nós downstream.
+    # Cada entrada é (node_name, thought, status) onde status ∈ {"ok", "error", "no_cot"}.
+    reasoning_trail:    list[tuple[str, str, str]] = Field(default_factory=list)
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -526,6 +527,29 @@ def _make_llm(model: str = _BASE_MODEL, temperature: float = 0.1, **kw) -> ChatO
 tool_map = {t.name: t for t in all_tools}
 risk_tools = [t for t in all_tools if t.name == "calculate_risk"]
 
+
+def _latest_user_message(messages: list) -> HumanMessage | None:
+    """Retorna a ÚLTIMA `HumanMessage` da lista, ou None se não houver.
+
+    Esta é a "pergunta corrente" do usuário em conversas multi-turno.
+    Por que ÚLTIMA e não primeira?
+      - `chat.py` prepende um summary de contexto histórico como `HumanMessage`
+        e depois cada turno antigo do session_history como `HumanMessage` /
+        `AIMessage`, antes de finalmente adicionar a pergunta corrente.
+      - Pegar a primeira `HumanMessage` retorna o summary de contexto OU uma
+        pergunta antiga — o que envenena todos os agentes downstream com a
+        pergunta errada (eles analisaram BTC quando o usuário pediu BTC vs ETH).
+
+    Nota: as `AIMessage` adicionadas pelos nós internos do pipeline ficam
+    intercaladas entre as `HumanMessage` do histórico e a pergunta corrente,
+    portanto `messages[-1]` também não é confiável (geralmente é o último nó).
+    """
+    return next(
+        (m for m in reversed(messages) if isinstance(m, HumanMessage)),
+        None,
+    )
+
+
 def _extract_cot_and_answer(content: str) -> tuple[str, str]:
     """
     Extrai CoT e answer de uma resposta formatada como:
@@ -552,16 +576,37 @@ def _extract_cot_and_answer(content: str) -> tuple[str, str]:
         return "", content
 
 
+class NodeStatus(str, Enum):
+    """Status de execução de um nó no reasoning trail."""
+    OK = "ok"
+    ERROR = "error"
+    NO_COT = "no_cot"
+
+
+def _failure_cot(node: str, reason: str) -> str:
+    """Pseudo-thought para nós que falharam tecnicamente."""
+    reason = (reason or "").strip() or "motivo desconhecido"
+    return f"Nó '{node}' não pôde concluir: {reason}"
+
+
 def _append_reasoning(
-    trail: list[tuple[str, str]],
+    trail: list[tuple[str, str, str]],
     node_name: str,
     cot: str,
-) -> list[tuple[str, str]]:
-    """Append a node's CoT to the reasoning trail, ignoring empty thoughts."""
+    status: NodeStatus = NodeStatus.OK,
+) -> list[tuple[str, str, str]]:
+    """Append a node's CoT to the reasoning trail.
+
+    - status=OK + cot vazio  → drop silencioso (sem sinal útil).
+    - status=ERROR/NO_COT    → sempre anexa (a falha em si é o sinal); cot vazio
+      vira placeholder informativo.
+    """
     cot = (cot or "").strip()
-    if not cot:
+    if not cot and status == NodeStatus.OK:
         return trail
-    return trail + [(node_name, cot)]
+    if not cot:
+        cot = f"(sem detalhe — status={status.value})"
+    return trail + [(node_name, cot, status.value)]
 
 
 def _get_llm_for_node(node_name: str):
@@ -623,12 +668,48 @@ PIPELINE OBRIGATÓRIO:
 8. finalize        → consolida resposta ao usuário
 
 REGRAS DE ROTEAMENTO:
-- Extraia symbol, timeframe e contexto da pergunta do usuário
+- Extraia symbols (lista), timeframe e contexto da pergunta do usuário
 - Se timeframe não especificado: use DAILY para análise geral, INTRADAY para scalping
 - Sempre passe o contexto acumulado para os agentes downstream
 - Se risk_gate retornar BLOCKED: informe o usuário com motivo claro
 
-OUTPUT FORMAT: JSON estruturado com campos: next_agent, symbol, timeframe, context
+═══════════════════════════════════════════════════════════
+EXTRAÇÃO DE SÍMBOLOS (CRÍTICO)
+═══════════════════════════════════════════════════════════
+
+REGRA 1 — Múltiplos ativos:
+Se a pergunta mencionar mais de um ativo (ex.: "compare BTC com ETH",
+"XRP é melhor que Chainlink?"), retorne TODOS em `symbols`, em ordem
+de aparição. O primeiro é o ATIVO PRIMÁRIO (foco da decisão direcional).
+
+REGRA 2 — Normalização de typos:
+Seja TOLERANTE a erros de digitação e variações de nome. Devolva sempre
+o ticker base canônico em UPPERCASE, SEM quote pair (sem "USDT", "USDC"
+etc — o sistema adiciona depois). Exemplos:
+  • "etherium", "etherum", "ethereu" → "ETH"
+  • "bitkoin", "bitcoint"             → "BTC"
+  • "rippe", "ripple"                 → "XRP"
+  • "chainlinc", "chainlink", "link"  → "LINK"
+  • "solanna", "solana", "sol"        → "SOL"
+  • "cardanoo", "cardano", "ada"      → "ADA"
+  • "doje", "dogecoin", "doge"        → "DOGE"
+  • "BTCUSDT" (já formatado)          → "BTC" (devolva só a base)
+
+REGRA 3 — Quando não houver ativo claro:
+Devolva `symbols=[]` (lista vazia). NÃO invente nem use default. O sistema
+trata isso a jusante.
+
+REGRA 4 — `symbol` (singular):
+Sempre igual a `symbols[0]` quando `symbols` não estiver vazio; "" caso contrário.
+
+EXEMPLOS DE ENTRADA → SAÍDA:
+  • "como está o bitcoin hoje?"        → symbol="BTC", symbols=["BTC"]
+  • "compare bitcoin com etherium"     → symbol="BTC", symbols=["BTC", "ETH"]
+  • "XRP é melhor que Chainlink?"      → symbol="XRP", symbols=["XRP", "LINK"]
+  • "BTCUSDT vs ETH"                   → symbol="BTC", symbols=["BTC", "ETH"]
+  • "explica o que é DeFi"             → symbol="",   symbols=[]
+
+OUTPUT FORMAT: JSON estruturado com campos: next_agent, symbol, symbols, timeframe, context
 """.strip()
 
 _MARKET_DATA_SYSTEM = """
@@ -755,9 +836,14 @@ PRINCÍPIO FUNDAMENTAL — RESPONDA A PERGUNTA QUE FOI FEITA:
 • NÃO force um template fixo quando ele não cabe na pergunta.
 
 USO DO RACIOCÍNIO ACUMULADO:
-• O contexto traz o RACIOCÍNIO DOS AGENTES (`reasoning_trail`) com a tese de cada nó (market_data, features, risk, signal, decision_engine etc.). USE-O como espinha dorsal.
+• O contexto traz o RACIOCÍNIO DOS AGENTES (`reasoning_trail`) no formato `[node](status) thought`, com a tese de cada nó (market_data, features, risk, signal, decision_engine etc.). USE-O como espinha dorsal.
 • Se houver conclusões fortes nesse trail (ex.: "Bullish macro but bearish setup", "Chainlink tem Sharpe superior"), elas devem aparecer na sua resposta — refraseadas, não copiadas literalmente.
 • Não ignore o trail e nem o repita: sintetize-o à luz da pergunta.
+
+INTERPRETAÇÃO DO STATUS DE CADA NÓ:
+• `(ok)`     → nó completou normalmente; confie no thought e nos dados que ele produziu.
+• `(error)`  → nó FALHOU tecnicamente (timeout/exceção/no-progress). Os dados desse domínio podem estar AUSENTES ou desatualizados. Sinalize honestamente na resposta (ex.: "indicador de risco indisponível por falha técnica") em vez de inventar. Nunca apresente como certeza algo que veio de um nó com status error.
+• `(no_cot)` → o nó respondeu mas não emitiu CoT estruturado; os dados em si provavelmente foram coletados (verifique no bloco DADOS POR ATIVO) — apenas o resumo de raciocínio está ausente. Trate como ok mas com menos contexto narrativo.
 
 POSTURA DO ESPECIALISTA:
 • Cite SEMPRE números específicos do contexto; nunca generalize ("alto", "baixo") sem o valor.
@@ -1027,16 +1113,19 @@ async def _run_agent_loop(
     force_interval: str | None = None,
     node_name: str = "unknown",
     enable_cot: bool = False,
-) -> tuple[str, str, list[ToolMessage], list]:
+) -> tuple[str, str, NodeStatus, list[ToolMessage], list]:
     """
     Loop LLM → tool call → result para um agente especializado.
     Usa APENAS a mensagem original do usuário — não o histórico acumulado
     de outros agentes (que pode conter tool_calls sem resposta).
-    Retorna (resposta_final, cot, tool_messages_acumulados, steps_acumulados).
+    Retorna (resposta_final, cot, status, tool_messages_acumulados, steps_acumulados).
+    Status reflete o resultado: OK, ERROR (falha técnica) ou NO_COT (LLM
+    respondeu mas não emitiu <thought>).
     Includes retry mechanism for LLM calls.
     """
-    # Extrai apenas a mensagem original do usuário
-    original_query = next((m for m in state.messages if isinstance(m, HumanMessage)), None)
+    # Pergunta ATUAL do usuário (vide docstring de _latest_user_message para
+    # o motivo de NÃO usar a primeira HumanMessage).
+    original_query = _latest_user_message(state.messages)
 
     # Adiciona instrução explícita para chamar ferramentas
     tool_instruction = "\n\nIMPORTANTE: Você tem acesso a ferramentas. Você DEVE chamar as ferramentas apropriadas antes de fornecer sua análise final. Não responda sem chamar as ferramentas primeiro."
@@ -1052,10 +1141,11 @@ async def _run_agent_loop(
     if original_query:
         msgs.append(original_query)
 
-    # Injeta raciocínio acumulado dos agentes upstream (se houver)
+    # Injeta raciocínio acumulado dos agentes upstream (se houver).
+    # Formato: [node](status) thought — status sinaliza falhas técnicas para o LLM.
     if state.reasoning_trail:
         trail_block = "RACIOCÍNIO DOS AGENTES ANTERIORES (use como contexto, não copie literalmente):\n" + \
-            "\n".join(f"  [{name}] {thought}" for name, thought in state.reasoning_trail)
+            "\n".join(f"  [{name}]({status}) {thought}" for name, thought, status in state.reasoning_trail)
         msgs.append(HumanMessage(content=trail_block))
 
     if extra_context:
@@ -1092,7 +1182,7 @@ async def _run_agent_loop(
                 if attempt == MAX_RETRIES - 1:
                     # Fallback: return error message
                     error_msg = f"[LLM ERROR after {MAX_RETRIES} retries]: {str(e)}"
-                    return error_msg, "", all_tool_msgs, steps
+                    return error_msg, _failure_cot(node_name, error_msg), NodeStatus.ERROR, all_tool_msgs, steps
                 # Exponential backoff: 0.5s, 1s, 2s (não-bloqueante)
                 backoff_time = 0.5 * (2 ** attempt)
                 await asyncio.sleep(backoff_time)
@@ -1100,7 +1190,7 @@ async def _run_agent_loop(
         
         if response is None:
             error_msg = "[LLM ERROR] Failed to get response after retries"
-            return error_msg, "", all_tool_msgs, steps
+            return error_msg, _failure_cot(node_name, error_msg), NodeStatus.ERROR, all_tool_msgs, steps
             
         msgs.append(response)
         
@@ -1126,12 +1216,14 @@ async def _run_agent_loop(
             else:
                 content = str(response)
             cot, answer = _extract_cot_and_answer(content) if enable_cot else ("", content)
-            return answer, cot, all_tool_msgs, steps
+            status = NodeStatus.OK if (cot or not enable_cot) else NodeStatus.NO_COT
+            return answer, cot, status, all_tool_msgs, steps
         else:
             # Regular AIMessage without tool calls
             print(f"[DEBUG] No tool calls found, returning content directly")
             cot, answer = _extract_cot_and_answer(response.content) if enable_cot else ("", response.content)
-            return answer, cot, all_tool_msgs, steps
+            status = NodeStatus.OK if (cot or not enable_cot) else NodeStatus.NO_COT
+            return answer, cot, status, all_tool_msgs, steps
         
         # Detect no-progress loops
         if len(steps) == previous_step_count:
@@ -1139,15 +1231,20 @@ async def _run_agent_loop(
             if no_progress_count >= 2:
                 # No progress for 2 iterations - abort early
                 error_msg = "[AGENT LOOP] No progress detected - aborting to prevent infinite loop"
-                return error_msg, "", all_tool_msgs, steps
+                return error_msg, _failure_cot(node_name, error_msg), NodeStatus.ERROR, all_tool_msgs, steps
         else:
             no_progress_count = 0
             previous_step_count = len(steps)
 
     # Força finalização se exceder iterações
-    final = await llm.ainvoke(msgs + [HumanMessage(content="Sintetize os resultados obtidos até agora.")])
+    try:
+        final = await llm.ainvoke(msgs + [HumanMessage(content="Sintetize os resultados obtidos até agora.")])
+    except Exception as e:
+        error_msg = f"[LLM ERROR on forced finalize]: {str(e)}"
+        return error_msg, _failure_cot(node_name, error_msg), NodeStatus.ERROR, all_tool_msgs, steps
     cot, answer = _extract_cot_and_answer(final.content) if enable_cot else ("", final.content)
-    return answer, cot, all_tool_msgs, steps
+    status = NodeStatus.OK if (cot or not enable_cot) else NodeStatus.NO_COT
+    return answer, cot, status, all_tool_msgs, steps
 
 # ─────────────────────────────────────────────
 # 6. AGENT NODES
@@ -1298,6 +1395,43 @@ def _classify_intent(question: Any) -> str:
 
     # 5) Default: assume task (mais seguro — não bloqueia análise por engano)
     return "task"
+
+
+# ───── Comparative intent detection ─────────────
+# Tokens / frases que sinalizam que o usuário quer comparar ≥2 ativos.
+# É o gatilho para invocar o LLM normalizador quando a heurística determinística
+# extrai apenas 1 símbolo (provavelmente perdeu o segundo por typo).
+_COMPARATIVE_TOKENS: frozenset[str] = frozenset({
+    "vs", "versus", "ou", "or",
+    "compare", "comparar", "comparado", "comparar",
+    "diferenca", "diferença", "difference",
+    "melhor", "pior", "better", "worse",
+})
+
+_COMPARATIVE_PHRASES: tuple[str, ...] = (
+    "melhor que", "pior que", "better than", "worse than",
+    "comparar com", "compare to", "compared to",
+    "em vez de", "instead of",
+)
+
+
+def _has_comparative_intent(text: str) -> bool:
+    """Heurística: a pergunta parece pedir comparação entre ≥2 ativos?
+
+    Usado para decidir se vale a pena chamar o LLM normalizador quando a
+    extração determinística retornou apenas 1 símbolo. Conservador por
+    padrão (false negatives são OK — significam só que ficamos com a
+    heurística pura, sem custo extra).
+    """
+    if not text:
+        return False
+    normalized = _normalize_text(text)
+    if not normalized:
+        return False
+    tokens = set(normalized.split())
+    if tokens & _COMPARATIVE_TOKENS:
+        return True
+    return any(phrase in normalized for phrase in _COMPARATIVE_PHRASES)
 
 
 # ───── Symbol extraction (alias → canonical ticker) ─────────────
@@ -1626,62 +1760,95 @@ async def orchestrator_node(state: QuantAgentState) -> dict:
     print(f"[DEBUG] Input state symbol: {state.symbol}")
 
     # ───── Heurística determinística (primeira linha de defesa) ─────
-    # Extrai símbolo e timeframe da pergunta antes do LLM. Mais rápido,
-    # determinístico e robusto contra alucinações. O LLM só é chamado se
-    # a heurística não conseguir extrair ambos.
+    # Extrai símbolos e timeframe da pergunta antes do LLM. Mais rápido,
+    # determinístico e robusto contra alucinações.
     # FUTURO: o quote pair (USDT) deve vir das configurações do usuário.
     heuristic_symbols = _extract_all_symbols(user_question)
-    heuristic_symbol = heuristic_symbols[0] if heuristic_symbols else None
     heuristic_timeframe = _extract_timeframe_hint(user_question)
     print(
         f"[DEBUG] Heuristic extraction - symbols: {heuristic_symbols}, "
         f"timeframe: {heuristic_timeframe}"
     )
 
-    if heuristic_symbol and heuristic_timeframe:
-        # Heurística completa — pula LLM (latência + custo)
-        symbol = heuristic_symbol
-        timeframe = heuristic_timeframe
-        print(f"[DEBUG] Orchestrator: heurística completa, pulando LLM")
-    else:
-        # Heurística incompleta — usa LLM para preencher os gaps
+    # ───── Decisão: quando chamar o LLM normalizador ─────
+    # O LLM é caro/lento mas é o ÚNICO que tolera typos arbitrários
+    # (ex.: "etherium" → "ETH"). Chamamos quando:
+    #   (a) heurística não achou nenhum símbolo, OU
+    #   (b) heurística achou só 1 mas a pergunta tem intenção comparativa
+    #       (provável que o segundo ativo foi escrito com typo), OU
+    #   (c) timeframe ainda não está resolvido (gap pré-existente).
+    comparative = _has_comparative_intent(user_question)
+    needs_llm = (
+        not heuristic_symbols
+        or (len(heuristic_symbols) < 2 and comparative)
+        or heuristic_timeframe is None
+    )
+    print(
+        f"[DEBUG] Orchestrator: comparative_intent={comparative}, "
+        f"needs_llm={needs_llm}"
+    )
+
+    llm_symbols: list[str] = []
+    llm_timeframe: AnalysisTimeframe | None = None
+
+    if needs_llm:
         llm = _get_llm_for_node("orchestrator")
         msgs = [SystemMessage(content=_ORCHESTRATOR_SYSTEM)] + state.messages
         try:
             resp = await llm.ainvoke(msgs)
             print(f"[DEBUG] Orchestrator response type: {type(resp).__name__}")
-            llm_symbol = (resp.symbol or "").strip()
-            llm_timeframe: AnalysisTimeframe | None = (
-                AnalysisTimeframe(resp.timeframe) if resp.timeframe else None
-            )
-            # Prioridade: heurística > LLM > state > default
-            symbol = heuristic_symbol or llm_symbol or state.symbol or f"BTC{_DEFAULT_QUOTE}"
-            timeframe = (
-                heuristic_timeframe
-                or llm_timeframe
-                or state.timeframe
-                or AnalysisTimeframe.DAILY
-            )
+            # `symbols` é a fonte preferida; se vier vazio, cai pra `symbol`
+            # (compat com OrchestratorOutput legado).
+            raw_syms = list(resp.symbols) if getattr(resp, "symbols", None) else []
+            if not raw_syms and getattr(resp, "symbol", None):
+                raw_syms = [resp.symbol]
+            # Normaliza: uppercase, sem espaços, adiciona quote se necessário.
+            for s in raw_syms:
+                if not s:
+                    continue
+                s_norm = s.strip().upper()
+                if not any(s_norm.endswith(q) for q in _KNOWN_QUOTES):
+                    s_norm = f"{s_norm}{_DEFAULT_QUOTE}"
+                if s_norm and s_norm not in llm_symbols:
+                    llm_symbols.append(s_norm)
+            if resp.timeframe:
+                llm_timeframe = AnalysisTimeframe(resp.timeframe)
+            print(f"[DEBUG] LLM extraction - symbols: {llm_symbols}, timeframe: {llm_timeframe}")
         except Exception as e:
             print(f"[DEBUG] Orchestrator LLM exception: {e}")
-            # Fallback: heurística > state > default
-            symbol = heuristic_symbol or state.symbol or f"BTC{_DEFAULT_QUOTE}"
-            timeframe = heuristic_timeframe or state.timeframe or AnalysisTimeframe.DAILY
 
-    # Normaliza símbolo final (uppercase, garante quote pair)
-    symbol = (symbol or "").strip().upper()
+    # ───── Merge: heurística primeiro (preserva ordem), LLM completa ─────
+    # Heurística é mais confiável quando pega — preferimos a ordem dela.
+    # O LLM contribui símbolos que ela perdeu (typos, aliases novos).
+    merged_symbols: list[str] = list(heuristic_symbols)
+    for s in llm_symbols:
+        if s not in merged_symbols:
+            merged_symbols.append(s)
+
+    # Resolve primário e timeframe finais.
+    if merged_symbols:
+        symbol = merged_symbols[0]
+    elif state.symbol:
+        symbol = state.symbol
+    else:
+        symbol = f"BTC{_DEFAULT_QUOTE}"
+        merged_symbols = [symbol]
+
+    timeframe = (
+        heuristic_timeframe
+        or llm_timeframe
+        or state.timeframe
+        or AnalysisTimeframe.DAILY
+    )
+
+    # Garantia final: símbolo primário em uppercase com quote.
+    symbol = symbol.strip().upper()
     if symbol and not any(symbol.endswith(q) for q in _KNOWN_QUOTES):
-        # FUTURO: usar quote do user config em vez de _DEFAULT_QUOTE
         symbol = f"{symbol}{_DEFAULT_QUOTE}"
+    if merged_symbols and merged_symbols[0] != symbol:
+        merged_symbols[0] = symbol
 
-    # Build the multi-asset symbol list. The primary (`symbol`) leads, then any
-    # extra symbols extracted by the heuristic in original order. Dedupe.
-    new_symbols: list[str] = []
-    if symbol:
-        new_symbols.append(symbol)
-    for extra in heuristic_symbols:
-        if extra and extra not in new_symbols:
-            new_symbols.append(extra)
+    new_symbols = merged_symbols
     new_assets = {s: state.assets.get(s) or AssetState(symbol=s) for s in new_symbols}
 
     print(f"[DEBUG] Orchestrator output - primary: {symbol}, all symbols: {new_symbols}, timeframe: {timeframe}")
@@ -1755,7 +1922,7 @@ async def _run_market_data_for_symbol(
         f"INTERVALO OBRIGATÓRIO: interval=\"{analysis_interval}\" — use ESTE intervalo em TODAS as ferramentas"
     )
     node_config = NODE_CONFIG["market_data"]
-    content, cot, tool_msgs, steps = await _run_agent_loop(
+    content, cot, status, tool_msgs, steps = await _run_agent_loop(
         state, _get_llm_for_node("market_data"), _MARKET_DATA_SYSTEM, context,
         force_interval=analysis_interval,
         node_name=f"MarketData[{symbol}]",
@@ -1819,6 +1986,7 @@ async def _run_market_data_for_symbol(
         ),
         "steps": steps,
         "cot": cot,
+        "status": status,
         "content": content,
     }
 
@@ -1846,6 +2014,7 @@ async def market_data_node(state: QuantAgentState) -> dict:
     new_assets = dict(state.assets)
     all_steps: list = []
     primary_cot = ""
+    primary_status = NodeStatus.OK
     primary_content = ""
     for r in results:
         sym = r["symbol"]
@@ -1854,6 +2023,7 @@ async def market_data_node(state: QuantAgentState) -> dict:
         all_steps.extend(_tag_steps(r["steps"], sym))
         if sym == state.symbol:
             primary_cot = r["cot"]
+            primary_status = NodeStatus(r.get("status", "ok"))
             primary_content = r["content"]
 
     print(f"[DEBUG] ===== MARKET DATA NODE END =====")
@@ -1865,7 +2035,7 @@ async def market_data_node(state: QuantAgentState) -> dict:
         "intermediate_steps_agent": all_steps,
         "assets":            new_assets,
         "cot":               primary_cot,
-        "reasoning_trail":   _append_reasoning(state.reasoning_trail, "market_data", primary_cot),
+        "reasoning_trail":   _append_reasoning(state.reasoning_trail, "market_data", primary_cot, primary_status),
     }
 
 async def _run_features_macro_for_symbol(
@@ -1878,7 +2048,7 @@ async def _run_features_macro_for_symbol(
         f"INTERVALO OBRIGATÓRIO: interval=\"{macro_interval}\" — Daily timeframe for regime detection"
     )
     node_config = NODE_CONFIG["feature_engineering"]
-    content, cot, tool_msgs, steps = await _run_agent_loop(
+    content, cot, status, tool_msgs, steps = await _run_agent_loop(
         state, _get_llm_for_node("feature_engineering"), _FEATURE_SYSTEM, context,
         force_interval=macro_interval,
         node_name=f"FeatureEngineering-Macro[{symbol}]",
@@ -1946,6 +2116,7 @@ async def _run_features_macro_for_symbol(
         ),
         "steps": steps,
         "cot": cot,
+        "status": status,
         "content": content,
     }
 
@@ -1972,6 +2143,7 @@ async def features_macro_node(state: QuantAgentState) -> dict:
     new_assets = dict(state.assets)
     all_steps: list = []
     primary_cot = ""
+    primary_status = NodeStatus.OK
     primary_content = ""
     for r in results:
         sym = r["symbol"]
@@ -1980,6 +2152,7 @@ async def features_macro_node(state: QuantAgentState) -> dict:
         all_steps.extend(_tag_steps(r["steps"], sym))
         if sym == state.symbol:
             primary_cot = r["cot"]
+            primary_status = NodeStatus(r.get("status", "ok"))
             primary_content = r["content"]
 
     print(f"[DEBUG] ===== FEATURES MACRO NODE END =====")
@@ -1991,7 +2164,7 @@ async def features_macro_node(state: QuantAgentState) -> dict:
         "intermediate_steps_agent": all_steps,
         "assets": new_assets,
         "cot": primary_cot,
-        "reasoning_trail": _append_reasoning(state.reasoning_trail, "features_macro", primary_cot),
+        "reasoning_trail": _append_reasoning(state.reasoning_trail, "features_macro", primary_cot, primary_status),
     }
 
 
@@ -2005,7 +2178,7 @@ async def _run_features_setup_for_symbol(
         f"INTERVALO OBRIGATÓRIO: interval=\"{setup_interval}\" — 4H timeframe for signal generation"
     )
     node_config = NODE_CONFIG["feature_engineering"]
-    content, cot, tool_msgs, steps = await _run_agent_loop(
+    content, cot, status, tool_msgs, steps = await _run_agent_loop(
         state, _get_llm_for_node("feature_engineering"), _FEATURE_SYSTEM, context,
         force_interval=setup_interval,
         node_name=f"FeatureEngineering-Setup[{symbol}]",
@@ -2057,6 +2230,7 @@ async def _run_features_setup_for_symbol(
         ),
         "steps": steps,
         "cot": cot,
+        "status": status,
         "content": content,
     }
 
@@ -2083,6 +2257,7 @@ async def features_setup_node(state: QuantAgentState) -> dict:
     new_assets = dict(state.assets)
     all_steps: list = []
     primary_cot = ""
+    primary_status = NodeStatus.OK
     primary_content = ""
     for r in results:
         sym = r["symbol"]
@@ -2091,6 +2266,7 @@ async def features_setup_node(state: QuantAgentState) -> dict:
         all_steps.extend(_tag_steps(r["steps"], sym))
         if sym == state.symbol:
             primary_cot = r["cot"]
+            primary_status = NodeStatus(r.get("status", "ok"))
             primary_content = r["content"]
 
     print(f"[DEBUG] ===== FEATURES SETUP NODE END =====")
@@ -2102,7 +2278,7 @@ async def features_setup_node(state: QuantAgentState) -> dict:
         "intermediate_steps_agent": all_steps,
         "assets": new_assets,
         "cot": primary_cot,
-        "reasoning_trail": _append_reasoning(state.reasoning_trail, "features_setup", primary_cot),
+        "reasoning_trail": _append_reasoning(state.reasoning_trail, "features_setup", primary_cot, primary_status),
     }
 
 
@@ -2116,7 +2292,7 @@ async def _run_features_exec_for_symbol(
         f"INTERVALO OBRIGATÓRIO: interval=\"{exec_interval}\" — 1H timeframe for execution timing"
     )
     node_config = NODE_CONFIG["feature_engineering"]
-    content, cot, tool_msgs, steps = await _run_agent_loop(
+    content, cot, status, tool_msgs, steps = await _run_agent_loop(
         state, _get_llm_for_node("feature_engineering"), _FEATURE_SYSTEM, context,
         force_interval=exec_interval,
         node_name=f"FeatureEngineering-Exec[{symbol}]",
@@ -2152,6 +2328,7 @@ async def _run_features_exec_for_symbol(
         ),
         "steps": steps,
         "cot": cot,
+        "status": status,
         "content": content,
     }
 
@@ -2178,6 +2355,7 @@ async def features_exec_node(state: QuantAgentState) -> dict:
     new_assets = dict(state.assets)
     all_steps: list = []
     primary_cot = ""
+    primary_status = NodeStatus.OK
     primary_content = ""
     for r in results:
         sym = r["symbol"]
@@ -2186,6 +2364,7 @@ async def features_exec_node(state: QuantAgentState) -> dict:
         all_steps.extend(_tag_steps(r["steps"], sym))
         if sym == state.symbol:
             primary_cot = r["cot"]
+            primary_status = NodeStatus(r.get("status", "ok"))
             primary_content = r["content"]
 
     print(f"[DEBUG] ===== FEATURES EXEC NODE END =====")
@@ -2197,7 +2376,7 @@ async def features_exec_node(state: QuantAgentState) -> dict:
         "intermediate_steps_agent": all_steps,
         "assets": new_assets,
         "cot": primary_cot,
-        "reasoning_trail": _append_reasoning(state.reasoning_trail, "features_exec", primary_cot),
+        "reasoning_trail": _append_reasoning(state.reasoning_trail, "features_exec", primary_cot, primary_status),
     }
 
 
@@ -2628,6 +2807,7 @@ async def decision_engine_node(state: QuantAgentState) -> dict:
         "intermediate_steps_global": state.intermediate_steps_global + [("decision_engine", decision.reasoning)],
         "assets": new_assets,
         "cot": decision.reasoning,
+        "reasoning_trail": _append_reasoning(state.reasoning_trail, "decision_engine", decision.reasoning),
     }
 
 
@@ -2699,6 +2879,7 @@ CRITÉRIOS DE QUALIDADE (referência):
     llm = _make_llm(model="gpt-4o-mini", temperature=0.1)
 
     cot = ""
+    status = NodeStatus.OK
     try:
         response = await llm.ainvoke([
             {"role": "system", "content": _FORECAST_RESPONSE_SYSTEM},
@@ -2706,14 +2887,18 @@ CRITÉRIOS DE QUALIDADE (referência):
         ])
         raw_content = response.content if hasattr(response, 'content') else str(response)
         cot, final_answer = _extract_cot_and_answer(raw_content)
+        if not cot:
+            status = NodeStatus.NO_COT
     except Exception as e:
         final_answer = f"Erro ao processar previsão: {str(e)}"
+        cot = _failure_cot("forecast_question", str(e))
+        status = NodeStatus.ERROR
 
     return {
         **state.model_dump(),
         "final_answer": final_answer,
         "cot": cot,
-        "reasoning_trail": _append_reasoning(state.reasoning_trail, "forecast_question", cot),
+        "reasoning_trail": _append_reasoning(state.reasoning_trail, "forecast_question", cot, status),
         "messages": state.messages + [AIMessage(content=final_answer)],
     }
 
@@ -2732,7 +2917,7 @@ async def _run_risk_for_symbol(
         f"SUA TAREFA: Calcular métricas de risco usando as ferramentas disponíveis."
     )
     node_config = NODE_CONFIG["risk_agent"]
-    content, cot, tool_msgs, steps = await _run_agent_loop(
+    content, cot, status, tool_msgs, steps = await _run_agent_loop(
         state, _get_llm_for_node("risk_agent"), _RISK_SYSTEM, context, clear_steps=True,
         force_interval=exec_interval,
         node_name=f"RiskAgent[{symbol}]",
@@ -2878,6 +3063,7 @@ async def _run_risk_for_symbol(
         ),
         "steps": steps,
         "cot": cot,
+        "status": status,
         "content": content,
     }
 
@@ -2905,6 +3091,7 @@ async def risk_agent_node(state: QuantAgentState) -> dict:
     new_assets = dict(state.assets)
     all_steps: list = []
     primary_cot = ""
+    primary_status = NodeStatus.OK
     primary_content = ""
     for r in results:
         sym = r["symbol"]
@@ -2913,6 +3100,7 @@ async def risk_agent_node(state: QuantAgentState) -> dict:
         all_steps.extend(_tag_steps(r["steps"], sym))
         if sym == state.symbol:
             primary_cot = r["cot"]
+            primary_status = NodeStatus(r.get("status", "ok"))
             primary_content = r["content"]
 
     print(f"[DEBUG] ===== RISK AGENT NODE END =====")
@@ -2924,7 +3112,7 @@ async def risk_agent_node(state: QuantAgentState) -> dict:
         "intermediate_steps_agent": all_steps,
         "assets":             new_assets,
         "cot":                primary_cot,
-        "reasoning_trail":    _append_reasoning(state.reasoning_trail, "risk_agent", primary_cot),
+        "reasoning_trail":    _append_reasoning(state.reasoning_trail, "risk_agent", primary_cot, primary_status),
     }
 
 @timed_async("Node: SignalAgent")
@@ -2943,7 +3131,7 @@ async def signal_agent_node(state: QuantAgentState) -> dict:
     )
     print(f"[DEBUG] Context: {context}")
     node_config = NODE_CONFIG["signal_agent"]
-    content, cot, tool_msgs, steps = await _run_agent_loop(
+    content, cot, status, tool_msgs, steps = await _run_agent_loop(
         state, _get_llm_for_node("signal_agent"), _SIGNAL_SYSTEM, context,
         force_interval=setup_interval, node_name="SignalAgent", enable_cot=node_config["cot"]
     )
@@ -3006,7 +3194,7 @@ async def signal_agent_node(state: QuantAgentState) -> dict:
         "intermediate_steps_global": state.intermediate_steps_global + steps,
         "intermediate_steps_agent": steps,
         "cot":                cot,
-        "reasoning_trail":    _append_reasoning(state.reasoning_trail, "signal_agent", cot),
+        "reasoning_trail":    _append_reasoning(state.reasoning_trail, "signal_agent", cot, status),
     }
 
 @timed_async("Node: MoE")
@@ -3304,16 +3492,15 @@ async def execution_node(state: QuantAgentState) -> dict:
         raise Exception("Risk level não definido no estado.")
 
     # ──────────── 1) Pergunta original do usuário (bússola da resposta) ────────────
-    original_query = next(
-        (m for m in reversed(state.messages) if isinstance(m, HumanMessage)),
-        None,
-    )
+    original_query = _latest_user_message(state.messages)
     user_question_text = original_query.content if original_query else "(não disponível)"
 
     # ──────────── 2) Reasoning trail — espinha dorsal ────────────
+    # Formato: [node](status) thought — status sinaliza falhas técnicas (error)
+    # ou ausência de CoT estruturado (no_cot) para o LLM tratar com cautela.
     if state.reasoning_trail:
         trail_block = "\n".join(
-            f"  [{name}] {thought}" for name, thought in state.reasoning_trail
+            f"  [{name}]({status}) {thought}" for name, thought, status in state.reasoning_trail
         )
     else:
         trail_block = "  (nenhum)"
@@ -3381,11 +3568,17 @@ HISTÓRICO DE ANÁLISE (últimos 12 steps, para auditoria):
             "<answer>Sua resposta final aqui</answer>"
         )))
 
-    final_response = await llm.ainvoke(msgs)
+    # Try/except: se o LLM final falhar, produzir resposta determinística a
+    # partir dos dados estruturados + trail acumulado, em vez de derrubar o pipeline.
+    try:
+        final_response = await llm.ainvoke(msgs)
+        llm_failure: str | None = None
+    except Exception as e:
+        final_response = None
+        llm_failure = f"LLM final falhou: {str(e)}"
 
-    # Track execution LLM call
     cost_tracker = get_cost_tracker()
-    if hasattr(final_response, 'response_metadata'):
+    if final_response is not None and hasattr(final_response, 'response_metadata'):
         metadata = final_response.response_metadata
         input_tokens = metadata.get('token_usage', {}).get('prompt_tokens', 0)
         output_tokens = metadata.get('token_usage', {}).get('completion_tokens', 0)
@@ -3394,16 +3587,33 @@ HISTÓRICO DE ANÁLISE (últimos 12 steps, para auditoria):
             cost_tracker.add_call(model_name, input_tokens, output_tokens, "Execution")
     cost_summary = cost_tracker.get_summary()
 
-    cot, answer = _extract_cot_and_answer(final_response.content) if node_config["cot"] else ("", final_response.content)
+    if llm_failure is not None:
+        # Fallback determinístico: monta resposta a partir do trail + dados crus.
+        cot = _failure_cot("execution", llm_failure)
+        node_status = NodeStatus.ERROR
+        answer = (
+            f"⚠️ **Falha na síntese final**\n\n"
+            f"O modelo de linguagem não pôde gerar a resposta consolidada ({llm_failure}). "
+            f"Segue resumo determinístico do pipeline:\n\n"
+            f"**Pergunta:** {user_question_text}\n\n"
+            f"**Raciocínio acumulado:**\n```\n{trail_block}\n```\n\n"
+            f"**Dados coletados:**\n```\n{asset_data_section}\n```\n\n"
+            f"> ℹ️ *Resposta de fallback — recomendado tentar novamente.*"
+        )
+        out_messages = state.messages + [AIMessage(content=answer)]
+    else:
+        cot, answer = _extract_cot_and_answer(final_response.content) if node_config["cot"] else ("", final_response.content)
+        node_status = NodeStatus.OK if (cot or not node_config["cot"]) else NodeStatus.NO_COT
+        out_messages = state.messages + [final_response]
 
     return {
         **state.model_dump(),
-        "messages":     state.messages + [final_response],
+        "messages":     out_messages,
         "next_action":  NextAction.FINALIZE,
         "final_answer": answer,
         "cost_summary": cost_summary,
         "cot":          cot,
-        "reasoning_trail": _append_reasoning(state.reasoning_trail, "execution", cot),
+        "reasoning_trail": _append_reasoning(state.reasoning_trail, "execution", cot, node_status),
     }
 
 def blocked_node(state: QuantAgentState) -> dict:
@@ -3459,10 +3669,7 @@ def route_after_forecast(state: QuantAgentState) -> str:
     antes de comparar com as keywords, para tolerar variações como
     "amanhã"/"amanha", "previsão"/"previsao".
     """
-    original = next(
-        (m for m in reversed(state.messages) if isinstance(m, HumanMessage)),
-        None,
-    )
+    original = _latest_user_message(state.messages)
     msg = _normalize_text(original.content if original else "")
 
     if any(kw in msg for kw in _FORECAST_CURRENT_PRICE_KEYWORDS):

@@ -190,7 +190,7 @@ class MultiTimeframeInterpreter:
         # Apply hierarchical rules
         result = self._apply_hierarchical_rules(
             macro_context, setup_context, exec_rsi, exec_macd_bullish,
-            macro_regime, volatility_annualized
+            macro_regime, volatility_annualized, price_change_pct
         )
 
         return result
@@ -203,6 +203,7 @@ class MultiTimeframeInterpreter:
         exec_macd_bullish: bool,
         macro_regime: Optional[str],
         volatility_annualized: Optional[float],
+        price_change_pct: Optional[float],
     ) -> dict:
         """
         Apply hierarchical interpretation rules.
