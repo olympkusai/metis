@@ -39,11 +39,13 @@ class TestRouteAfterOrchestrator:
     """
 
     def _make_state(self, next_action: NextAction, symbol: str = "") -> QuantAgentState:
-        return QuantAgentState(
-            messages=[],
-            next_action=next_action,
-            symbol=symbol,
-        )
+        # symbol agora é uma property derivada de primary_symbol/symbols.
+        # Para configurar o "símbolo primário" no estado, usar primary_symbol.
+        kwargs: dict = {"messages": [], "next_action": next_action}
+        if symbol:
+            kwargs["primary_symbol"] = symbol
+            kwargs["symbols"] = [symbol]
+        return QuantAgentState(**kwargs)
 
     def test_finalize_action_routes_to_finalize(self):
         from app.agent.graph import build_quant_graph

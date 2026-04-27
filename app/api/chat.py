@@ -14,6 +14,23 @@ import uuid
 
 router = APIRouter()
 
+
+def _as_dict(obj) -> dict:
+    """Normalize AssetState / BaseModel / None into a plain dict.
+
+    LangGraph stream updates carry `assets: dict[str, AssetState]`, so the
+    values are Pydantic objects (not dicts). This helper lets the SSE layer
+    use `.get(...)` uniformly without leaking Pydantic into the API code.
+    """
+    if obj is None:
+        return {}
+    if hasattr(obj, "model_dump"):
+        return obj.model_dump()
+    if isinstance(obj, dict):
+        return obj
+    return {}
+
+
 class ChatRequest(BaseModel):
     message: str
     user_id: str
@@ -83,25 +100,49 @@ async def chat(request: ChatRequest):
         for i, (tool_name, result) in enumerate(intermediate_steps, 1)
     ]
 
+    # ── Multi-asset view: campos por-ativo agora vivem em `assets[symbol]`. ──
+    primary_symbol = final_state.get("primary_symbol") or ""
+    all_symbols = final_state.get("symbols", []) or ([primary_symbol] if primary_symbol else [])
+    assets_dict = final_state.get("assets", {}) or {}
+    primary = assets_dict.get(primary_symbol, {}) or {}
+
     # Metadados extras do pipeline multi-agente
     pipeline_meta = {
-        "symbol":             final_state.get("symbol"),
+        "symbol":             primary_symbol,
+        "symbols":            all_symbols,
         "timeframe":          final_state.get("timeframe"),
-        "risk_level":         final_state.get("risk_level"),
-        "signal_direction":   final_state.get("signal_direction"),
-        "signal_confidence":  final_state.get("signal_confidence"),
+        "risk_level":         primary.get("risk_level"),
+        "signal_direction":   primary.get("signal_direction"),
+        "signal_confidence":  primary.get("signal_confidence"),
         "gate_approved":      final_state.get("gate_approved"),
         "gate_reason":        final_state.get("gate_reason"),
-        "anomalies_detected": final_state.get("anomalies_detected", []),
+        "anomalies_detected": primary.get("anomalies_detected", []),
         "forecast": {
-            "status": final_state.get("forecast_status"),
-            "direction": final_state.get("forecast_direction"),
-            "confidence": final_state.get("forecast_confidence"),
-            "predicted_price": final_state.get("forecast_predicted_price"),
-            "return_pct": final_state.get("forecast_return_pct"),
-            "actionable": final_state.get("forecast_actionable"),
-            "warnings": final_state.get("forecast_warnings", []),
+            "status": primary.get("forecast_status"),
+            "direction": primary.get("forecast_direction"),
+            "confidence": primary.get("forecast_confidence"),
+            "predicted_price": primary.get("forecast_predicted_price"),
+            "return_pct": primary.get("forecast_return_pct"),
+            "actionable": primary.get("forecast_actionable"),
+            "warnings": primary.get("forecast_warnings", []),
         },
+        # Quando há comparação, exponha um snapshot compacto dos comparativos
+        # para o frontend renderizar lado a lado se quiser.
+        "compared": [
+            {
+                "symbol": s,
+                "live_price": (assets_dict.get(s) or {}).get("live_price"),
+                "price_change_pct": (assets_dict.get(s) or {}).get("price_change_pct"),
+                "risk_level": (assets_dict.get(s) or {}).get("risk_level"),
+                "sharpe": (assets_dict.get(s) or {}).get("sharpe"),
+                "max_drawdown": (assets_dict.get(s) or {}).get("max_drawdown"),
+                "volatility_annualized": (assets_dict.get(s) or {}).get("volatility_annualized"),
+                "macro_regime": (assets_dict.get(s) or {}).get("macro_regime"),
+                "forecast_return_pct": (assets_dict.get(s) or {}).get("forecast_return_pct"),
+                "forecast_confidence": (assets_dict.get(s) or {}).get("forecast_confidence"),
+            }
+            for s in all_symbols if s and s != primary_symbol
+        ],
     }
     
     # Save assistant response with complete metadata
@@ -236,43 +277,59 @@ async def streaming_chat(request: ChatRequest):
                                 content = content[:500] + "..."
                             step_data["reasoning"] = content
                 
-                # Add node-specific data
+                # ── Helper: extrai snapshot do primary asset do update ──
+                primary_sym = (
+                    state_update.get("primary_symbol")
+                    or accumulated_state.get("primary_symbol")
+                    or ""
+                )
+                # NB: assets values are AssetState (Pydantic), not dicts → normalize.
+                primary_asset_update = (
+                    _as_dict((state_update.get("assets") or {}).get(primary_sym))
+                    if primary_sym else {}
+                )
+
+                # Add node-specific data (lê do update direto OU do AssetState do primary)
                 if node_name == "orchestrator":
                     if "next_agent" in state_update:
                         step_data["next_agent"] = state_update["next_agent"]
-                    if "symbol" in state_update:
-                        step_data["symbol"] = state_update["symbol"]
+                    if primary_sym:
+                        step_data["symbol"] = primary_sym
+                    if state_update.get("symbols"):
+                        step_data["symbols"] = state_update["symbols"]
                     if "timeframe" in state_update:
                         step_data["timeframe"] = str(state_update["timeframe"])
-                
+
                 elif node_name == "market_data":
-                    if "live_price" in state_update:
-                        step_data["live_price"] = state_update["live_price"]
-                    if "volume_24h" in state_update:
-                        step_data["volume_24h"] = state_update["volume_24h"]
-                
-                elif node_name == "feature_engineering":
-                    if "rsi" in state_update:
-                        step_data["rsi"] = state_update["rsi"]
-                    if "macd" in state_update:
-                        step_data["macd"] = state_update["macd"]
-                    if "bb_upper" in state_update:
-                        step_data["bb_upper"] = state_update["bb_upper"]
-                
+                    if primary_asset_update.get("live_price") is not None:
+                        step_data["live_price"] = primary_asset_update["live_price"]
+                    if primary_asset_update.get("volume_24h") is not None:
+                        step_data["volume_24h"] = primary_asset_update["volume_24h"]
+
+                elif node_name in ("features_macro", "features_setup", "features_exec", "feature_engineering"):
+                    if primary_asset_update.get("macro_rsi_14") is not None:
+                        step_data["rsi"] = primary_asset_update["macro_rsi_14"]
+                    elif primary_asset_update.get("setup_rsi_14") is not None:
+                        step_data["rsi"] = primary_asset_update["setup_rsi_14"]
+                    elif primary_asset_update.get("exec_rsi_14") is not None:
+                        step_data["rsi"] = primary_asset_update["exec_rsi_14"]
+                    if primary_asset_update.get("macro_macd_line") is not None:
+                        step_data["macd"] = primary_asset_update["macro_macd_line"]
+
                 elif node_name == "risk_agent":
-                    if "risk_level" in state_update:
-                        step_data["risk_level"] = str(state_update["risk_level"])
-                    if "cvar_95" in state_update:
-                        step_data["cvar_95"] = state_update["cvar_95"]
-                    if "sharpe" in state_update:
-                        step_data["sharpe"] = state_update["sharpe"]
-                
+                    if primary_asset_update.get("risk_level") is not None:
+                        step_data["risk_level"] = str(primary_asset_update["risk_level"])
+                    if primary_asset_update.get("cvar_95") is not None:
+                        step_data["cvar_95"] = primary_asset_update["cvar_95"]
+                    if primary_asset_update.get("sharpe") is not None:
+                        step_data["sharpe"] = primary_asset_update["sharpe"]
+
                 elif node_name == "signal_agent":
-                    if "signal_direction" in state_update:
-                        step_data["signal_direction"] = state_update["signal_direction"]
-                    if "signal_confidence" in state_update:
-                        step_data["signal_confidence"] = state_update["signal_confidence"]
-                
+                    if primary_asset_update.get("signal_direction") is not None:
+                        step_data["signal_direction"] = primary_asset_update["signal_direction"]
+                    if primary_asset_update.get("signal_confidence") is not None:
+                        step_data["signal_confidence"] = primary_asset_update["signal_confidence"]
+
                 elif node_name == "risk_gate":
                     if "gate_approved" in state_update:
                         step_data["gate_approved"] = state_update["gate_approved"]
@@ -284,20 +341,42 @@ async def streaming_chat(request: ChatRequest):
                 # Emit SSE event
                 yield f"data: {json.dumps(step_data)}\n\n"
         
-        # Send final event with complete accumulated state
+        # ── Multi-asset view for the final event ──
+        primary_sym = accumulated_state.get("primary_symbol") or ""
+        all_syms = accumulated_state.get("symbols", []) or ([primary_sym] if primary_sym else [])
+        assets_dict = accumulated_state.get("assets", {}) or {}
+        # AssetState (Pydantic) → dict for uniform .get() access.
+        primary = _as_dict(assets_dict.get(primary_sym))
+
+        compared: list[dict] = []
+        for s in all_syms:
+            if not s or s == primary_sym:
+                continue
+            asset = _as_dict(assets_dict.get(s))
+            compared.append({
+                "symbol": s,
+                "live_price": asset.get("live_price"),
+                "risk_level": str(asset["risk_level"]) if asset.get("risk_level") else None,
+                "sharpe": asset.get("sharpe"),
+                "max_drawdown": asset.get("max_drawdown"),
+                "forecast_return_pct": asset.get("forecast_return_pct"),
+            })
+
         final_event = {
             "node": "final",
             "type": "completion",
             "response": accumulated_state.get("final_answer", ""),
             "pipeline": {
-                "symbol": accumulated_state.get("symbol"),
+                "symbol": primary_sym,
+                "symbols": all_syms,
                 "timeframe": str(accumulated_state.get("timeframe")),
-                "risk_level": str(accumulated_state.get("risk_level")),
-                "signal_direction": accumulated_state.get("signal_direction"),
-                "signal_confidence": accumulated_state.get("signal_confidence"),
+                "risk_level": str(primary["risk_level"]) if primary.get("risk_level") else None,
+                "signal_direction": primary.get("signal_direction"),
+                "signal_confidence": primary.get("signal_confidence"),
                 "gate_approved": accumulated_state.get("gate_approved"),
                 "gate_reason": accumulated_state.get("gate_reason"),
-                "anomalies_detected": accumulated_state.get("anomalies_detected", []),
+                "anomalies_detected": primary.get("anomalies_detected", []),
+                "compared": compared,
             },
             "timestamp": asyncio.get_event_loop().time(),
             "session_id": session_id,

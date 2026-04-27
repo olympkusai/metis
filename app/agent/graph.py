@@ -132,20 +132,18 @@ class TimeframeLayer(str, Enum):
 # 2. TYPED STATE  (Pydantic-backed)
 # ─────────────────────────────────────────────
 
-class QuantAgentState(BaseModel):
-    # Conversation
-    messages:           list[Any]          = Field(default_factory=list)
-    user_id:            str                = ""
+class AssetState(BaseModel):
+    """
+    Estado per-ativo. Encapsula TODOS os campos analíticos de um único símbolo
+    (preço, indicadores multi-TF, risco, sinal, decisão, MoE, forecast).
 
-    # Routing
-    next_action:        NextAction         = NextAction.MARKET_DATA
-    intermediate_steps_global: list[tuple[str, str]] = Field(default_factory=list)  # Global audit trail
-    intermediate_steps_agent: list[tuple[str, str]] = Field(default_factory=list)  # Agent-specific steps
-    final_answer:       str                = ""
+    O `QuantAgentState` mantém um `assets: dict[str, AssetState]` para suportar
+    análises comparativas entre múltiplos ativos. O ativo "primário" é o foco
+    da decisão direcional; os demais são contexto comparativo.
+    """
+    symbol:             str                = ""
 
     # Market context (populated by MarketDataAgent)
-    symbol:             str                = ""
-    timeframe:          AnalysisTimeframe  = AnalysisTimeframe.DAILY
     live_price:         float | None       = None
     volume_24h:         float | None       = None
     price_change_pct:   float | None       = None
@@ -160,7 +158,7 @@ class QuantAgentState(BaseModel):
     max_drawdown:       float | None       = None
     volatility_annualized: float | None    = None
 
-    # Technical indicators (populated by FeatureAgent)
+    # Technical indicators (populated by FeatureAgent — legacy)
     rsi_14:             float | None       = None
     macd_line:          float | None       = None
     macd_signal:        float | None       = None
@@ -169,28 +167,27 @@ class QuantAgentState(BaseModel):
     bb_middle:          float | None       = None
     bb_lower:           float | None       = None
 
-    # Multi-timeframe indicators (separated by layer)
-    # Macro layer (1D) - regime detection
+    # Multi-timeframe — Macro layer (1D) - regime detection
     macro_rsi_14:       float | None       = None
     macro_macd_line:    float | None       = None
     macro_macd_signal:  float | None       = None
     macro_bb_upper:     float | None       = None
     macro_bb_lower:     float | None       = None
     macro_bb_pct_b:     float | None       = None
-    macro_regime:       str | None         = None   # "trending" | "ranging" | "breakout" | "volatile" | "reversal"
-    macro_bias:         str | None         = None   # "bullish" | "bearish" | "neutral"
-    
-    # Trend state context (new hierarchical interpretation)
-    trend_state:        str | None         = None   # "trending" | "overextended" | "pullback" | "reversal" | "neutral"
-    trend_direction:    str | None         = None   # "bullish" | "bearish" | "neutral"
-    signal_type:        str | None         = None   # "trend_follow" | "pullback_entry" | "breakout" | "reversal" | "no_edge"
-    execution_timing:   str | None         = None   # "immediate" | "wait_for_pullback" | "wait_for_confirmation" | "wait"
-    
+    macro_regime:       str | None         = None
+    macro_bias:         str | None         = None
+
+    # Trend state context (hierarchical interpretation)
+    trend_state:        str | None         = None
+    trend_direction:    str | None         = None
+    signal_type:        str | None         = None
+    execution_timing:   str | None         = None
+
     # Final decision (from Decision Engine - FINAL authority)
-    final_signal:       str | None         = None   # "long" | "short" | "conditional_long" | "conditional_short" | "wait" | "neutral"
-    final_signal_type:  str | None         = None   # "trend_follow" | "pullback_entry" | "breakout" | "reversal" | "no_edge"
-    final_confidence:   float | None       = None   # 0 to 1
-    final_reasoning:    str | None         = None   # Explanation of final decision
+    final_signal:       str | None         = None
+    final_signal_type:  str | None         = None
+    final_confidence:   float | None       = None
+    final_reasoning:    str | None         = None
 
     # Setup layer (4H) - signal generation
     setup_rsi_14:       float | None       = None
@@ -199,9 +196,9 @@ class QuantAgentState(BaseModel):
     setup_bb_upper:     float | None       = None
     setup_bb_lower:     float | None       = None
     setup_bb_pct_b:     float | None       = None
-    setup_signal:       float | None       = None   # -1 to 1
-    setup_confidence:   float | None       = None   # 0..1
-    setup_direction:    str | None         = None   # "long" | "short" | "weak_long" | "weak_short"
+    setup_signal:       float | None       = None
+    setup_confidence:   float | None       = None
+    setup_direction:    str | None         = None
 
     # Execution layer (1H) - timing + risk
     exec_rsi_14:        float | None       = None
@@ -209,7 +206,7 @@ class QuantAgentState(BaseModel):
     exec_macd_signal:   float | None       = None
     exec_sharpe:        float | None       = None
     exec_volatility:    float | None       = None
-    exec_timing:        str | None         = None   # "entry" | "wait" | "exit"
+    exec_timing:        str | None         = None
 
     # Apollo ML forecast context
     forecast_period_start: str | None      = None
@@ -230,27 +227,51 @@ class QuantAgentState(BaseModel):
     forecast_warnings:    list[str]        = Field(default_factory=list)
 
     # Signal context (legacy, will be phased out)
-    regime:             str | None         = None   # "trending" | "ranging" | "breakout"
-    signal_direction:   str | None         = None   # "long" | "short" | "neutral"
-    signal_confidence:  float | None       = None   # 0..1
+    regime:             str | None         = None
+    signal_direction:   str | None         = None
+    signal_confidence:  float | None       = None
 
-    # MoE output (populated by MoE node)
-    moe_final_signal:       float | None   = None   # -1 to 1
-    moe_final_confidence:   float | None   = None   # 0 to 1
+    # MoE output (populated by MoE node — primary only in practice)
+    moe_final_signal:       float | None   = None
+    moe_final_confidence:   float | None   = None
     moe_selected_experts:   list[str]     = Field(default_factory=list)
     moe_expert_weights:     dict[str, float] = Field(default_factory=dict)
     moe_gating_reason:      str            = ""
-    moe_position_size:      float | None   = None   # 0 to 1 (fraction of capital)
-    moe_risk_adjusted_signal: float | None = None   # signal * position_size
-
-    # Risk gate output
-    gate_approved:      bool | None        = None
-    gate_reason:        str                = ""
+    moe_position_size:      float | None   = None
+    moe_risk_adjusted_signal: float | None = None
 
     # Data quality
     anomalies_detected: list[str]          = Field(default_factory=list)
 
-    # Portfolio context (for institutional portfolio management)
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+
+class QuantAgentState(BaseModel):
+    # Conversation
+    messages:           list[Any]          = Field(default_factory=list)
+    user_id:            str                = ""
+
+    # Routing
+    next_action:        NextAction         = NextAction.MARKET_DATA
+    intermediate_steps_global: list[tuple[str, str]] = Field(default_factory=list)  # Global audit trail
+    intermediate_steps_agent: list[tuple[str, str]] = Field(default_factory=list)  # Agent-specific steps
+    final_answer:       str                = ""
+
+    # Multi-asset support
+    # `symbols[0]` is the primary asset (target of directional decision).
+    # Others are comparative context.
+    symbols:            list[str]          = Field(default_factory=list)
+    primary_symbol:     str                = ""
+    assets:             dict[str, AssetState] = Field(default_factory=dict)
+
+    # Shared analysis timeframe (applies to all assets)
+    timeframe:          AnalysisTimeframe  = AnalysisTimeframe.DAILY
+
+    # Risk gate output (refers to primary asset — gate runs only on primary)
+    gate_approved:      bool | None        = None
+    gate_reason:        str                = ""
+
+    # Portfolio context (cross-asset, institutional portfolio management)
     portfolio_state: PortfolioState       = Field(default_factory=PortfolioState)
     proposed_position_size: float | None   = None
 
@@ -263,6 +284,212 @@ class QuantAgentState(BaseModel):
     reasoning_trail:    list[tuple[str, str]] = Field(default_factory=list)
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    # ─── Convenience accessors (backward-compat reads) ───
+
+    @property
+    def symbol(self) -> str:
+        """Primary symbol. Backward-compat alias for `primary_symbol`."""
+        return self.primary_symbol or (self.symbols[0] if self.symbols else "")
+
+    @property
+    def primary(self) -> AssetState:
+        """Primary asset state. Returns an empty `AssetState` when missing."""
+        sym = self.symbol
+        if not sym:
+            return AssetState()
+        return self.assets.get(sym) or AssetState(symbol=sym)
+
+    def get_asset(self, symbol: str) -> AssetState:
+        """Get asset state by symbol; returns empty `AssetState` if absent."""
+        return self.assets.get(symbol) or AssetState(symbol=symbol)
+
+    # ─── Backward-compat read-only delegations to `primary` ───
+    # These exist so existing nodes that read `state.live_price`, `state.rsi_14`, etc.
+    # keep working unchanged. WRITES must go through `_patch_asset(assets, symbol, ...)`.
+    # NOTE: these properties are NOT serialized by `model_dump()`. Consumers that need
+    # them (e.g. `app/api/chat.py`) should read from `assets[primary_symbol]`.
+
+    @property
+    def live_price(self) -> float | None: return self.primary.live_price
+    @property
+    def volume_24h(self) -> float | None: return self.primary.volume_24h
+    @property
+    def price_change_pct(self) -> float | None: return self.primary.price_change_pct
+    @property
+    def recent_high(self) -> float | None: return self.primary.recent_high
+    @property
+    def recent_low(self) -> float | None: return self.primary.recent_low
+
+    @property
+    def risk_level(self) -> RiskLevel | None: return self.primary.risk_level
+    @property
+    def var_95(self) -> float | None: return self.primary.var_95
+    @property
+    def cvar_95(self) -> float | None: return self.primary.cvar_95
+    @property
+    def sharpe(self) -> float | None: return self.primary.sharpe
+    @property
+    def max_drawdown(self) -> float | None: return self.primary.max_drawdown
+    @property
+    def volatility_annualized(self) -> float | None: return self.primary.volatility_annualized
+
+    @property
+    def rsi_14(self) -> float | None: return self.primary.rsi_14
+    @property
+    def macd_line(self) -> float | None: return self.primary.macd_line
+    @property
+    def macd_signal(self) -> float | None: return self.primary.macd_signal
+    @property
+    def macd_histogram(self) -> float | None: return self.primary.macd_histogram
+    @property
+    def bb_upper(self) -> float | None: return self.primary.bb_upper
+    @property
+    def bb_middle(self) -> float | None: return self.primary.bb_middle
+    @property
+    def bb_lower(self) -> float | None: return self.primary.bb_lower
+
+    @property
+    def macro_rsi_14(self) -> float | None: return self.primary.macro_rsi_14
+    @property
+    def macro_macd_line(self) -> float | None: return self.primary.macro_macd_line
+    @property
+    def macro_macd_signal(self) -> float | None: return self.primary.macro_macd_signal
+    @property
+    def macro_bb_upper(self) -> float | None: return self.primary.macro_bb_upper
+    @property
+    def macro_bb_lower(self) -> float | None: return self.primary.macro_bb_lower
+    @property
+    def macro_bb_pct_b(self) -> float | None: return self.primary.macro_bb_pct_b
+    @property
+    def macro_regime(self) -> str | None: return self.primary.macro_regime
+    @property
+    def macro_bias(self) -> str | None: return self.primary.macro_bias
+
+    @property
+    def trend_state(self) -> str | None: return self.primary.trend_state
+    @property
+    def trend_direction(self) -> str | None: return self.primary.trend_direction
+    @property
+    def signal_type(self) -> str | None: return self.primary.signal_type
+    @property
+    def execution_timing(self) -> str | None: return self.primary.execution_timing
+
+    @property
+    def final_signal(self) -> str | None: return self.primary.final_signal
+    @property
+    def final_signal_type(self) -> str | None: return self.primary.final_signal_type
+    @property
+    def final_confidence(self) -> float | None: return self.primary.final_confidence
+    @property
+    def final_reasoning(self) -> str | None: return self.primary.final_reasoning
+
+    @property
+    def setup_rsi_14(self) -> float | None: return self.primary.setup_rsi_14
+    @property
+    def setup_macd_line(self) -> float | None: return self.primary.setup_macd_line
+    @property
+    def setup_macd_signal(self) -> float | None: return self.primary.setup_macd_signal
+    @property
+    def setup_bb_upper(self) -> float | None: return self.primary.setup_bb_upper
+    @property
+    def setup_bb_lower(self) -> float | None: return self.primary.setup_bb_lower
+    @property
+    def setup_bb_pct_b(self) -> float | None: return self.primary.setup_bb_pct_b
+    @property
+    def setup_signal(self) -> float | None: return self.primary.setup_signal
+    @property
+    def setup_confidence(self) -> float | None: return self.primary.setup_confidence
+    @property
+    def setup_direction(self) -> str | None: return self.primary.setup_direction
+
+    @property
+    def exec_rsi_14(self) -> float | None: return self.primary.exec_rsi_14
+    @property
+    def exec_macd_line(self) -> float | None: return self.primary.exec_macd_line
+    @property
+    def exec_macd_signal(self) -> float | None: return self.primary.exec_macd_signal
+    @property
+    def exec_sharpe(self) -> float | None: return self.primary.exec_sharpe
+    @property
+    def exec_volatility(self) -> float | None: return self.primary.exec_volatility
+    @property
+    def exec_timing(self) -> str | None: return self.primary.exec_timing
+
+    @property
+    def forecast_period_start(self) -> str | None: return self.primary.forecast_period_start
+    @property
+    def forecast_period_end(self) -> str | None: return self.primary.forecast_period_end
+    @property
+    def forecast_data_points(self) -> int | None: return self.primary.forecast_data_points
+    @property
+    def forecast_current_price(self) -> float | None: return self.primary.forecast_current_price
+    @property
+    def forecast_predicted_price(self) -> float | None: return self.primary.forecast_predicted_price
+    @property
+    def forecast_direction(self) -> str | None: return self.primary.forecast_direction
+    @property
+    def forecast_confidence(self) -> float | None: return self.primary.forecast_confidence
+    @property
+    def forecast_model_mape(self) -> float | None: return self.primary.forecast_model_mape
+    @property
+    def forecast_period_volatility(self) -> float | None: return self.primary.forecast_period_volatility
+    @property
+    def forecast_data_quality(self) -> str | None: return self.primary.forecast_data_quality
+    @property
+    def forecast_return_pct(self) -> float | None: return self.primary.forecast_return_pct
+    @property
+    def forecast_backtest_error_pct(self) -> float | None: return self.primary.forecast_backtest_error_pct
+    @property
+    def forecast_training_attempts(self) -> int: return self.primary.forecast_training_attempts
+    @property
+    def forecast_actionable(self) -> bool: return self.primary.forecast_actionable
+    @property
+    def forecast_status(self) -> str: return self.primary.forecast_status
+    @property
+    def forecast_warnings(self) -> list[str]: return self.primary.forecast_warnings
+
+    @property
+    def regime(self) -> str | None: return self.primary.regime
+    @property
+    def signal_direction(self) -> str | None: return self.primary.signal_direction
+    @property
+    def signal_confidence(self) -> float | None: return self.primary.signal_confidence
+
+    @property
+    def moe_final_signal(self) -> float | None: return self.primary.moe_final_signal
+    @property
+    def moe_final_confidence(self) -> float | None: return self.primary.moe_final_confidence
+    @property
+    def moe_selected_experts(self) -> list[str]: return self.primary.moe_selected_experts
+    @property
+    def moe_expert_weights(self) -> dict[str, float]: return self.primary.moe_expert_weights
+    @property
+    def moe_gating_reason(self) -> str: return self.primary.moe_gating_reason
+    @property
+    def moe_position_size(self) -> float | None: return self.primary.moe_position_size
+    @property
+    def moe_risk_adjusted_signal(self) -> float | None: return self.primary.moe_risk_adjusted_signal
+
+    @property
+    def anomalies_detected(self) -> list[str]: return self.primary.anomalies_detected
+
+
+def _patch_asset(
+    assets: dict[str, AssetState],
+    symbol: str,
+    **fields: Any,
+) -> dict[str, AssetState]:
+    """Return a NEW assets dict with `symbol`'s AssetState updated by `fields`.
+
+    Use this in node returns to update a single asset without mutating the
+    incoming state. Designed to play well with LangGraph's state merge
+    semantics (which fully replace dict-typed fields).
+    """
+    new_assets = dict(assets)
+    current = new_assets.get(symbol) or AssetState(symbol=symbol)
+    new_assets[symbol] = current.model_copy(update=fields)
+    return new_assets
 
 # ─────────────────────────────────────────────
 # 3. NODE CONFIGURATION  (model + CoT per node)
@@ -518,33 +745,68 @@ FERRAMENTAS: Nenhuma - use dados do contexto
 """.strip()
 
 _EXECUTION_SYSTEM = """
-Você é um ESPECIALISTA EM INVESTIMENTOS em criptomoedas — atua como analista sênior buy-side respondendo a um investidor sobre o estado atual do ativo / mercado.
+Você é um analista sênior buy-side de criptomoedas. Sua tarefa é RESPONDER À PERGUNTA do usuário usando os dados já coletados pelos agentes upstream e o raciocínio acumulado do pipeline.
 
-OBJETIVO: produzir uma análise de mercado/cripto orientada à TOMADA DE DECISÃO de investimento, baseada nos dados quantitativos coletados (preço, indicadores técnicos, risco, regime, sinal). Este NÃO é um fluxo de previsão futura — para previsão existe outro fluxo dedicado.
+PRINCÍPIO FUNDAMENTAL — RESPONDA A PERGUNTA QUE FOI FEITA:
+• Leia a PERGUNTA ORIGINAL DO USUÁRIO (vem destacada no contexto). Ela define o formato e foco da resposta.
+• Se a pergunta é comparativa ("X é melhor que Y?", "compare A e B", "qual escolher entre…"): responda como comparação direta, com tabela lado a lado e veredicto claro.
+• Se a pergunta é uma análise simples ("como está o BTC?", "vale comprar agora?"): use o esqueleto single-asset sugerido abaixo.
+• Se a pergunta é específica ("qual o RSI?", "qual o risco?"): responda focado, sem inflar com seções desnecessárias.
+• NÃO force um template fixo quando ele não cabe na pergunta.
 
-CONTEÚDO QUE A RESPOSTA DEVE COBRIR (adapte ao contexto, não force seções vazias):
-1. LEITURA DO ATIVO — tese em uma frase (ex.: "BTC opera lateralizado em zona de acumulação após pullback").
-2. NÚMEROS QUE IMPORTAM — cite apenas os relevantes (preço, variação 24h, volume, RSI, MACD, %B, volatilidade).
-3. INTERPRETAÇÃO — o que esses números dizem para um investidor: força/fraqueza, regime (trending/ranging/breakout), divergências, qualidade do sinal.
-4. RISCO — classifique (baixo/moderado/alto/extremo) com base em VaR, CVaR, drawdown, vol anualizada e Sharpe; explique a implicação para position sizing e exposição.
-5. CONCLUSÃO ACIONÁVEL — viés (bullish/bearish/neutro), em qual cenário a tese se invalida, o que monitorar.
+USO DO RACIOCÍNIO ACUMULADO:
+• O contexto traz o RACIOCÍNIO DOS AGENTES (`reasoning_trail`) com a tese de cada nó (market_data, features, risk, signal, decision_engine etc.). USE-O como espinha dorsal.
+• Se houver conclusões fortes nesse trail (ex.: "Bullish macro but bearish setup", "Chainlink tem Sharpe superior"), elas devem aparecer na sua resposta — refraseadas, não copiadas literalmente.
+• Não ignore o trail e nem o repita: sintetize-o à luz da pergunta.
 
 POSTURA DO ESPECIALISTA:
-• Pondere retorno × risco — não recomende às cegas.
 • Cite SEMPRE números específicos do contexto; nunca generalize ("alto", "baixo") sem o valor.
 • Trate conflito entre indicadores como informação útil, não como ruído.
+• Pondere retorno × risco — não recomende às cegas.
 • Se um campo aparece como "(não coletado)" ou None: omita em silêncio.
+• Não invente target ou horizonte (este fluxo NÃO é previsão futura).
 
-ESTILO DE FORMATAÇÃO (OBRIGATÓRIO — markdown rico, tom amigável):
-• Escreva como um analista que sabe explicar para investidor não-técnico — claro, descomplicado, sem condescendência.
-• Use cabeçalhos `##` para separar blocos.
-• **Negrito** nos valores-chave (preço, RSI, viés).
-• Emojis nos cabeçalhos: 🎯 leitura, 📊 indicadores, 🔍 interpretação, ⚠️ risco, ✅ conclusão.
-• Use TABELA markdown para listar os indicadores principais (uma linha por indicador, com valor + leitura).
-• Bullets (`-`) para listar pontos de interpretação, riscos e o que monitorar.
+ESTILO DE FORMATAÇÃO:
+• Markdown rico, tom de analista que explica para investidor não-técnico — claro, descomplicado, sem condescendência.
+• Use cabeçalhos `##` para separar blocos quando o conteúdo justifica.
+• **Negrito** nos valores-chave (preço, RSI, viés, vencedor de comparação).
+• Emojis pontuais nos cabeçalhos quando ajudar a leitura: 🎯 leitura, 📊 dados, 🔍 interpretação, ⚠️ risco, ✅ conclusão, ⚖️ comparação.
+• Tabelas markdown para listar números (indicadores, métricas, comparação lado a lado).
+• Bullets (`-`) para pontos curtos.
 • Encerre com um blockquote (`>`) contendo o disclaimer.
 
-ESQUELETO SUGERIDO (omita seções sem dados):
+═══════════════════════════════════════════════════════════
+MODOS DE RESPOSTA — escolha o que melhor serve à pergunta:
+═══════════════════════════════════════════════════════════
+
+▶ MODO COMPARATIVO (>1 ativo no contexto, pergunta envolve comparação):
+## ⚖️ {Ativo A} vs {Ativo B}
+> Veredicto em uma frase: qual é a tese comparativa? (ex.: "Chainlink lidera em risco-retorno; XRP tem momentum mais frágil.")
+
+## 📊 Lado a lado
+| Métrica | {A} | {B} |
+|---|---|---|
+| Preço | $X | $Y |
+| Variação 24h | … | … |
+| RSI(14) macro/setup/exec | … | … |
+| Regime | … | … |
+| Sharpe | … | … |
+| Max Drawdown | … | … |
+| Volatilidade a.a. | … | … |
+| Forecast ML (retorno/conf) | … | … |
+
+## 🔍 Análise comparativa
+- onde {A} é mais forte
+- onde {B} é mais forte
+- conflitos / pontos de atenção
+
+## ✅ Veredicto
+- qual escolher e por quê (em função da pergunta)
+- caveats (perfil de risco, horizonte, etc.)
+
+> ℹ️ *Análise quantitativa — não é recomendação de investimento.*
+
+▶ MODO SINGLE-ASSET (1 ativo, pergunta de leitura/análise):
 ## 🎯 Leitura de {symbol}
 > Tese em uma frase.
 
@@ -553,9 +815,9 @@ ESQUELETO SUGERIDO (omita seções sem dados):
 |---|---|---|
 | Preço | $X | variação 24h |
 | RSI(14) | X | sobrecomprado / neutro / sobrevendido |
-| MACD | ... | ... |
-| Bollinger %B | X | ... |
-| Volatilidade | X% | ... |
+| MACD | … | … |
+| Bollinger %B | X | … |
+| Volatilidade | X% | … |
 
 ## 🔍 Interpretação
 - ponto 1
@@ -572,11 +834,16 @@ ESQUELETO SUGERIDO (omita seções sem dados):
 
 > ℹ️ *Análise quantitativa — não é recomendação de investimento.*
 
+▶ MODO PERGUNTA ESPECÍFICA:
+Responda direto, sem esqueleto. Use 1-3 parágrafos curtos + bullets se ajudar. Sempre cite números do contexto. Encerre com o disclaimer em blockquote.
+
+═══════════════════════════════════════════════════════════
+
 REGRAS DURAS:
 • Não trate este fluxo como previsão futura — não invente target ou horizonte.
-• Não diga que "não há dado" quando o número está no contexto.
+• Se um valor não existe, OMITA a linha (não escreva "indisponível").
 • Não repita disclaimers no meio do texto — apenas o blockquote final.
-• Se um valor não existe, OMITA a linha da tabela (não escreva "indisponível" na tabela).
+• Se a pergunta é comparativa, NUNCA produza apenas a leitura de 1 ativo — isso é falha grave.
 """.strip()
 
 _FORECAST_RESPONSE_SYSTEM = """
@@ -1105,35 +1372,90 @@ def _extract_symbol(text: str, default_quote: str = _DEFAULT_QUOTE) -> str | Non
     Retorna:
         Ticker canônico em uppercase (e.g., "BTCUSDT") ou None.
     """
+    syms = _extract_all_symbols(text, default_quote=default_quote)
+    return syms[0] if syms else None
+
+
+def _extract_all_symbols(
+    text: str,
+    default_quote: str = _DEFAULT_QUOTE,
+    max_symbols: int = 4,
+) -> list[str]:
+    """
+    Extrai TODOS os símbolos da pergunta, preservando a ordem de aparição.
+
+    A ordem importa: o primeiro símbolo encontrado é considerado o ATIVO PRIMÁRIO
+    (foco da decisão direcional). Os demais são contexto comparativo. Exemplo:
+    "XRP é melhor que Chainlink?" → ["XRPUSDT", "LINKUSDT"], primário = XRPUSDT.
+
+    Estratégia:
+        1. Localiza todos os tickers formatados (BTCUSDT, ETH/USDT) com seu offset.
+        2. Localiza todos os aliases (bitcoin, btc, chainlink) com seu offset.
+        3. Ordena por offset, deduplica preservando a primeira ocorrência.
+        4. Limita a `max_symbols` para evitar pipelines absurdamente longos.
+
+    Args:
+        text: pergunta do usuário (texto natural)
+        default_quote: moeda quote para complementar tickers nus.
+        max_symbols: limite superior de símbolos retornados.
+
+    Retorna:
+        Lista ordenada de tickers canônicos (uppercase). Vazia se nenhum.
+    """
     if not text:
-        return None
+        return []
 
     normalized = _normalize_text(text)
     if not normalized:
-        return None
+        return []
 
-    # 1) Ticker já formatado (e.g., btcusdt, ethusdc) — match no texto inteiro
+    found: list[tuple[int, str]] = []  # (offset, canonical_ticker)
+
+    # 1) Tickers já formatados (e.g., btcusdt, ethusdc)
     quotes_pattern = "|".join(re.escape(q.lower()) for q in _KNOWN_QUOTES)
     full_ticker_pattern = re.compile(
         rf"\b([a-z0-9]{{2,10}})({quotes_pattern})\b",
         re.IGNORECASE,
     )
-    match = full_ticker_pattern.search(normalized)
-    if match:
+    for match in full_ticker_pattern.finditer(normalized):
         base = match.group(1).upper()
         quote = match.group(2).upper()
-        # Evita falso positivo: base não pode ser palavra comum
-        if base.lower() not in {"the", "for", "with", "que", "com", "para"}:
-            return f"{base}{quote}"
+        if base.lower() in {"the", "for", "with", "que", "com", "para"}:
+            continue
+        found.append((match.start(), f"{base}{quote}"))
 
-    # 2) Nome ou ticker curto via alias map
-    tokens = normalized.split()
-    for token in tokens:
-        if token in _SYMBOL_ALIASES:
-            base = _SYMBOL_ALIASES[token]
-            return f"{base}{default_quote}"
+    # 2) Aliases (nome ou ticker curto). Usamos word-boundary regex para cada alias.
+    # Ordenar aliases por comprimento desc para preferir matches longos
+    # ("bitcoin" antes de "btc") quando o offset é o mesmo.
+    sorted_aliases = sorted(_SYMBOL_ALIASES.keys(), key=len, reverse=True)
+    seen_offsets: set[int] = set()
+    for alias in sorted_aliases:
+        pattern = re.compile(rf"\b{re.escape(alias)}\b", re.IGNORECASE)
+        for match in pattern.finditer(normalized):
+            off = match.start()
+            # Skip overlapping matches (e.g., "btc" inside "btcusdt" already captured)
+            if any(abs(off - o) < 4 for o in seen_offsets):
+                continue
+            seen_offsets.add(off)
+            base = _SYMBOL_ALIASES[alias]
+            found.append((off, f"{base}{default_quote}"))
 
-    return None
+    if not found:
+        return []
+
+    # Sort by offset (order of appearance), then dedupe preserving first occurrence
+    found.sort(key=lambda x: x[0])
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for _, ticker in found:
+        if ticker in seen:
+            continue
+        seen.add(ticker)
+        ordered.append(ticker)
+        if len(ordered) >= max_symbols:
+            break
+
+    return ordered
 
 
 # ───── Timeframe extraction (palavras-chave temporais → AnalysisTimeframe) ─────
@@ -1308,10 +1630,11 @@ async def orchestrator_node(state: QuantAgentState) -> dict:
     # determinístico e robusto contra alucinações. O LLM só é chamado se
     # a heurística não conseguir extrair ambos.
     # FUTURO: o quote pair (USDT) deve vir das configurações do usuário.
-    heuristic_symbol = _extract_symbol(user_question)
+    heuristic_symbols = _extract_all_symbols(user_question)
+    heuristic_symbol = heuristic_symbols[0] if heuristic_symbols else None
     heuristic_timeframe = _extract_timeframe_hint(user_question)
     print(
-        f"[DEBUG] Heuristic extraction - symbol: {heuristic_symbol}, "
+        f"[DEBUG] Heuristic extraction - symbols: {heuristic_symbols}, "
         f"timeframe: {heuristic_timeframe}"
     )
 
@@ -1351,16 +1674,34 @@ async def orchestrator_node(state: QuantAgentState) -> dict:
         # FUTURO: usar quote do user config em vez de _DEFAULT_QUOTE
         symbol = f"{symbol}{_DEFAULT_QUOTE}"
 
-    print(f"[DEBUG] Orchestrator output - symbol: {symbol}, timeframe: {timeframe}")
+    # Build the multi-asset symbol list. The primary (`symbol`) leads, then any
+    # extra symbols extracted by the heuristic in original order. Dedupe.
+    new_symbols: list[str] = []
+    if symbol:
+        new_symbols.append(symbol)
+    for extra in heuristic_symbols:
+        if extra and extra not in new_symbols:
+            new_symbols.append(extra)
+    new_assets = {s: state.assets.get(s) or AssetState(symbol=s) for s in new_symbols}
+
+    print(f"[DEBUG] Orchestrator output - primary: {symbol}, all symbols: {new_symbols}, timeframe: {timeframe}")
     print(f"[DEBUG] ===== ORCHESTRATOR NODE END =====")
+
+    summary = (
+        f"symbols={new_symbols}, primary={symbol}, timeframe={timeframe}"
+        if len(new_symbols) > 1
+        else f"symbol={symbol}, timeframe={timeframe}"
+    )
 
     return {
         **state.model_dump(),
         "messages":     state.messages + [AIMessage(content=f"Routed to {symbol} ({timeframe})")],
         "next_action":  NextAction.MARKET_DATA,
-        "symbol":       symbol,
+        "symbols":      new_symbols,
+        "primary_symbol": symbol,
+        "assets":       new_assets,
         "timeframe":    timeframe,
-        "intermediate_steps_global": state.intermediate_steps_global + [("orchestrator", f"symbol={symbol}, timeframe={timeframe}")],
+        "intermediate_steps_global": state.intermediate_steps_global + [("orchestrator", summary)],
         "intermediate_steps_agent": [],
         "cot":          "",
     }
@@ -1387,34 +1728,48 @@ def _get_multi_tf_interval(layer: TimeframeLayer) -> str:
     """Returns the interval for a given multi-timeframe layer."""
     return _MULTI_TF_INTERVALS.get(layer, "1h")
 
-@timed_async("Node: MarketData")
-async def market_data_node(state: QuantAgentState) -> dict:
-    print(f"[DEBUG] ===== MARKET DATA NODE START =====")
-    print(f"[DEBUG] Input symbol: {state.symbol}, timeframe: {state.timeframe}")
+def _resolve_symbols(state: QuantAgentState) -> list[str]:
+    """Return the list of symbols to process. Falls back to `[state.symbol]`
+    when `state.symbols` is empty but a primary symbol exists, so that the
+    multi-asset code path keeps working for legacy single-asset calls."""
+    if state.symbols:
+        return list(state.symbols)
+    return [state.symbol] if state.symbol else []
+
+
+def _tag_steps(steps: list, symbol: str) -> list:
+    """Prefix step labels with the symbol so the audit trail stays readable
+    when N assets run in parallel."""
+    return [(f"{name}@{symbol}", val) for (name, val) in steps]
+
+
+async def _run_market_data_for_symbol(
+    state: QuantAgentState, symbol: str
+) -> dict:
+    """Coleta market data para um único símbolo. Função pura para uso
+    em paralelo via asyncio.gather pelo `market_data_node`."""
+    print(f"[DEBUG] [{symbol}] MarketData start")
     analysis_interval = _get_analysis_interval(state.timeframe)
     context = (
-        f"Symbol: {state.symbol} | Timeframe: {state.timeframe} | "
+        f"Symbol: {symbol} | Timeframe: {state.timeframe} | "
         f"INTERVALO OBRIGATÓRIO: interval=\"{analysis_interval}\" — use ESTE intervalo em TODAS as ferramentas"
     )
-    print(f"[DEBUG] Context: {context}")
     node_config = NODE_CONFIG["market_data"]
     content, cot, tool_msgs, steps = await _run_agent_loop(
         state, _get_llm_for_node("market_data"), _MARKET_DATA_SYSTEM, context,
-        force_interval=analysis_interval, node_name="MarketData", enable_cot=node_config["cot"]
+        force_interval=analysis_interval,
+        node_name=f"MarketData[{symbol}]",
+        enable_cot=node_config["cot"],
     )
-    print(f"[DEBUG] Market data - steps: {len(steps)}, tool_msgs: {len(tool_msgs)}")
-    print(f"[DEBUG] Market data content preview: {content[:200] if content else 'None'}")
 
-    print(f"[DEBUG] Parsing tool results...")
-    # Parse valores dos tool results usando Pydantic schemas (STRICT - no regex fallback)
-    live_price = state.live_price
-    volume_24h = state.volume_24h
-    price_change_pct = state.price_change_pct
-    recent_high = state.recent_high
-    recent_low = state.recent_low
+    asset = state.get_asset(symbol)
+    live_price = asset.live_price
+    volume_24h = asset.volume_24h
+    price_change_pct = asset.price_change_pct
+    recent_high = asset.recent_high
+    recent_low = asset.recent_low
 
     for tool_name, result in steps:
-        print(f"[DEBUG] Processing tool: {tool_name}, result preview: {result[:100] if result else 'None'}")
         try:
             if "error" in result:
                 continue
@@ -1430,87 +1785,116 @@ async def market_data_node(state: QuantAgentState) -> dict:
                 recent_high = parsed.high
                 recent_low = parsed.low
         except (json.JSONDecodeError, KeyError, TypeError, Exception):
-            # Strict parsing: ignore invalid data (institutional rule)
             continue
 
-    # Try to parse structured output from LLM
-    anomalies = state.anomalies_detected[:]
+    anomalies = list(asset.anomalies_detected)
     try:
-        # content is now a string representation of the structured output
-        # We need to extract the JSON from it
-        import re
-        json_match = re.search(r'\{.*\}', content, re.DOTALL)
+        import re as _re
+        json_match = _re.search(r'\{.*\}', content, _re.DOTALL)
         if json_match:
             structured_data = json.loads(json_match.group())
             anomalies.extend(structured_data.get("anomalies", []))
     except Exception:
-        # If structured parsing fails, continue without anomalies
         pass
 
-    # Data consistency check: detect conflicting values from cache vs fresh calculation
-    # This prevents the RSI inconsistency issue (22.49 vs 48.91)
-    data_anomalies = []
-    if state.rsi_14 is not None:
-        # Check if RSI is in valid range
-        if state.rsi_14 < 0 or state.rsi_14 > 100:
-            data_anomalies.append(f"RSI value {state.rsi_14} out of valid range [0, 100]")
-            live_price = None  # Force recalculation on next run
-            price_change_pct = None
+    # Data consistency check: validate previously-stored RSI per-asset (defensive).
+    if asset.rsi_14 is not None and (asset.rsi_14 < 0 or asset.rsi_14 > 100):
+        anomalies.append(f"RSI value {asset.rsi_14} out of valid range [0, 100]")
+        live_price = None
+        price_change_pct = None
 
-    if data_anomalies:
-        anomalies.extend(data_anomalies)
-        print(f"[DEBUG] Data consistency anomalies detected: {data_anomalies}")
+    print(
+        f"[DEBUG] [{symbol}] MarketData done - live_price: {live_price}, "
+        f"volume_24h: {volume_24h}, price_change_pct: {price_change_pct}"
+    )
+    return {
+        "symbol": symbol,
+        "patch": dict(
+            live_price=live_price,
+            volume_24h=volume_24h,
+            price_change_pct=price_change_pct,
+            recent_high=recent_high,
+            recent_low=recent_low,
+            anomalies_detected=anomalies,
+        ),
+        "steps": steps,
+        "cot": cot,
+        "content": content,
+    }
 
-    print(f"[DEBUG] Market data output - live_price: {live_price}, volume_24h: {volume_24h}, price_change_pct: {price_change_pct}")
+
+@timed_async("Node: MarketData")
+async def market_data_node(state: QuantAgentState) -> dict:
+    print(f"[DEBUG] ===== MARKET DATA NODE START =====")
+    symbols = _resolve_symbols(state)
+    print(f"[DEBUG] Input symbols: {symbols}, timeframe: {state.timeframe}")
+
+    if not symbols:
+        # Nothing to do — let the pipeline continue, downstream nodes will short-circuit.
+        return {
+            **state.model_dump(),
+            "next_action": NextAction.FEATURES_MACRO,
+            "intermediate_steps_agent": [],
+            "cot": "",
+        }
+
+    # Run market_data agent loop in parallel for every symbol.
+    results = await asyncio.gather(
+        *[_run_market_data_for_symbol(state, s) for s in symbols]
+    )
+
+    new_assets = dict(state.assets)
+    all_steps: list = []
+    primary_cot = ""
+    primary_content = ""
+    for r in results:
+        sym = r["symbol"]
+        current = new_assets.get(sym) or AssetState(symbol=sym)
+        new_assets[sym] = current.model_copy(update=r["patch"])
+        all_steps.extend(_tag_steps(r["steps"], sym))
+        if sym == state.symbol:
+            primary_cot = r["cot"]
+            primary_content = r["content"]
+
     print(f"[DEBUG] ===== MARKET DATA NODE END =====")
     return {
         **state.model_dump(),
-        "messages":          state.messages + [AIMessage(content=content)],
-        "next_action":       NextAction.FEATURES_MACRO,  # Route to multi-timeframe structure
-        "intermediate_steps_global": state.intermediate_steps_global + steps,
-        "intermediate_steps_agent": steps,
-        "anomalies_detected": anomalies,
-        "live_price":        live_price,
-        "volume_24h":        volume_24h,
-        "price_change_pct":  price_change_pct,
-        "recent_high":       recent_high,
-        "recent_low":        recent_low,
-        "cot":               cot,
-        "reasoning_trail":   _append_reasoning(state.reasoning_trail, "market_data", cot),
+        "messages":          state.messages + [AIMessage(content=primary_content)],
+        "next_action":       NextAction.FEATURES_MACRO,
+        "intermediate_steps_global": state.intermediate_steps_global + all_steps,
+        "intermediate_steps_agent": all_steps,
+        "assets":            new_assets,
+        "cot":               primary_cot,
+        "reasoning_trail":   _append_reasoning(state.reasoning_trail, "market_data", primary_cot),
     }
 
-@timed_async("Node: FeatureEngineering-Macro")
-async def features_macro_node(state: QuantAgentState) -> dict:
-    """
-    Multi-timeframe: Macro layer (1D) - regime detection.
-    Defines market regime and directional bias.
-    """
-    print(f"[DEBUG] ===== FEATURES MACRO NODE START (1D) =====")
-    print(f"[DEBUG] Input symbol: {state.symbol}")
-    
-    # Use daily interval for regime detection
+async def _run_features_macro_for_symbol(
+    state: QuantAgentState, symbol: str
+) -> dict:
+    """Macro features (1D) — regime detection — for a single symbol."""
     macro_interval = _get_multi_tf_interval(TimeframeLayer.MACRO)
     context = (
-        f"Symbol: {state.symbol} | "
+        f"Symbol: {symbol} | "
         f"INTERVALO OBRIGATÓRIO: interval=\"{macro_interval}\" — Daily timeframe for regime detection"
     )
-    print(f"[DEBUG] Context: {context}")
-    
     node_config = NODE_CONFIG["feature_engineering"]
     content, cot, tool_msgs, steps = await _run_agent_loop(
         state, _get_llm_for_node("feature_engineering"), _FEATURE_SYSTEM, context,
-        force_interval=macro_interval, node_name="FeatureEngineering-Macro", enable_cot=node_config["cot"]
+        force_interval=macro_interval,
+        node_name=f"FeatureEngineering-Macro[{symbol}]",
+        enable_cot=node_config["cot"],
     )
-    
-    # Parse macro features
-    macro_rsi_14 = state.macro_rsi_14
-    macro_macd_line = state.macro_macd_line
-    macro_macd_signal = state.macro_macd_signal
-    macro_bb_upper = state.macro_bb_upper
-    macro_bb_lower = state.macro_bb_lower
-    macro_bb_pct_b = state.macro_bb_pct_b
-    macro_regime = state.macro_regime
-    
+
+    asset = state.get_asset(symbol)
+    macro_rsi_14 = asset.macro_rsi_14
+    macro_macd_line = asset.macro_macd_line
+    macro_macd_signal = asset.macro_macd_signal
+    macro_bb_upper = asset.macro_bb_upper
+    macro_bb_lower = asset.macro_bb_lower
+    macro_bb_pct_b = asset.macro_bb_pct_b
+    macro_regime = asset.macro_regime
+    live_price = asset.live_price  # populated by market_data upstream
+
     for tool_name, result in steps:
         try:
             if "error" in result:
@@ -1527,16 +1911,14 @@ async def features_macro_node(state: QuantAgentState) -> dict:
                 parsed = BollingerBandsOutput.model_validate_json(result)
                 macro_bb_upper = parsed.upper
                 macro_bb_lower = parsed.lower
-                # Calculate %B
-                if parsed.upper and parsed.lower and state.live_price:
+                if parsed.upper and parsed.lower and live_price:
                     bandwidth = parsed.upper - parsed.lower
                     if abs(bandwidth) > 1e-8:
-                        macro_bb_pct_b = (state.live_price - parsed.lower) / bandwidth
+                        macro_bb_pct_b = (live_price - parsed.lower) / bandwidth
                         macro_bb_pct_b = max(0.0, min(1.0, macro_bb_pct_b))
         except Exception:
             continue
-    
-    # Calculate macro bias based on regime
+
     if macro_regime == "overbought":
         macro_bias = "bullish_stretched"
     elif macro_regime == "oversold":
@@ -1545,60 +1927,100 @@ async def features_macro_node(state: QuantAgentState) -> dict:
         macro_bias = "neutral"
     else:
         macro_bias = None
-    
-    print(f"[DEBUG] Macro features - rsi: {macro_rsi_14}, macd: {macro_macd_line}, regime: {macro_regime}, bias: {macro_bias}")
-    print(f"[DEBUG] ===== FEATURES MACRO NODE END =====")
-    
+
+    print(
+        f"[DEBUG] [{symbol}] Macro features - rsi: {macro_rsi_14}, "
+        f"macd: {macro_macd_line}, regime: {macro_regime}, bias: {macro_bias}"
+    )
     return {
-        **state.model_dump(),
-        "messages": state.messages + [AIMessage(content=content)],
-        "next_action": NextAction.FEATURES_SETUP,
-        "intermediate_steps_global": state.intermediate_steps_global + steps,
-        "intermediate_steps_agent": steps,
-        "macro_rsi_14": macro_rsi_14,
-        "macro_macd_line": macro_macd_line,
-        "macro_macd_signal": macro_macd_signal,
-        "macro_bb_upper": macro_bb_upper,
-        "macro_bb_lower": macro_bb_lower,
-        "macro_bb_pct_b": macro_bb_pct_b,
-        "macro_regime": macro_regime,
-        "macro_bias": macro_bias,
+        "symbol": symbol,
+        "patch": dict(
+            macro_rsi_14=macro_rsi_14,
+            macro_macd_line=macro_macd_line,
+            macro_macd_signal=macro_macd_signal,
+            macro_bb_upper=macro_bb_upper,
+            macro_bb_lower=macro_bb_lower,
+            macro_bb_pct_b=macro_bb_pct_b,
+            macro_regime=macro_regime,
+            macro_bias=macro_bias,
+        ),
+        "steps": steps,
         "cot": cot,
-        "reasoning_trail": _append_reasoning(state.reasoning_trail, "features_macro", cot),
+        "content": content,
     }
 
 
-@timed_async("Node: FeatureEngineering-Setup")
-async def features_setup_node(state: QuantAgentState) -> dict:
-    """
-    Multi-timeframe: Setup layer (4H) - signal generation.
-    Identifies concrete trading opportunities.
-    """
-    print(f"[DEBUG] ===== FEATURES SETUP NODE START (4H) =====")
-    print(f"[DEBUG] Input symbol: {state.symbol}")
-    
-    # Use 4H interval for signal generation
+@timed_async("Node: FeatureEngineering-Macro")
+async def features_macro_node(state: QuantAgentState) -> dict:
+    """Macro layer (1D) — fan-out per symbol."""
+    print(f"[DEBUG] ===== FEATURES MACRO NODE START (1D) =====")
+    symbols = _resolve_symbols(state)
+    print(f"[DEBUG] Input symbols: {symbols}")
+
+    if not symbols:
+        return {
+            **state.model_dump(),
+            "next_action": NextAction.FEATURES_SETUP,
+            "intermediate_steps_agent": [],
+            "cot": "",
+        }
+
+    results = await asyncio.gather(
+        *[_run_features_macro_for_symbol(state, s) for s in symbols]
+    )
+
+    new_assets = dict(state.assets)
+    all_steps: list = []
+    primary_cot = ""
+    primary_content = ""
+    for r in results:
+        sym = r["symbol"]
+        current = new_assets.get(sym) or AssetState(symbol=sym)
+        new_assets[sym] = current.model_copy(update=r["patch"])
+        all_steps.extend(_tag_steps(r["steps"], sym))
+        if sym == state.symbol:
+            primary_cot = r["cot"]
+            primary_content = r["content"]
+
+    print(f"[DEBUG] ===== FEATURES MACRO NODE END =====")
+    return {
+        **state.model_dump(),
+        "messages": state.messages + [AIMessage(content=primary_content)],
+        "next_action": NextAction.FEATURES_SETUP,
+        "intermediate_steps_global": state.intermediate_steps_global + all_steps,
+        "intermediate_steps_agent": all_steps,
+        "assets": new_assets,
+        "cot": primary_cot,
+        "reasoning_trail": _append_reasoning(state.reasoning_trail, "features_macro", primary_cot),
+    }
+
+
+async def _run_features_setup_for_symbol(
+    state: QuantAgentState, symbol: str
+) -> dict:
+    """Setup features (4H) — signal generation — for a single symbol."""
     setup_interval = _get_multi_tf_interval(TimeframeLayer.SETUP)
     context = (
-        f"Symbol: {state.symbol} | "
+        f"Symbol: {symbol} | "
         f"INTERVALO OBRIGATÓRIO: interval=\"{setup_interval}\" — 4H timeframe for signal generation"
     )
-    print(f"[DEBUG] Context: {context}")
-    
     node_config = NODE_CONFIG["feature_engineering"]
     content, cot, tool_msgs, steps = await _run_agent_loop(
         state, _get_llm_for_node("feature_engineering"), _FEATURE_SYSTEM, context,
-        force_interval=setup_interval, node_name="FeatureEngineering-Setup", enable_cot=node_config["cot"]
+        force_interval=setup_interval,
+        node_name=f"FeatureEngineering-Setup[{symbol}]",
+        enable_cot=node_config["cot"],
     )
-    
-    # Parse setup features
-    setup_rsi_14 = state.setup_rsi_14
-    setup_macd_line = state.setup_macd_line
-    setup_macd_signal = state.setup_macd_signal
-    setup_bb_upper = state.setup_bb_upper
-    setup_bb_lower = state.setup_bb_lower
-    setup_bb_pct_b = state.setup_bb_pct_b
-    
+
+    asset = state.get_asset(symbol)
+    setup_rsi_14 = asset.setup_rsi_14
+    setup_macd_line = asset.setup_macd_line
+    setup_macd_signal = asset.setup_macd_signal
+    setup_bb_upper = asset.setup_bb_upper
+    setup_bb_lower = asset.setup_bb_lower
+    setup_bb_pct_b = asset.setup_bb_pct_b
+    live_price = asset.live_price
+
     for tool_name, result in steps:
         try:
             if "error" in result:
@@ -1614,63 +2036,98 @@ async def features_setup_node(state: QuantAgentState) -> dict:
                 parsed = BollingerBandsOutput.model_validate_json(result)
                 setup_bb_upper = parsed.upper
                 setup_bb_lower = parsed.lower
-                # Calculate %B
-                if parsed.upper and parsed.lower and state.live_price:
+                if parsed.upper and parsed.lower and live_price:
                     bandwidth = parsed.upper - parsed.lower
                     if abs(bandwidth) > 1e-8:
-                        setup_bb_pct_b = (state.live_price - parsed.lower) / bandwidth
+                        setup_bb_pct_b = (live_price - parsed.lower) / bandwidth
                         setup_bb_pct_b = max(0.0, min(1.0, setup_bb_pct_b))
         except Exception:
             continue
-    
-    print(f"[DEBUG] Setup features - rsi: {setup_rsi_14}, macd: {setup_macd_line}")
-    print(f"[DEBUG] ===== FEATURES SETUP NODE END =====")
-    
+
+    print(f"[DEBUG] [{symbol}] Setup features - rsi: {setup_rsi_14}, macd: {setup_macd_line}")
     return {
-        **state.model_dump(),
-        "messages": state.messages + [AIMessage(content=content)],
-        "next_action": NextAction.FEATURES_EXEC,
-        "intermediate_steps_global": state.intermediate_steps_global + steps,
-        "intermediate_steps_agent": steps,
-        "setup_rsi_14": setup_rsi_14,
-        "setup_macd_line": setup_macd_line,
-        "setup_macd_signal": setup_macd_signal,
-        "setup_bb_upper": setup_bb_upper,
-        "setup_bb_lower": setup_bb_lower,
-        "setup_bb_pct_b": setup_bb_pct_b,
+        "symbol": symbol,
+        "patch": dict(
+            setup_rsi_14=setup_rsi_14,
+            setup_macd_line=setup_macd_line,
+            setup_macd_signal=setup_macd_signal,
+            setup_bb_upper=setup_bb_upper,
+            setup_bb_lower=setup_bb_lower,
+            setup_bb_pct_b=setup_bb_pct_b,
+        ),
+        "steps": steps,
         "cot": cot,
-        "reasoning_trail": _append_reasoning(state.reasoning_trail, "features_setup", cot),
+        "content": content,
     }
 
 
-@timed_async("Node: FeatureEngineering-Exec")
-async def features_exec_node(state: QuantAgentState) -> dict:
-    """
-    Multi-timeframe: Execution layer (1H) - timing + risk.
-    Provides execution timing and risk metrics.
-    """
-    print(f"[DEBUG] ===== FEATURES EXEC NODE START (1H) =====")
-    print(f"[DEBUG] Input symbol: {state.symbol}")
-    
-    # Use 1H interval for execution timing
+@timed_async("Node: FeatureEngineering-Setup")
+async def features_setup_node(state: QuantAgentState) -> dict:
+    """Setup layer (4H) — fan-out per symbol."""
+    print(f"[DEBUG] ===== FEATURES SETUP NODE START (4H) =====")
+    symbols = _resolve_symbols(state)
+    print(f"[DEBUG] Input symbols: {symbols}")
+
+    if not symbols:
+        return {
+            **state.model_dump(),
+            "next_action": NextAction.FEATURES_EXEC,
+            "intermediate_steps_agent": [],
+            "cot": "",
+        }
+
+    results = await asyncio.gather(
+        *[_run_features_setup_for_symbol(state, s) for s in symbols]
+    )
+
+    new_assets = dict(state.assets)
+    all_steps: list = []
+    primary_cot = ""
+    primary_content = ""
+    for r in results:
+        sym = r["symbol"]
+        current = new_assets.get(sym) or AssetState(symbol=sym)
+        new_assets[sym] = current.model_copy(update=r["patch"])
+        all_steps.extend(_tag_steps(r["steps"], sym))
+        if sym == state.symbol:
+            primary_cot = r["cot"]
+            primary_content = r["content"]
+
+    print(f"[DEBUG] ===== FEATURES SETUP NODE END =====")
+    return {
+        **state.model_dump(),
+        "messages": state.messages + [AIMessage(content=primary_content)],
+        "next_action": NextAction.FEATURES_EXEC,
+        "intermediate_steps_global": state.intermediate_steps_global + all_steps,
+        "intermediate_steps_agent": all_steps,
+        "assets": new_assets,
+        "cot": primary_cot,
+        "reasoning_trail": _append_reasoning(state.reasoning_trail, "features_setup", primary_cot),
+    }
+
+
+async def _run_features_exec_for_symbol(
+    state: QuantAgentState, symbol: str
+) -> dict:
+    """Exec features (1H) — execution timing — for a single symbol."""
     exec_interval = _get_multi_tf_interval(TimeframeLayer.EXECUTION)
     context = (
-        f"Symbol: {state.symbol} | "
+        f"Symbol: {symbol} | "
         f"INTERVALO OBRIGATÓRIO: interval=\"{exec_interval}\" — 1H timeframe for execution timing"
     )
-    print(f"[DEBUG] Context: {context}")
-    
     node_config = NODE_CONFIG["feature_engineering"]
     content, cot, tool_msgs, steps = await _run_agent_loop(
         state, _get_llm_for_node("feature_engineering"), _FEATURE_SYSTEM, context,
-        force_interval=exec_interval, node_name="FeatureEngineering-Exec", enable_cot=node_config["cot"]
+        force_interval=exec_interval,
+        node_name=f"FeatureEngineering-Exec[{symbol}]",
+        enable_cot=node_config["cot"],
     )
-    
-    # Parse execution features
-    exec_rsi_14 = state.exec_rsi_14
-    exec_macd_line = state.exec_macd_line
-    exec_macd_signal = state.exec_macd_signal
-    
+
+    asset = state.get_asset(symbol)
+    exec_rsi_14 = asset.exec_rsi_14
+    exec_macd_line = asset.exec_macd_line
+    exec_macd_signal = asset.exec_macd_signal
+
     for tool_name, result in steps:
         try:
             if "error" in result:
@@ -1684,21 +2141,63 @@ async def features_exec_node(state: QuantAgentState) -> dict:
                 exec_macd_signal = parsed.signal
         except Exception:
             continue
-    
-    print(f"[DEBUG] Exec features - rsi: {exec_rsi_14}")
+
+    print(f"[DEBUG] [{symbol}] Exec features - rsi: {exec_rsi_14}")
+    return {
+        "symbol": symbol,
+        "patch": dict(
+            exec_rsi_14=exec_rsi_14,
+            exec_macd_line=exec_macd_line,
+            exec_macd_signal=exec_macd_signal,
+        ),
+        "steps": steps,
+        "cot": cot,
+        "content": content,
+    }
+
+
+@timed_async("Node: FeatureEngineering-Exec")
+async def features_exec_node(state: QuantAgentState) -> dict:
+    """Execution layer (1H) — fan-out per symbol."""
+    print(f"[DEBUG] ===== FEATURES EXEC NODE START (1H) =====")
+    symbols = _resolve_symbols(state)
+    print(f"[DEBUG] Input symbols: {symbols}")
+
+    if not symbols:
+        return {
+            **state.model_dump(),
+            "next_action": NextAction.FORECAST,
+            "intermediate_steps_agent": [],
+            "cot": "",
+        }
+
+    results = await asyncio.gather(
+        *[_run_features_exec_for_symbol(state, s) for s in symbols]
+    )
+
+    new_assets = dict(state.assets)
+    all_steps: list = []
+    primary_cot = ""
+    primary_content = ""
+    for r in results:
+        sym = r["symbol"]
+        current = new_assets.get(sym) or AssetState(symbol=sym)
+        new_assets[sym] = current.model_copy(update=r["patch"])
+        all_steps.extend(_tag_steps(r["steps"], sym))
+        if sym == state.symbol:
+            primary_cot = r["cot"]
+            primary_content = r["content"]
+
     print(f"[DEBUG] ===== FEATURES EXEC NODE END =====")
-    
     return {
         **state.model_dump(),
-        "messages": state.messages + [AIMessage(content=content)],
-        "next_action": NextAction.FORECAST,  # Route to forecast before interpretation
-        "intermediate_steps_global": state.intermediate_steps_global + steps,
-        "intermediate_steps_agent": steps,
-        "exec_rsi_14": exec_rsi_14,
-        "exec_macd_line": exec_macd_line,
-        "exec_macd_signal": exec_macd_signal,
-        "cot": cot,
-        "reasoning_trail": _append_reasoning(state.reasoning_trail, "features_exec", cot),
+        "messages": state.messages + [AIMessage(content=primary_content)],
+        "next_action": NextAction.FORECAST,
+        "intermediate_steps_global": state.intermediate_steps_global + all_steps,
+        "intermediate_steps_agent": all_steps,
+        "assets": new_assets,
+        "cot": primary_cot,
+        "reasoning_trail": _append_reasoning(state.reasoning_trail, "features_exec", primary_cot),
     }
 
 
@@ -1727,43 +2226,48 @@ async def _run_apollo_backtest_with_polling(symbol: str) -> tuple[ApolloBacktest
             await asyncio.sleep(settings.apollo_poll_interval_seconds)
 
 
-@timed_async("Node: Forecast")
-async def forecast_node(state: QuantAgentState) -> dict:
-    """Apollo forecast node with safe training/backtest fallback."""
+async def _run_forecast_for_symbol(
+    state: QuantAgentState, symbol: str
+) -> dict:
+    """Apollo forecast for a single symbol with safe training/backtest fallback.
+
+    Returns a dict with keys: ``symbol``, ``patch`` (AssetState fields),
+    ``audit_step`` (label, message) for the global trail, ``message``
+    (AIMessage content for the primary symbol).
+    """
     import logging
     logger = logging.getLogger(__name__)
 
-    print(f"[FORECAST] Iniciando para {state.symbol}", flush=True)
+    print(f"[FORECAST] [{symbol}] Iniciando", flush=True)
     settings = get_settings()
     client = get_apollo_client()
     window = build_prediction_window(
         lookback_days=settings.apollo_prediction_lookback_days,
     )
 
-    # Guard: símbolo vazio/inválido — aborta antes de chamar Apollo (que falharia com 400)
-    raw_symbol = (state.symbol or "").strip().upper()
+    asset = state.get_asset(symbol)
+    raw_symbol = (symbol or "").strip().upper()
     if not raw_symbol:
         warning = "forecast pulado: símbolo não identificado"
         print(f"[FORECAST] ⚠️  {warning}", flush=True)
         logger.warning(f"[FORECAST] {warning}")
         return {
-            **state.model_dump(),
-            "messages": state.messages + [AIMessage(content="Apollo forecast indisponível: símbolo não identificado.")],
-            "next_action": NextAction.TREND_INTERPRET,
-            "intermediate_steps_global": state.intermediate_steps_global + [("apollo_predict", warning)],
-            "forecast_period_start": window.start_date,
-            "forecast_period_end": window.end_date,
-            "forecast_status": "unavailable",
-            "forecast_warnings": list(state.forecast_warnings) + [warning],
-            "forecast_actionable": False,
-            "cot": "",
+            "symbol": symbol,
+            "patch": dict(
+                forecast_period_start=window.start_date,
+                forecast_period_end=window.end_date,
+                forecast_status="unavailable",
+                forecast_warnings=list(asset.forecast_warnings) + [warning],
+                forecast_actionable=False,
+            ),
+            "audit_step": ("apollo_predict", warning),
+            "message": "Apollo forecast indisponível: símbolo não identificado.",
         }
 
-    # Normaliza símbolo para o formato que Apollo espera (ex: BTC -> BTCUSDT)
     apollo_symbol = raw_symbol if raw_symbol.endswith("USDT") else f"{raw_symbol}USDT"
-    print(f"[FORECAST] Apollo predict: symbol={apollo_symbol} | start={window.start_date} | end={window.end_date}", flush=True)
+    print(f"[FORECAST] [{symbol}] Apollo predict: symbol={apollo_symbol} | start={window.start_date} | end={window.end_date}", flush=True)
 
-    warnings = list(state.forecast_warnings)
+    warnings = list(asset.forecast_warnings)
     training_attempts = 0
     backtest_error_pct: float | None = None
     prediction: ApolloPredictionOutput | None = None
@@ -1771,37 +2275,34 @@ async def forecast_node(state: QuantAgentState) -> dict:
     action_step = "apollo_predict"
 
     try:
-        logger.info(f"[FORECAST] Chamando Apollo predict para {apollo_symbol}")
+        logger.info(f"[FORECAST] [{symbol}] Chamando Apollo predict para {apollo_symbol}")
         prediction = await client.predict(
             symbol=apollo_symbol,
             start_date=window.start_date,
             end_date=window.end_date,
         )
-        logger.info(f"[FORECAST] ✅ Predict retornou: {prediction.direction} com {prediction.confidence:.1%} confiança")
+        logger.info(f"[FORECAST] [{symbol}] ✅ Predict retornou: {prediction.direction} com {prediction.confidence:.1%} confiança")
     except ApolloApiError as exc:
-        logger.error(f"[FORECAST] ❌ Erro Apollo: {str(exc)} (status: {exc.status_code}, missing_model: {exc.missing_model})")
+        logger.error(f"[FORECAST] [{symbol}] ❌ Erro Apollo: {str(exc)} (status: {exc.status_code}, missing_model: {exc.missing_model})")
         if not exc.missing_model:
             warnings.append(f"forecast indisponível: {exc}")
             status = "unavailable"
-            logger.error(f"[FORECAST] Forecast indisponível, status: {status}")
         else:
             status = "training_required"
             action_step = "apollo_train"
-            logger.warning(f"[FORECAST] Modelo não encontrado, iniciando treinamento...")
+            logger.warning(f"[FORECAST] [{symbol}] Modelo não encontrado, iniciando treinamento...")
             for attempt in range(1, settings.apollo_train_max_attempts + 1):
                 try:
                     training_attempts = attempt
-                    logger.info(f"[FORECAST] Tentativa de treinamento {attempt}/{settings.apollo_train_max_attempts}")
+                    logger.info(f"[FORECAST] [{symbol}] Tentativa de treinamento {attempt}/{settings.apollo_train_max_attempts}")
                     train_result = await client.train(
                         symbol=apollo_symbol,
                         lookback_days=settings.apollo_train_lookback_days,
                     )
-                    logger.info(f"[FORECAST] ✅ Treinamento iniciado: {train_result.status}")
                     warnings.append(
                         f"treino Apollo iniciado (tentativa {attempt}/{settings.apollo_train_max_attempts}): {train_result.status}"
                     )
                     backtest_result, polls = await _run_apollo_backtest_with_polling(apollo_symbol)
-                    logger.info(f"[FORECAST] ✅ Backtest concluído após {polls} polls | períodos: {backtest_result.periods_tested}")
                     if len(backtest_result.results) < settings.apollo_backtest_periods:
                         warnings.append("backtest Apollo retornou menos períodos que o esperado")
                         continue
@@ -1835,21 +2336,21 @@ async def forecast_node(state: QuantAgentState) -> dict:
 
     if prediction is None:
         return {
-            **state.model_dump(),
-            "messages": state.messages + [AIMessage(content="Apollo forecast indisponível ou não confiável.")],
-            "next_action": NextAction.TREND_INTERPRET,
-            "intermediate_steps_global": state.intermediate_steps_global + [(
+            "symbol": symbol,
+            "patch": dict(
+                forecast_period_start=window.start_date,
+                forecast_period_end=window.end_date,
+                forecast_training_attempts=training_attempts,
+                forecast_backtest_error_pct=backtest_error_pct,
+                forecast_status=status,
+                forecast_warnings=warnings,
+                forecast_actionable=False,
+            ),
+            "audit_step": (
                 action_step,
                 status if not warnings else " | ".join(warnings[-3:]),
-            )],
-            "forecast_period_start": window.start_date,
-            "forecast_period_end": window.end_date,
-            "forecast_training_attempts": training_attempts,
-            "forecast_backtest_error_pct": backtest_error_pct,
-            "forecast_status": status,
-            "forecast_warnings": warnings,
-            "forecast_actionable": False,
-            "cot": "",
+            ),
+            "message": "Apollo forecast indisponível ou não confiável.",
         }
 
     forecast_return_pct = calculate_return_pct(
@@ -1878,32 +2379,94 @@ async def forecast_node(state: QuantAgentState) -> dict:
         f"ret={(forecast_return_pct if forecast_return_pct is not None else 0.0):.2f}% | "
         f"mape={model_mape if model_mape is not None else -1:.2f}"
     )
+    logger.info(
+        f"[FORECAST] [{symbol}] ✅ status: {status} | actionable: {quality.actionable} | warnings: {len(warnings)}"
+    )
 
     return {
-        **state.model_dump(),
-        "messages": state.messages + [AIMessage(content=summary)],
-        "next_action": NextAction.TREND_INTERPRET,
-        "intermediate_steps_global": state.intermediate_steps_global + [(action_step, summary)],
-        "forecast_period_start": prediction.period_start,
-        "forecast_period_end": prediction.period_end,
-        "forecast_data_points": prediction.data_points,
-        "forecast_current_price": prediction.current_price,
-        "forecast_predicted_price": prediction.predicted_price,
-        "forecast_direction": prediction.direction,
-        "forecast_confidence": prediction.confidence,
-        "forecast_model_mape": model_mape,
-        "forecast_period_volatility": prediction.confidence_explanation.period_volatility,
-        "forecast_data_quality": data_quality,
-        "forecast_return_pct": forecast_return_pct,
-        "forecast_backtest_error_pct": backtest_error_pct,
-        "forecast_training_attempts": training_attempts,
-        "forecast_status": status,
-        "forecast_actionable": quality.actionable,
-        "forecast_warnings": warnings,
-        "cot": "",
+        "symbol": symbol,
+        "patch": dict(
+            forecast_period_start=prediction.period_start,
+            forecast_period_end=prediction.period_end,
+            forecast_data_points=prediction.data_points,
+            forecast_current_price=prediction.current_price,
+            forecast_predicted_price=prediction.predicted_price,
+            forecast_direction=prediction.direction,
+            forecast_confidence=prediction.confidence,
+            forecast_model_mape=model_mape,
+            forecast_period_volatility=prediction.confidence_explanation.period_volatility,
+            forecast_data_quality=data_quality,
+            forecast_return_pct=forecast_return_pct,
+            forecast_backtest_error_pct=backtest_error_pct,
+            forecast_training_attempts=training_attempts,
+            forecast_status=status,
+            forecast_actionable=quality.actionable,
+            forecast_warnings=warnings,
+        ),
+        "audit_step": (action_step, summary),
+        "message": summary,
     }
 
-    logger.info(f"[FORECAST] ✅ Nó concluído | status: {status} | acionável: {quality.actionable} | avisos: {len(warnings)}")
+
+@timed_async("Node: Forecast")
+async def forecast_node(state: QuantAgentState) -> dict:
+    """Apollo forecast — fan-out per symbol.
+
+    Per user choice (option 2 in the plan), the forecast is run for ALL
+    symbols (primary + comparatives), in parallel via asyncio.gather. Cost
+    and latency scale linearly with the number of symbols.
+    """
+    print(f"[FORECAST] ===== FORECAST NODE START =====")
+    symbols = _resolve_symbols(state)
+    print(f"[FORECAST] Symbols: {symbols}")
+
+    if not symbols:
+        return {
+            **state.model_dump(),
+            "next_action": NextAction.TREND_INTERPRET,
+            "intermediate_steps_agent": [],
+            "cot": "",
+        }
+
+    results = await asyncio.gather(
+        *[_run_forecast_for_symbol(state, s) for s in symbols],
+        return_exceptions=True,
+    )
+
+    new_assets = dict(state.assets)
+    audit_steps: list = []
+    primary_message = ""
+    for s, r in zip(symbols, results):
+        if isinstance(r, Exception):
+            # Defensive: never let a forecast error crash the whole pipeline.
+            err_msg = f"forecast crashed: {type(r).__name__}: {r}"
+            print(f"[FORECAST] [{s}] ⚠️  {err_msg}")
+            current = new_assets.get(s) or AssetState(symbol=s)
+            new_assets[s] = current.model_copy(update=dict(
+                forecast_status="error",
+                forecast_warnings=list(current.forecast_warnings) + [err_msg],
+                forecast_actionable=False,
+            ))
+            audit_steps.append((f"apollo_predict@{s}", err_msg))
+            continue
+
+        sym = r["symbol"]
+        current = new_assets.get(sym) or AssetState(symbol=sym)
+        new_assets[sym] = current.model_copy(update=r["patch"])
+        label, msg = r["audit_step"]
+        audit_steps.append((f"{label}@{sym}", msg))
+        if sym == state.symbol:
+            primary_message = r["message"]
+
+    print(f"[FORECAST] ===== FORECAST NODE END =====")
+    return {
+        **state.model_dump(),
+        "messages": state.messages + [AIMessage(content=primary_message)],
+        "next_action": NextAction.TREND_INTERPRET,
+        "intermediate_steps_global": state.intermediate_steps_global + audit_steps,
+        "assets": new_assets,
+        "cot": "",
+    }
 
 
 @timed_async("Node: TrendInterpretation")
@@ -1949,17 +2512,22 @@ async def trend_interpret_node(state: QuantAgentState) -> dict:
     print(f"[DEBUG] Trend interpretation - reasoning: {interpretation['reasoning']}")
     print(f"[DEBUG] ===== TREND INTERPRETATION NODE END =====")
     
+    new_assets = _patch_asset(
+        state.assets, state.symbol,
+        trend_state=interpretation['trend_state'],
+        trend_direction=interpretation['signal_direction'],
+        signal_type=interpretation['signal_type'],
+        execution_timing=interpretation['execution_timing'],
+        signal_direction=interpretation['signal_direction'],  # Legacy field for compatibility
+        signal_confidence=interpretation['confidence'],  # Legacy field for compatibility
+    )
+
     return {
         **state.model_dump(),
         "messages": state.messages + [AIMessage(content=interpretation['reasoning'])],
         "next_action": NextAction.SIGNAL,  # Route to signal_agent (then moe → decision_engine)
         "intermediate_steps_global": state.intermediate_steps_global + [("trend_interpret", interpretation['reasoning'])],
-        "trend_state": interpretation['trend_state'],
-        "trend_direction": interpretation['signal_direction'],
-        "signal_type": interpretation['signal_type'],
-        "execution_timing": interpretation['execution_timing'],
-        "signal_direction": interpretation['signal_direction'],  # Legacy field for compatibility
-        "signal_confidence": interpretation['confidence'],  # Legacy field for compatibility
+        "assets": new_assets,
         "cot": interpretation['reasoning'],
     }
 
@@ -2042,18 +2610,23 @@ async def decision_engine_node(state: QuantAgentState) -> dict:
     print(f"[DEBUG] Decision Engine - execution_timing: {decision.execution_timing}")
     print(f"[DEBUG] ===== DECISION ENGINE NODE END =====")
     
+    new_assets = _patch_asset(
+        state.assets, state.symbol,
+        final_signal=decision.signal.value,
+        final_signal_type=decision.signal_type.value,
+        final_confidence=decision.confidence,
+        final_reasoning=decision.reasoning,
+        # Override legacy fields with final decision
+        signal_direction=decision.signal.value,
+        signal_confidence=decision.confidence,
+    )
+
     return {
         **state.model_dump(),
         "messages": state.messages + [AIMessage(content=decision.reasoning)],
         "next_action": NextAction.RISK,  # Route to risk after decision
         "intermediate_steps_global": state.intermediate_steps_global + [("decision_engine", decision.reasoning)],
-        "final_signal": decision.signal.value,
-        "final_signal_type": decision.signal_type.value,
-        "final_confidence": decision.confidence,
-        "final_reasoning": decision.reasoning,
-        # Override legacy fields with final decision
-        "signal_direction": decision.signal.value,
-        "signal_confidence": decision.confidence,
+        "assets": new_assets,
         "cot": decision.reasoning,
     }
 
@@ -2144,50 +2717,40 @@ CRITÉRIOS DE QUALIDADE (referência):
         "messages": state.messages + [AIMessage(content=final_answer)],
     }
 
-@timed_async("Node: RiskAgent")
-async def risk_agent_node(state: QuantAgentState) -> dict:
-    """
-    Risk agent: calculates risk metrics (CVaR, Sharpe, drawdown, volatility).
-    Uses execution layer (1H) for risk metrics - multi-timeframe consistency.
-    """
-    print(f"[DEBUG] ===== RISK AGENT NODE START =====")
-    print(f"[DEBUG] Input symbol: {state.symbol}")
-    
-    # Use 1H interval for risk metrics (execution layer)
+async def _run_risk_for_symbol(
+    state: QuantAgentState, symbol: str
+) -> dict:
+    """Risk metrics (CVaR, Sharpe, drawdown, volatility) for a single symbol.
+    Uses execution layer (1H) — multi-timeframe consistency."""
+    asset = state.get_asset(symbol)
     exec_interval = _get_multi_tf_interval(TimeframeLayer.EXECUTION)
     context = (
-        f"Symbol: {state.symbol} | Preço: {state.live_price} | "
+        f"Symbol: {symbol} | Preço: {asset.live_price} | "
         f"INTERVALO OBRIGATÓRIO: interval=\"{exec_interval}\" — 1H timeframe for risk metrics (execution layer) | "
-        f"Vol 24h: {state.volume_24h} | Variação: {state.price_change_pct}%\n"
-        f"DADOS JÁ COLETADOS: RSI={state.exec_rsi_14}\n"
+        f"Vol 24h: {asset.volume_24h} | Variação: {asset.price_change_pct}%\n"
+        f"DADOS JÁ COLETADOS: RSI={asset.exec_rsi_14}\n"
         f"SUA TAREFA: Calcular métricas de risco usando as ferramentas disponíveis."
     )
-    print(f"[DEBUG] Context: {context}")
     node_config = NODE_CONFIG["risk_agent"]
     content, cot, tool_msgs, steps = await _run_agent_loop(
         state, _get_llm_for_node("risk_agent"), _RISK_SYSTEM, context, clear_steps=True,
-        force_interval=exec_interval, node_name="RiskAgent", enable_cot=node_config["cot"]
+        force_interval=exec_interval,
+        node_name=f"RiskAgent[{symbol}]",
+        enable_cot=node_config["cot"],
     )
-    print(f"[DEBUG] Risk agent - steps: {len(steps)}, tool_msgs: {len(tool_msgs)}")
 
-    print(f"[DEBUG] Parsing risk tool results...")
-    # Parse valores dos tool results usando Pydantic schemas (STRICT - no regex fallback)
-    var_95 = state.var_95
-    cvar_95 = state.cvar_95
-    sharpe = state.sharpe
-    max_drawdown = state.max_drawdown
-    volatility_annualized = state.volatility_annualized
+    var_95 = asset.var_95
+    cvar_95 = asset.cvar_95
+    sharpe = asset.sharpe
+    max_drawdown = asset.max_drawdown
+    volatility_annualized = asset.volatility_annualized
     volatility_raw = None
     volatility_interval = None
-
-    # Track risk interval for consistency check
     risk_interval = None
 
     for tool_name, result in steps:
-        print(f"[DEBUG] Processing risk tool: {tool_name}, result preview: {result[:100] if result else 'None'}")
         try:
             if "error" in result:
-                print(f"[DEBUG] Tool returned error, skipping")
                 continue
             if tool_name == "calculate_risk":
                 parsed = RiskMetricsOutput.model_validate_json(result)
@@ -2197,64 +2760,51 @@ async def risk_agent_node(state: QuantAgentState) -> dict:
                 volatility_raw = parsed.volatility_20d if parsed.volatility_20d is not None else parsed.volatility_21
                 volatility_interval = parsed.interval
                 risk_interval = parsed.interval
-                print(f"[DEBUG] Parsed calculate_risk: cvar={cvar_95}, sharpe={sharpe}, drawdown={max_drawdown}, interval={risk_interval}")
             elif tool_name == "get_feature_cvar":
                 parsed = CVaROutput.model_validate_json(result)
                 cvar_95 = parsed.cvar_95
                 risk_interval = parsed.interval
-                print(f"[DEBUG] Parsed get_feature_cvar: cvar={cvar_95}, interval={risk_interval}")
             elif tool_name == "get_feature_sharpe":
                 parsed = SharpeOutput.model_validate_json(result)
                 sharpe = parsed.sharpe
                 risk_interval = parsed.interval
-                print(f"[DEBUG] Parsed get_feature_sharpe: sharpe={sharpe}, interval={risk_interval}")
             elif tool_name == "get_feature_max_drawdown":
                 parsed = MaxDrawdownOutput.model_validate_json(result)
                 max_drawdown = parsed.max_drawdown
                 risk_interval = parsed.interval
-                print(f"[DEBUG] Parsed get_feature_max_drawdown: drawdown={max_drawdown}, interval={risk_interval}")
             elif tool_name == "get_feature_volatility":
                 parsed = VolatilityOutput.model_validate_json(result)
                 volatility_raw = parsed.volatility_raw
                 volatility_annualized = parsed.volatility_annualized
                 volatility_interval = parsed.data_interval
                 risk_interval = parsed.data_interval
-                print(f"[DEBUG] Parsed get_feature_volatility: vol_raw={volatility_raw}, vol_ann={volatility_annualized}, interval={risk_interval}")
-        except (json.JSONDecodeError, KeyError, TypeError, Exception) as e:
-            # Strict parsing: ignore invalid data (institutional rule)
-            print(f"[DEBUG] Exception parsing {tool_name}: {type(e).__name__}: {e}")
+        except (json.JSONDecodeError, KeyError, TypeError, Exception):
             continue
 
     # Timeframe consistency check: risk metrics must match execution layer (1H)
     expected_interval = _get_multi_tf_interval(TimeframeLayer.EXECUTION)
     if risk_interval and risk_interval != expected_interval:
-        print(f"[DEBUG] WARNING: Risk interval {risk_interval} != expected {expected_interval}")
-        print(f"[DEBUG] Clearing risk metrics to force recalculation with correct interval")
+        print(f"[DEBUG] [{symbol}] WARNING: Risk interval {risk_interval} != expected {expected_interval}")
         cvar_95 = None
         sharpe = None
         max_drawdown = None
         volatility_annualized = None
 
-    print(f"[DEBUG] Risk metrics before calculation - cvar: {cvar_95}, sharpe: {sharpe}, drawdown: {max_drawdown}, vol: {volatility_annualized}")
-
-    # Store execution layer metrics separately for multi-timeframe consistency
+    # Store execution layer metrics separately
     exec_sharpe = sharpe
     exec_volatility = volatility_annualized
 
-    # ─── SANITY AUDIT — proteção contra valores implausíveis do backend ───
+    # ─── SANITY AUDIT ───
     risk_audit_anomalies: list[str] = []
 
-    # A) max_drawdown bounds: deve estar em [0, 1]
     if max_drawdown is not None:
         if max_drawdown < 0 or max_drawdown > 1:
             risk_audit_anomalies.append(
                 f"max_drawdown fora do range [0,1]: {max_drawdown:.4f} — descartado"
             )
             max_drawdown = None
-        elif state.recent_high and state.recent_low and state.recent_high > 0:
-            # Cross-check: drawdown do backend não pode exceder o range observado
-            # * 1.5 (tolerância para janela maior do que nossos 100 candles).
-            observed_range_dd = (state.recent_high - state.recent_low) / state.recent_high
+        elif asset.recent_high and asset.recent_low and asset.recent_high > 0:
+            observed_range_dd = (asset.recent_high - asset.recent_low) / asset.recent_high
             if max_drawdown > observed_range_dd * 1.5 and max_drawdown > 0.10:
                 risk_audit_anomalies.append(
                     f"max_drawdown backend ({max_drawdown:.2%}) >> range observado "
@@ -2262,45 +2812,34 @@ async def risk_agent_node(state: QuantAgentState) -> dict:
                 )
                 max_drawdown = observed_range_dd
 
-    # B) cvar_95: por convenção é uma perda (fração negativa ou próxima de 0 negativa)
     if cvar_95 is not None and (cvar_95 < -1.0 or cvar_95 > 1.0):
         risk_audit_anomalies.append(
             f"cvar_95 fora do range [-1,1]: {cvar_95:.4f} — descartado"
         )
         cvar_95 = None
 
-    # C) sharpe: na prática financeira |sharpe| > 5 é extremamente suspeito
     if sharpe is not None and abs(sharpe) > 10:
         risk_audit_anomalies.append(
             f"sharpe implausível: {sharpe:.4f} — descartado"
         )
         sharpe = None
 
-    # D) volatility_annualized: > 500% a.a. é essencialmente quebra de dados
     if volatility_annualized is not None and volatility_annualized > 5.0:
         risk_audit_anomalies.append(
             f"volatility_annualized implausível: {volatility_annualized:.2%} — descartado"
         )
         volatility_annualized = None
 
-    if risk_audit_anomalies:
-        print(f"[DEBUG] Risk audit caught anomalies: {risk_audit_anomalies}")
-
-    # QUANTITATIVE ENGINE: Deterministic risk level calculation (no LLM)
     risk_level_str = determine_risk_level(
         cvar_95=cvar_95,
         sharpe=sharpe,
         max_drawdown=max_drawdown,
-        volatility_annualized=volatility_annualized
+        volatility_annualized=volatility_annualized,
     )
     risk_level = RiskLevel(risk_level_str)
-    print(f"[DEBUG] Calculated risk level: {risk_level}")
 
-    # Annualizar volatilidade baseado no timeframe e interval dos dados
-    # Usando log returns para crypto (mais robusto que simple returns)
-    # Standard sqrt scaling sem fatores mágicos (institucional)
+    # Annualizar volatilidade quando vier raw
     if volatility_raw is not None and volatility_annualized is None:
-        # Se o intervalo dos dados não foi detectado, usar o timeframe atual
         if volatility_interval is None:
             timeframe = state.timeframe
             if timeframe == AnalysisTimeframe.INTRADAY:
@@ -2311,8 +2850,6 @@ async def risk_agent_node(state: QuantAgentState) -> dict:
                 volatility_interval = "1D"
             else:
                 volatility_interval = "1h"
-
-        # Annualizar baseado no intervala dos dados (standard sqrt scaling)
         if volatility_interval == "1m":
             volatility_annualized = volatility_raw * math.sqrt(252 * 1440)
         elif volatility_interval == "1h":
@@ -2321,26 +2858,73 @@ async def risk_agent_node(state: QuantAgentState) -> dict:
             volatility_annualized = volatility_raw * math.sqrt(252)
         elif volatility_interval in ["1D", "1w", "1W"]:
             volatility_annualized = volatility_raw * math.sqrt(52)
-        else:
-            print(f"[DEBUG] Risk agent output - risk_level: {risk_level}")
+
+    print(
+        f"[DEBUG] [{symbol}] Risk - cvar: {cvar_95}, sharpe: {sharpe}, "
+        f"drawdown: {max_drawdown}, vol: {volatility_annualized}, level: {risk_level}"
+    )
+    return {
+        "symbol": symbol,
+        "patch": dict(
+            var_95=var_95,
+            cvar_95=cvar_95,
+            sharpe=sharpe,
+            max_drawdown=max_drawdown,
+            volatility_annualized=volatility_annualized,
+            risk_level=risk_level,
+            exec_sharpe=exec_sharpe,
+            exec_volatility=exec_volatility,
+            anomalies_detected=list(asset.anomalies_detected) + risk_audit_anomalies,
+        ),
+        "steps": steps,
+        "cot": cot,
+        "content": content,
+    }
+
+
+@timed_async("Node: RiskAgent")
+async def risk_agent_node(state: QuantAgentState) -> dict:
+    """Risk metrics — fan-out per symbol. Comparados precisam dessas métricas
+    para o execution_node renderizar a tabela comparativa."""
+    print(f"[DEBUG] ===== RISK AGENT NODE START =====")
+    symbols = _resolve_symbols(state)
+    print(f"[DEBUG] Input symbols: {symbols}")
+
+    if not symbols:
+        return {
+            **state.model_dump(),
+            "next_action": NextAction.RISK_GATE,
+            "intermediate_steps_agent": [],
+            "cot": "",
+        }
+
+    results = await asyncio.gather(
+        *[_run_risk_for_symbol(state, s) for s in symbols]
+    )
+
+    new_assets = dict(state.assets)
+    all_steps: list = []
+    primary_cot = ""
+    primary_content = ""
+    for r in results:
+        sym = r["symbol"]
+        current = new_assets.get(sym) or AssetState(symbol=sym)
+        new_assets[sym] = current.model_copy(update=r["patch"])
+        all_steps.extend(_tag_steps(r["steps"], sym))
+        if sym == state.symbol:
+            primary_cot = r["cot"]
+            primary_content = r["content"]
+
     print(f"[DEBUG] ===== RISK AGENT NODE END =====")
     return {
         **state.model_dump(),
-        "messages":           state.messages + [AIMessage(content=content)],
+        "messages":           state.messages + [AIMessage(content=primary_content)],
         "next_action":        NextAction.RISK_GATE,
-        "intermediate_steps_global": state.intermediate_steps_global + steps,
-        "intermediate_steps_agent": steps,
-        "var_95":             var_95,
-        "cvar_95":            cvar_95,
-        "sharpe":             sharpe,
-        "max_drawdown":       max_drawdown,
-        "volatility_annualized": volatility_annualized,
-        "risk_level":         risk_level,
-        "exec_sharpe":        exec_sharpe,      # Execution layer (1H) sharpe
-        "exec_volatility":    exec_volatility,  # Execution layer (1H) volatility
-        "anomalies_detected": state.anomalies_detected + risk_audit_anomalies,
-        "cot":                cot,
-        "reasoning_trail":    _append_reasoning(state.reasoning_trail, "risk_agent", cot),
+        "intermediate_steps_global": state.intermediate_steps_global + all_steps,
+        "intermediate_steps_agent": all_steps,
+        "assets":             new_assets,
+        "cot":                primary_cot,
+        "reasoning_trail":    _append_reasoning(state.reasoning_trail, "risk_agent", primary_cot),
     }
 
 @timed_async("Node: SignalAgent")
@@ -2408,13 +2992,17 @@ async def signal_agent_node(state: QuantAgentState) -> dict:
     print(f"[DEBUG] Quant engine output - regime: {regime}, direction: {direction}, confidence: {signal_confidence}")
 
     print(f"[DEBUG] ===== SIGNAL AGENT NODE END =====")
+    new_assets = _patch_asset(
+        state.assets, state.symbol,
+        signal_direction=direction,
+        regime=regime,
+        signal_confidence=signal_confidence,
+    )
     return {
         **state.model_dump(),
         "messages":           state.messages + [AIMessage(content=content)],
         "next_action":        NextAction.MOE,
-        "signal_direction":   direction,
-        "regime":             regime,
-        "signal_confidence":  signal_confidence,
+        "assets":             new_assets,
         "intermediate_steps_global": state.intermediate_steps_global + steps,
         "intermediate_steps_agent": steps,
         "cot":                cot,
@@ -2457,17 +3045,21 @@ async def moe_node(state: QuantAgentState) -> dict:
     print(f"[DEBUG] MoE experts: {[e.value for e in moe_output.selected_experts]}")
     print(f"[DEBUG] ===== MOE NODE END =====")
     
+    new_assets = _patch_asset(
+        state.assets, state.symbol,
+        moe_final_signal=moe_output.final_signal,
+        moe_final_confidence=moe_output.final_confidence,
+        moe_selected_experts=[e.value for e in moe_output.selected_experts],
+        moe_expert_weights={k.value: v for k, v in moe_output.expert_weights.items()},
+        moe_gating_reason=moe_output.gating_reason,
+        moe_position_size=moe_output.position_size,
+        moe_risk_adjusted_signal=moe_output.risk_adjusted_signal,
+    )
     return {
         **state.model_dump(),
         "messages": state.messages + [AIMessage(content=f"MoE signal: {moe_output.final_signal:.3f}, confidence: {moe_output.final_confidence:.3f}")],
         "next_action": NextAction.DECISION_ENGINE,  # MoE feeds into decision_engine (FINAL authority)
-        "moe_final_signal": moe_output.final_signal,
-        "moe_final_confidence": moe_output.final_confidence,
-        "moe_selected_experts": [e.value for e in moe_output.selected_experts],
-        "moe_expert_weights": {k.value: v for k, v in moe_output.expert_weights.items()},
-        "moe_gating_reason": moe_output.gating_reason,
-        "moe_position_size": moe_output.position_size,
-        "moe_risk_adjusted_signal": moe_output.risk_adjusted_signal,
+        "assets": new_assets,
         "intermediate_steps_global": state.intermediate_steps_global + [("moe", moe_output.gating_reason)],
         "intermediate_steps_agent": [],
         "cot": "",
@@ -2610,33 +3202,98 @@ def _fmt(val, *, pct: bool = False, unit: str = "", prec: int = 4) -> str:
     return str(val)
 
 
-def _coverage_summary(state: QuantAgentState) -> tuple[int, int, list[str]]:
-    """Conta quantos campos críticos estão preenchidos; retorna (ok, total, missing)."""
+def _coverage_summary_for_asset(asset: AssetState) -> tuple[int, int, list[str]]:
+    """Conta quantos campos críticos estão preenchidos para um ativo;
+    retorna (ok, total, missing). Usado para anti-alucinação no execution_node."""
     fields = {
-        "live_price": state.live_price,
-        "price_change_pct": state.price_change_pct,
-        "rsi_14": state.rsi_14,
-        "macd_line": state.macd_line,
-        "bb_upper": state.bb_upper,
-        "sharpe": state.sharpe,
-        "cvar_95": state.cvar_95,
-        "max_drawdown": state.max_drawdown,
-        "volatility_annualized": state.volatility_annualized,
+        "live_price": asset.live_price,
+        "price_change_pct": asset.price_change_pct,
+        "rsi_14": asset.rsi_14,
+        "macd_line": asset.macd_line,
+        "bb_upper": asset.bb_upper,
+        "sharpe": asset.sharpe,
+        "cvar_95": asset.cvar_95,
+        "max_drawdown": asset.max_drawdown,
+        "volatility_annualized": asset.volatility_annualized,
     }
     missing = [k for k, v in fields.items() if v is None]
     return len(fields) - len(missing), len(fields), missing
 
 
+def _render_asset_block(asset: AssetState, *, label: str = "") -> str:
+    """Renderiza o bloco completo de dados de um ativo para o contexto do
+    execution_node. Inclui market data, indicadores multi-TF, risco e forecast."""
+    header = f"━━━ {label or asset.symbol} ━━━"
+    return f"""
+{header}
+DADOS DE MERCADO
+  Symbol:          {asset.symbol}
+  Preço atual:     {_fmt(asset.live_price, prec=2)}
+  Variação 24h:    {_fmt(asset.price_change_pct, prec=4)}%
+  Volume 24h:      {_fmt(asset.volume_24h, prec=2)}
+  Range recente:   high={_fmt(asset.recent_high, prec=2)} low={_fmt(asset.recent_low, prec=2)}
+
+INDICADORES — MACRO (1D)
+  RSI(14):         {_fmt(asset.macro_rsi_14, prec=2)}
+  MACD line/signal:{_fmt(asset.macro_macd_line)} / {_fmt(asset.macro_macd_signal)}
+  Bollinger %B:    {_fmt(asset.macro_bb_pct_b, prec=2)}
+  Regime:          {asset.macro_regime or '(não coletado)'}
+  Bias:            {asset.macro_bias or '(não coletado)'}
+
+INDICADORES — SETUP (4H)
+  RSI(14):         {_fmt(asset.setup_rsi_14, prec=2)}
+  MACD line/signal:{_fmt(asset.setup_macd_line)} / {_fmt(asset.setup_macd_signal)}
+  Bollinger %B:    {_fmt(asset.setup_bb_pct_b, prec=2)}
+
+INDICADORES — EXEC (1H)
+  RSI(14):         {_fmt(asset.exec_rsi_14, prec=2)}
+  MACD line/signal:{_fmt(asset.exec_macd_line)} / {_fmt(asset.exec_macd_signal)}
+
+MÉTRICAS DE RISCO
+  Risk level:      {asset.risk_level}
+  CVaR 95%:        {_fmt(asset.cvar_95, pct=True)}
+  Sharpe:          {_fmt(asset.sharpe, prec=3)}
+  Max Drawdown:    {_fmt(asset.max_drawdown, pct=True)}
+  Vol. anualizada: {_fmt(asset.volatility_annualized, pct=True)}
+
+SINAL & DECISÃO
+  Regime:          {asset.regime or '(não coletado)'}
+  Direção:         {asset.signal_direction or '(não coletado)'}
+  Confiança:       {_fmt(asset.signal_confidence, pct=True)}
+  Trend state:     {asset.trend_state or '(não coletado)'}
+  Final signal:    {asset.final_signal or '(não coletado)'} ({asset.final_signal_type or '—'})
+  Final reasoning: {asset.final_reasoning or '(não coletado)'}
+
+FORECAST APOLLO
+  Status:          {asset.forecast_status}
+  Janela:          {asset.forecast_period_start or '(não coletado)'} → {asset.forecast_period_end or '(não coletado)'}
+  Current price:   {_fmt(asset.forecast_current_price, prec=2)}
+  Predicted price: {_fmt(asset.forecast_predicted_price, prec=2)}
+  Direção ML:      {asset.forecast_direction or '(não coletado)'}
+  Retorno esperado:{_fmt(asset.forecast_return_pct, prec=2)}%
+  Confiança ML:    {_fmt(asset.forecast_confidence, pct=True)}
+  MAPE modelo:     {_fmt(asset.forecast_model_mape, prec=2)}%
+  Acionável:       {asset.forecast_actionable}
+  Avisos:          {asset.forecast_warnings or 'Nenhum'}
+
+QUALIDADE DOS DADOS
+  Anomalias:       {asset.anomalies_detected or 'Nenhuma'}
+""".rstrip()
+
+
 @timed_async("Node: Execution")
 async def execution_node(state: QuantAgentState) -> dict:
     """
-    Consolida toda a análise e gera resposta final institucional.
-    Hardened:
-      • valida gate + campos críticos
-      • renderiza None como '(não coletado)' explicitamente
-      • inclui resumo de cobertura para evitar alucinação
+    Consolida a análise e gera a resposta final orientada à PERGUNTA do usuário.
+
+    Multi-asset aware:
+      • Renderiza dados de TODOS os ativos em `state.assets` (primário + comparativos).
+      • Inclui a pergunta original do usuário no topo do contexto.
+      • Promove o `reasoning_trail` a espinha dorsal antes dos dados estruturados.
+      • Deixa o LLM escolher entre modo comparativo / single / pergunta específica
+        com base na pergunta — sem template forçado.
     """
-    # VALIDAÇÃO FINAL OBRIGATÓRIA
+    # VALIDAÇÃO FINAL OBRIGATÓRIA — gate é sobre o primário
     if not state.gate_approved:
         raise Exception(f"Execution node chamado sem aprovação do risk gate. Motivo: {state.gate_reason}")
     if not state.symbol:
@@ -2646,73 +3303,67 @@ async def execution_node(state: QuantAgentState) -> dict:
     if state.risk_level is None:
         raise Exception("Risk level não definido no estado.")
 
-    ok, total, missing = _coverage_summary(state)
-    coverage_line = f"Cobertura de dados: {ok}/{total} campos preenchidos"
+    # ──────────── 1) Pergunta original do usuário (bússola da resposta) ────────────
+    original_query = next(
+        (m for m in reversed(state.messages) if isinstance(m, HumanMessage)),
+        None,
+    )
+    user_question_text = original_query.content if original_query else "(não disponível)"
+
+    # ──────────── 2) Reasoning trail — espinha dorsal ────────────
+    if state.reasoning_trail:
+        trail_block = "\n".join(
+            f"  [{name}] {thought}" for name, thought in state.reasoning_trail
+        )
+    else:
+        trail_block = "  (nenhum)"
+
+    # ──────────── 3) Dados estruturados — 1 bloco por ativo ────────────
+    symbols = _resolve_symbols(state)
+    asset_blocks: list[str] = []
+    for sym in symbols:
+        asset = state.get_asset(sym)
+        label = f"{sym} (PRIMÁRIO — foco da decisão)" if sym == state.symbol else f"{sym} (comparativo)"
+        asset_blocks.append(_render_asset_block(asset, label=label))
+    asset_data_section = "\n\n".join(asset_blocks)
+
+    # Cobertura é avaliada sobre o primário
+    primary_asset = state.primary
+    ok, total, missing = _coverage_summary_for_asset(primary_asset)
+    coverage_line = f"Cobertura ({state.symbol}): {ok}/{total} campos preenchidos"
     if missing:
         coverage_line += f" | AUSENTES: {', '.join(missing)}"
 
-    # Formatação explícita evita o LLM confundir 0.0 com None
+    multi_asset_hint = ""
+    if len(symbols) > 1:
+        multi_asset_hint = (
+            f"\n⚠️  CONTEXTO MULTI-ATIVO: a pergunta envolve {len(symbols)} ativos "
+            f"({', '.join(symbols)}). Se a pergunta é comparativa, use o MODO COMPARATIVO."
+        )
+
     context = f"""
-RESUMO DE COBERTURA
+PERGUNTA ORIGINAL DO USUÁRIO (responda esta pergunta — não force template):
+  "{user_question_text}"
+{multi_asset_hint}
+
+RACIOCÍNIO ACUMULADO DOS AGENTES (use como espinha dorsal, sintetize — não copie literalmente):
+{trail_block}
+
+═══════════════════════════════════════════════════════════
+DADOS POR ATIVO
+═══════════════════════════════════════════════════════════
+{asset_data_section}
+
+═══════════════════════════════════════════════════════════
+COBERTURA & RISK GATE (sobre o primário {state.symbol})
+═══════════════════════════════════════════════════════════
   {coverage_line}
+  Risk gate aprovado:  {state.gate_approved}
+  Risk gate motivo:    {state.gate_reason}
+  Timeframe da análise:{state.timeframe}
 
-DADOS DE MERCADO
-  Symbol:          {state.symbol}
-  Timeframe:       {state.timeframe}
-  Preço atual:     {_fmt(state.live_price, prec=2)}
-  Variação 24h:    {_fmt(state.price_change_pct, prec=4)}%
-  Volume 24h:      {_fmt(state.volume_24h, prec=2)}
-  Range recente:   high={_fmt(state.recent_high, prec=2)} low={_fmt(state.recent_low, prec=2)}
-
-INDICADORES TÉCNICOS
-  RSI (14):        {_fmt(state.rsi_14, prec=2)}
-  MACD Line:       {_fmt(state.macd_line)}
-  MACD Signal:     {_fmt(state.macd_signal)}
-  MACD Histogram:  {_fmt(state.macd_histogram)}
-  Bollinger Upper: {_fmt(state.bb_upper, prec=2)}
-  Bollinger Middle:{_fmt(state.bb_middle, prec=2)}
-  Bollinger Lower: {_fmt(state.bb_lower, prec=2)}
-
-MÉTRICAS DE RISCO
-  Risk level:      {state.risk_level}
-  VaR 95%:         {_fmt(state.var_95, pct=True)}
-  CVaR 95%:        {_fmt(state.cvar_95, pct=True)}
-  Sharpe:          {_fmt(state.sharpe, prec=3)}
-  Max Drawdown:    {_fmt(state.max_drawdown, pct=True)}
-  Vol. anualizada: {_fmt(state.volatility_annualized, pct=True)}
-
-SINAL
-  Regime:          {state.regime}
-  Direção:         {state.signal_direction}
-  Confiança:       {_fmt(state.signal_confidence, pct=True)}
-
-QUALIDADE DOS DADOS
-  Anomalias:       {state.anomalies_detected or 'Nenhuma'}
-
-MODELO PREDITIVO (APOLLO)
-  Status:          {state.forecast_status}
-  Janela:          {state.forecast_period_start or '(não coletado)'} -> {state.forecast_period_end or '(não coletado)'}
-  Data points:     {state.forecast_data_points if state.forecast_data_points is not None else '(não coletado)'}
-  Current price:   {_fmt(state.forecast_current_price, prec=2)}
-  Predicted price: {_fmt(state.forecast_predicted_price, prec=2)}
-  Direção ML:      {state.forecast_direction or '(não coletado)'}
-  Forecast ret.:   {_fmt(state.forecast_return_pct, prec=2)}%
-  Confiança ML:    {_fmt(state.forecast_confidence, pct=True)}
-  MAPE modelo:     {_fmt(state.forecast_model_mape, prec=2)}%
-  Qualidade dados: {state.forecast_data_quality or '(não coletado)'}
-  Acionável:       {state.forecast_actionable}
-  Backtest p5 err: {_fmt(state.forecast_backtest_error_pct, prec=2)}%
-  Avisos ML:       {state.forecast_warnings or 'Nenhum'}
-
-RISK GATE
-  Aprovado:        {state.gate_approved}
-  Motivo:          {state.gate_reason}
-
-HISTÓRICO DE ANÁLISE (últimos 8 steps):
-{chr(10).join(f'  [{k}] {v[:120]}' for k, v in state.intermediate_steps_global[-8:])}
-
-RACIOCÍNIO DOS AGENTES (use como insumo, não copie literalmente):
-{chr(10).join(f'  [{name}] {thought}' for name, thought in state.reasoning_trail) if state.reasoning_trail else '  (nenhum)'}
+HISTÓRICO DE ANÁLISE (últimos 12 steps, para auditoria):
+{chr(10).join(f'  [{k}] {v[:120]}' for k, v in state.intermediate_steps_global[-12:])}
 """.strip()
 
     msgs = [
@@ -2721,13 +3372,17 @@ RACIOCÍNIO DOS AGENTES (use como insumo, não copie literalmente):
     ]
     node_config = NODE_CONFIG["execution"]
     llm = _get_llm_for_node("execution")
-    
-    # Add CoT instruction if enabled
+
     if node_config["cot"]:
-        msgs.append(HumanMessage(content="\n\nFORMATO DE RESPOSTA OBRIGATÓRIO:\n<thought>Resumo CONCISO do seu raciocínio (max 2-3 frases). Ex: 'Obtive o indicador X que está em Y, indicando Z.'</thought>\n<answer>Sua resposta final aqui</answer>"))
-    
+        msgs.append(HumanMessage(content=(
+            "\n\nFORMATO DE RESPOSTA OBRIGATÓRIO:\n"
+            "<thought>Resumo CONCISO do seu raciocínio (max 2-3 frases). "
+            "Ex: 'Pergunta comparativa entre X e Y; X tem Sharpe maior, Y tem momentum melhor; vereditc X.'</thought>\n"
+            "<answer>Sua resposta final aqui</answer>"
+        )))
+
     final_response = await llm.ainvoke(msgs)
-    
+
     # Track execution LLM call
     cost_tracker = get_cost_tracker()
     if hasattr(final_response, 'response_metadata'):
@@ -2737,11 +3392,8 @@ RACIOCÍNIO DOS AGENTES (use como insumo, não copie literalmente):
         model_name = getattr(llm, 'model_name', 'unknown') or getattr(llm, 'model', 'unknown')
         if input_tokens > 0 or output_tokens > 0:
             cost_tracker.add_call(model_name, input_tokens, output_tokens, "Execution")
-    
-    # Cost summary is tracked internally but not shown to the user.
     cost_summary = cost_tracker.get_summary()
 
-    # Extract CoT if enabled
     cot, answer = _extract_cot_and_answer(final_response.content) if node_config["cot"] else ("", final_response.content)
 
     return {
