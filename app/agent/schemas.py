@@ -181,7 +181,7 @@ class ApolloBacktestOutput(BaseModel):
 
 class OrchestratorOutput(BaseModel):
     """Structured output for Orchestrator agent."""
-    next_agent: Literal["market_data", "features", "risk", "signal", "risk_gate", "execution", "finalize", "blocked"]
+    next_agent: Literal["market_data", "features_macro", "features_setup", "features_exec", "risk", "signal", "risk_gate", "execution", "finalize", "blocked"]
     symbol: str
     timeframe: Literal["intraday", "daily", "weekly"]
     context: str = ""

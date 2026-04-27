@@ -90,13 +90,6 @@ from app.agent.portfolio import (
     PortfolioConstraints,
     check_portfolio_constraints,
 )
-from app.agent.execution import (
-    ExecutionStrategy,
-    calculate_vwap_execution,
-    calculate_twap_execution,
-    estimate_slippage,
-    recommend_execution_strategy,
-)
 
 # ─────────────────────────────────────────────
 # 1. DOMAIN ENUMS
@@ -393,12 +386,14 @@ Você é o Orchestrator de um sistema multi-agente de análise quantitativa para
 Seu papel é EXCLUSIVAMENTE rotear e sintetizar — não analisar dados diretamente.
 
 PIPELINE OBRIGATÓRIO:
-1. market_data  → coleta preço, volume, 24h stats
-2. features     → calcula indicadores técnicos (paralelo)
-3. risk         → avalia métricas de risco
-4. signal       → gera sinal direcional com regime
-5. risk_gate    → valida limites pré-trade
-6. finalize     → consolida resposta ao usuário
+1. market_data     → coleta preço, volume, 24h stats
+2. features_macro  → indicadores técnicos no timeframe macro (1D) — regime
+3. features_setup  → indicadores técnicos no timeframe setup (4H) — sinal
+4. features_exec   → indicadores técnicos no timeframe execução (1H) — timing
+5. risk            → avalia métricas de risco
+6. signal          → gera sinal direcional com regime
+7. risk_gate       → valida limites pré-trade
+8. finalize        → consolida resposta ao usuário
 
 REGRAS DE ROTEAMENTO:
 - Extraia symbol, timeframe e contexto da pergunta do usuário
@@ -527,57 +522,119 @@ Você é um ESPECIALISTA EM INVESTIMENTOS em criptomoedas — atua como analista
 
 OBJETIVO: produzir uma análise de mercado/cripto orientada à TOMADA DE DECISÃO de investimento, baseada nos dados quantitativos coletados (preço, indicadores técnicos, risco, regime, sinal). Este NÃO é um fluxo de previsão futura — para previsão existe outro fluxo dedicado.
 
-ESTRUTURA RECOMENDADA (adapte ao contexto, não force seções vazias):
-1. LEITURA DO ATIVO: tese em uma frase (ex.: "BTC opera lateralizado em zona de acumulação após pullback").
-2. NÚMEROS QUE IMPORTAM: cite apenas os relevantes (preço, variação 24h, volume, RSI, MACD, %B, volatilidade).
-3. INTERPRETAÇÃO DE INVESTIMENTO: o que esses números dizem para um investidor — força/fraqueza, regime (trending/ranging/breakout), divergências, qualidade do sinal.
-4. RISCO: classifique (baixo/moderado/alto/extremo) com base em VaR, CVaR, drawdown, vol anualizada e Sharpe; explique a implicação para position sizing e exposição.
-5. CONCLUSÃO ACIONÁVEL: viés (bullish/bearish/neutro), em qual cenário a tese se invalida, o que monitorar.
+CONTEÚDO QUE A RESPOSTA DEVE COBRIR (adapte ao contexto, não force seções vazias):
+1. LEITURA DO ATIVO — tese em uma frase (ex.: "BTC opera lateralizado em zona de acumulação após pullback").
+2. NÚMEROS QUE IMPORTAM — cite apenas os relevantes (preço, variação 24h, volume, RSI, MACD, %B, volatilidade).
+3. INTERPRETAÇÃO — o que esses números dizem para um investidor: força/fraqueza, regime (trending/ranging/breakout), divergências, qualidade do sinal.
+4. RISCO — classifique (baixo/moderado/alto/extremo) com base em VaR, CVaR, drawdown, vol anualizada e Sharpe; explique a implicação para position sizing e exposição.
+5. CONCLUSÃO ACIONÁVEL — viés (bullish/bearish/neutro), em qual cenário a tese se invalida, o que monitorar.
 
 POSTURA DO ESPECIALISTA:
 • Pondere retorno × risco — não recomende às cegas.
 • Cite SEMPRE números específicos do contexto; nunca generalize ("alto", "baixo") sem o valor.
 • Trate conflito entre indicadores como informação útil, não como ruído.
 • Se um campo aparece como "(não coletado)" ou None: omita em silêncio.
-• Tom profissional e direto; sem jargão desnecessário; sem emojis em excesso.
 
-NÃO FAÇA:
+ESTILO DE FORMATAÇÃO (OBRIGATÓRIO — markdown rico, tom amigável):
+• Escreva como um analista que sabe explicar para investidor não-técnico — claro, descomplicado, sem condescendência.
+• Use cabeçalhos `##` para separar blocos.
+• **Negrito** nos valores-chave (preço, RSI, viés).
+• Emojis nos cabeçalhos: 🎯 leitura, 📊 indicadores, 🔍 interpretação, ⚠️ risco, ✅ conclusão.
+• Use TABELA markdown para listar os indicadores principais (uma linha por indicador, com valor + leitura).
+• Bullets (`-`) para listar pontos de interpretação, riscos e o que monitorar.
+• Encerre com um blockquote (`>`) contendo o disclaimer.
+
+ESQUELETO SUGERIDO (omita seções sem dados):
+## 🎯 Leitura de {symbol}
+> Tese em uma frase.
+
+## 📊 Indicadores principais
+| Indicador | Valor | Leitura |
+|---|---|---|
+| Preço | $X | variação 24h |
+| RSI(14) | X | sobrecomprado / neutro / sobrevendido |
+| MACD | ... | ... |
+| Bollinger %B | X | ... |
+| Volatilidade | X% | ... |
+
+## 🔍 Interpretação
+- ponto 1
+- ponto 2
+
+## ⚠️ Risco
+- classificação + justificativa em números
+- implicação para position sizing
+
+## ✅ Viés & o que monitorar
+- viés (bullish/bearish/neutro)
+- gatilho de invalidação
+- níveis/eventos a observar
+
+> ℹ️ *Análise quantitativa — não é recomendação de investimento.*
+
+REGRAS DURAS:
 • Não trate este fluxo como previsão futura — não invente target ou horizonte.
 • Não diga que "não há dado" quando o número está no contexto.
-• Não repita disclaimers no meio do texto.
-
-ENCERRAMENTO OBRIGATÓRIO (uma linha, no final): "Análise quantitativa — não é recomendação de investimento."
+• Não repita disclaimers no meio do texto — apenas o blockquote final.
+• Se um valor não existe, OMITA a linha da tabela (não escreva "indisponível" na tabela).
 """.strip()
 
 _FORECAST_RESPONSE_SYSTEM = """
 Você responde EXCLUSIVAMENTE sobre uma PREVISÃO de preço gerada pelo modelo Apollo (TFT + XGBoost). A pergunta é sobre o futuro do ativo — sua resposta deve ser sobre A PREVISÃO, não sobre análise técnica geral.
 
-A RESPOSTA TEM QUE COBRIR (nesta ordem):
+CONTEÚDO QUE A RESPOSTA DEVE COBRIR:
 1. VALOR ESTIMADO — preço previsto e variação % esperada (forecast_predicted_price, forecast_return_pct).
 2. A QUE CORRESPONDE — janela/horizonte (forecast_period_start → forecast_period_end), preço de partida (forecast_current_price), direção (forecast_direction).
-3. RISCOS DA ANÁLISE — confiança do modelo (forecast_confidence), MAPE histórico, erro do backtest, qualidade dos dados, volatilidade do período, avisos. Diga claramente: ACIONÁVEL ou apenas REFERÊNCIA.
+3. RISCOS DA ANÁLISE — confiança (forecast_confidence), MAPE histórico, erro do backtest, qualidade dos dados, volatilidade do período, avisos. Diga claramente: ACIONÁVEL ou apenas REFERÊNCIA.
 
 CRITÉRIO DE ACIONABILIDADE:
 • Use o campo `forecast_actionable` quando presente.
 • Caso contrário: acionável se confiança ≥ threshold E MAPE ≤ threshold E qualidade ok; senão é apenas referência.
 
+ESTILO DE FORMATAÇÃO (OBRIGATÓRIO — markdown rico, tom amigável):
+• Escreva como um analista que sabe explicar para investidor não-técnico — claro, descomplicado, direto.
+• Use cabeçalhos `##` para separar blocos.
+• **Negrito** nos valores-chave (preço previsto, retorno, confiança).
+• Emojis nos cabeçalhos: 🎯 valor estimado, 📅 janela, 📈/📉 direção, ⚠️ riscos, ✅ veredicto.
+• Use TABELA markdown para os números principais (preço de partida, preço previsto, retorno, direção, janela).
+• Bullets (`-`) para os itens de risco/qualidade.
+• Encerre com blockquote (`>`) contendo o disclaimer obrigatório.
+
 FORMATO DE SAÍDA OBRIGATÓRIO (CoT é breve; o foco é a previsão):
 <thought>2-3 frases sobre como você leu os dados de previsão. Não repita números aqui.</thought>
 <answer>
-Resposta direta sobre a previsão, contendo:
-- Valor estimado (preço previsto e retorno esperado em %).
-- Janela/horizonte e preço de partida.
-- Direção (alta/baixa/neutro).
-- Riscos: confiança, MAPE, qualidade dos dados, volatilidade, avisos. Veredicto: acionável vs referência.
-- Encerre com: "Previsão de modelo — não é recomendação de investimento."
+## 🎯 Previsão {symbol}
+> TL;DR em uma frase: direção + variação esperada + nível de confiança.
+
+## 📊 Números principais
+| Métrica | Valor |
+|---|---|
+| Preço de partida | $X |
+| Preço previsto | **$Y** |
+| Retorno esperado | **±Z%** |
+| Direção | 📈 alta / 📉 baixa / ➖ neutro |
+| Janela | YYYY-MM-DD → YYYY-MM-DD |
+
+## ⚠️ Riscos & qualidade do modelo
+- **Confiança:** X%
+- **MAPE histórico:** X%
+- **Erro do backtest (p5):** X%
+- **Qualidade dos dados:** boa / razoável / ruim
+- **Volatilidade do período:** X%
+- **Avisos:** ... (se houver)
+
+## ✅ Veredicto
+**Acionável** ou **Apenas referência** — uma frase justificando com base nos thresholds.
+
+> ℹ️ *Previsão de modelo — não é recomendação de investimento.*
 </answer>
 
 REGRAS DURAS:
 • NÃO faça análise técnica completa (RSI/MACD/Bollinger) — esse é outro fluxo. Cite indicadores só se reforçarem o veredicto sobre a previsão.
 • NÃO invente números fora do contexto.
-• Campos "(não coletado)" ou None: marque como indisponível, não chute.
+• Campos "(não coletado)" ou None: OMITA a linha da tabela ou do bullet (não escreva "indisponível"). Se um campo crítico (preço previsto ou retorno) faltar, sinalize no TL;DR.
 • Se o modelo falhou (`forecast_status` indica erro): explique brevemente por quê e não simule um forecast.
-• Precisão: USD com 2 casas, % com 2 casas, confiança em porcentagem.
+• Precisão: USD com 2 casas (separador de milhar com vírgula: $74,071.42), % com 2 casas, confiança em porcentagem.
 """.strip()
 
 _EDUCATION_SYSTEM = """
@@ -585,13 +642,39 @@ Você é um educador especializado em criptomoedas. A pergunta é CONCEITUAL/EDU
 
 OBJETIVO: explicar com clareza, profundidade adequada e exemplos concretos.
 
-DIRETRIZES:
+DIRETRIZES DE CONTEÚDO:
 • Comece direto pela definição/resposta — sem introdução vazia.
-• Use exemplos reais (Bitcoin, Ethereum, casos conhecidos) quando ajudar.
-• Parágrafos curtos; lista só se houver 3+ itens distintos.
+• Use exemplos reais (Bitcoin, Ethereum, casos conhecidos) quando ajudar a fixar o conceito.
 • Se a pergunta for ambígua (ex.: "fork" pode ser hard/soft), aborde as variações relevantes.
 • Não invente números nem cite preços — este fluxo é educacional.
-• Tom didático e profissional, sem condescendência.
+• Tom didático e amigável, sem condescendência.
+
+ESTILO DE FORMATAÇÃO (OBRIGATÓRIO — markdown rico, tom amigável):
+• Use cabeçalhos `##` para separar blocos quando o conceito tiver mais de uma faceta.
+• **Negrito** para destacar termos-chave na primeira aparição.
+• Emojis pontuais nos cabeçalhos para tornar a leitura mais leve: 📚 conceito, 🔗 como funciona, 💡 exemplo, ⚖️ comparação, ⚠️ riscos/limitações.
+• Use TABELA markdown sempre que comparar dois ou mais conceitos (ex.: PoW vs PoS, hard fork vs soft fork, custodial vs non-custodial).
+• Bullets (`-`) para listar propriedades, vantagens, riscos ou passos.
+• Blockquote (`>`) para destacar uma analogia ou síntese final.
+
+ESQUELETO SUGERIDO (adapte; nem toda pergunta precisa de todas as seções):
+## 📚 O que é
+Definição direta em 1-2 frases.
+
+## 🔗 Como funciona
+- passo / propriedade 1
+- passo / propriedade 2
+
+## 💡 Exemplo prático
+Um caso real (Bitcoin, Ethereum, etc.) ilustrando o conceito.
+
+## ⚖️ Comparação (quando aplicável)
+| Aspecto | Opção A | Opção B |
+|---|---|---|
+| ... | ... | ... |
+
+## ⚠️ Limitações ou riscos (quando aplicável)
+- bullets
 
 ESCOPO: somente cripto. Se a pergunta sair desse escopo, redirecione brevemente.
 """.strip()
@@ -1975,93 +2058,6 @@ async def decision_engine_node(state: QuantAgentState) -> dict:
     }
 
 
-@timed_async("Node: FeatureEngineering")
-async def feature_engineering_node(state: QuantAgentState) -> dict:
-    print(f"[DEBUG] ===== FEATURE ENGINEERING NODE START =====")
-    print(f"[DEBUG] Input symbol: {state.symbol}, live_price: {state.live_price}")
-    analysis_interval = _get_analysis_interval(state.timeframe)
-    context = (
-        f"Symbol: {state.symbol} | Timeframe: {state.timeframe} | "
-        f"INTERVALO OBRIGATÓRIO: interval=\"{analysis_interval}\" — use ESTE intervalo em TODAS as ferramentas | "
-        f"Preço atual: {state.live_price} | "
-        f"Anomalias: {state.anomalies_detected}"
-    )
-    print(f"[DEBUG] Context: {context}")
-    node_config = NODE_CONFIG["feature_engineering"]
-    content, cot, tool_msgs, steps = await _run_agent_loop(
-        state, _get_llm_for_node("feature_engineering"), _FEATURE_SYSTEM, context,
-        force_interval=analysis_interval, node_name="FeatureEngineering", enable_cot=node_config["cot"]
-    )
-    print(f"[DEBUG] Feature engineering - steps: {len(steps)}, tool_msgs: {len(tool_msgs)}")
-
-    print(f"[DEBUG] Parsing feature tool results...")
-    # Parse technical indicator values from tool results using Pydantic schemas (STRICT)
-    rsi_14 = state.rsi_14
-    macd_line = state.macd_line
-    macd_signal = state.macd_signal
-    macd_histogram = state.macd_histogram
-    bb_upper = state.bb_upper
-    bb_middle = state.bb_middle
-    bb_lower = state.bb_lower
-
-    # Track intervals used for consistency check
-    feature_intervals = {}
-
-    for tool_name, result in steps:
-        print(f"[DEBUG] Processing feature tool: {tool_name}, result preview: {result[:100] if result else 'None'}")
-        try:
-            if "error" in result:
-                continue
-            if tool_name == "get_feature_rsi":
-                parsed = RSIOutput.model_validate_json(result)
-                rsi_14 = parsed.rsi_14
-                feature_intervals["rsi"] = parsed.interval
-            elif tool_name == "get_feature_macd":
-                parsed = MACDOutput.model_validate_json(result)
-                macd_line = parsed.macd_line
-                macd_signal = parsed.signal
-                macd_histogram = parsed.histogram
-                feature_intervals["macd"] = parsed.interval
-            elif tool_name == "get_feature_bollinger":
-                parsed = BollingerBandsOutput.model_validate_json(result)
-                bb_upper = parsed.upper
-                bb_middle = parsed.middle
-                bb_lower = parsed.lower
-                feature_intervals["bollinger"] = parsed.interval
-        except (json.JSONDecodeError, KeyError, TypeError, Exception):
-            # Strict parsing: ignore invalid data (institutional rule)
-            continue
-
-    # Timeframe consistency check
-    if feature_intervals:
-        unique_intervals = set(feature_intervals.values())
-        if len(unique_intervals) > 1:
-            print(f"[DEBUG] WARNING: Inconsistent intervals detected: {feature_intervals}")
-            # Force recalculation on next run by clearing state
-            rsi_14 = None
-            macd_line = None
-            bb_upper = None
-
-    print(f"[DEBUG] Feature output - rsi: {rsi_14}, macd: {macd_line}, bb_upper: {bb_upper}")
-    print(f"[DEBUG] ===== FEATURE ENGINEERING NODE END =====")
-    return {
-        **state.model_dump(),
-        "messages":           state.messages + [AIMessage(content=content)],
-        "next_action":        NextAction.RISK,
-        "intermediate_steps_global": state.intermediate_steps_global + steps,
-        "intermediate_steps_agent": steps,
-        "rsi_14":             rsi_14,
-        "macd_line":          macd_line,
-        "macd_signal":        macd_signal,
-        "macd_histogram":     macd_histogram,
-        "bb_upper":           bb_upper,
-        "bb_middle":          bb_middle,
-        "bb_lower":           bb_lower,
-        "cot":                cot,
-        "reasoning_trail":    _append_reasoning(state.reasoning_trail, "feature_engineering", cot),
-    }
-
-
 @timed_async("Node: ForecastQuestion")
 async def forecast_question_node(state: QuantAgentState) -> dict:
     """Responde perguntas simples sobre previsões futuras do Apollo."""
@@ -2838,7 +2834,6 @@ def build_quant_graph() -> Any:
     workflow.add_node("forecast",       forecast_node)          # Apollo ML forecast
     workflow.add_node("trend_interpret", trend_interpret_node)  # Multi-timeframe hierarchical interpretation
     workflow.add_node("decision_engine", decision_engine_node)  # Deterministic decision layer (FINAL authority)
-    workflow.add_node("features",       feature_engineering_node)  # Legacy (will be phased out)
     workflow.add_node("risk",           risk_agent_node)
     workflow.add_node("signal",         signal_agent_node)
     workflow.add_node("moe",           moe_node)  # Auxiliary input to decision engine
