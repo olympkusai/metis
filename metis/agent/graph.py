@@ -699,12 +699,12 @@ async def synthesis_node(state: FinanceAgentState, config: RunnableConfig) -> di
         extra_context=extra,
         clear_steps=True,
         node_name="synthesis",
-        enable_cot=True,
+        enable_cot=False,
         tool_map_override=None,
         config=config,
     )
 
-    print(f"[synthesis_node] cot_len={len(cot)}, answer_len={len(content)}")
+    print(f"[synthesis_node] answer_len={len(content)}")
 
     # Safety: never return an empty answer
     if not content or not content.strip():
@@ -713,8 +713,8 @@ async def synthesis_node(state: FinanceAgentState, config: RunnableConfig) -> di
     return {
         **state.model_dump(),
         "final_answer": content,
-        "cot": cot,
-        "reasoning_trail": _append_reasoning(state.reasoning_trail, "synthesis", cot, status),
+        "cot": "",
+        "reasoning_trail": _append_reasoning(state.reasoning_trail, "synthesis", "", NodeStatus.OK),
         "next_action": NextAction.FINALIZE,
         "messages": state.messages + [AIMessage(content=content)],
     }

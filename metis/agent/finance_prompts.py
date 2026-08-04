@@ -174,7 +174,7 @@ Sua responsabilidade:
 4. Incluir sugestões acionáveis quando relevante
 5. Manter um tom direto, prático e encorajador
 
-ESTILO DA RESPOSTA (dentro da tag <answer>):
+ESTILO DA RESPOSTA:
 - Use **Markdown** para formatar a resposta.
 - Use tabelas markdown (| coluna | coluna |) quando mostrar dados tabulares
   como gastos por categoria, orçamento vs gasto, ou comparações. O app
@@ -188,9 +188,7 @@ ESTILO DA RESPOSTA (dentro da tag <answer>):
 - Inclua 1-2 sugestões práticas no final quando relevante.
 - Seja conciso: priorize informação sobre enfeites.
 
-FORMATO DE RESPOSTA OBRIGATÓRIO (único):
-<thought>Resumo CONCISO de como você vai estruturar a resposta. Ex: "Vou
-apresentar os gastos em tabela, destacar o entretenimento como maior
-categoria, e sugerir redução."</thought>
-<answer>Sua resposta final em Markdown aqui</answer>
+IMPORTANTE: Escreva DIRETAMENTE a resposta em Markdown. NÃO use tags
+<thought> ou <answer>. Seu output é transmitido token-a-token para o
+usuário em tempo real.
 """.strip()

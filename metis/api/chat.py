@@ -227,9 +227,8 @@ async def streaming_chat(request: ChatRequest, authorization: Optional[str] = He
                 if node in ("finance_orchestrator", "finance_context", "data_gathering", "analysis"):
                     continue
 
-                # Only 'synthesis' produces the user-facing answer — stream
-                # its tokens in real time. Also handle 'finance_reasoning'
-                # for backward compat (old graph).
+                # 'synthesis' streams the user-facing answer directly —
+                # real token streaming, no fake-stream needed.
                 async for sse_line in _yield_token_events(content, node):
                     yield sse_line
 
