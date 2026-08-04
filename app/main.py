@@ -13,45 +13,57 @@ if __package__ in {None, ""}:
 
 from app.api import register_routes
 from app.apollo_client import close_apollo_client
+from app.pluto_client import close_pluto_client
 from app.config import get_settings
 from app.storage import DatabasePool
-from app.storage.migrations import run_migrations
+from app.storage.migrations import run_migrations, run_conversation_migrations
 from app.tools import set_db_pool
+from app.memory.conversation_history import set_conversation_db_pool
 
 
-# Global database pool
+# Global database pools
 _db_pool: DatabasePool | None = None
+_conversation_db_pool: DatabasePool | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan manager for database pool initialization."""
-    global _db_pool
-    
-    # Startup
+    global _db_pool, _conversation_db_pool
+
+    # Startup — external k0s Postgres (market data cache, owned by another system)
     settings = get_settings()
     _db_pool = await DatabasePool.create(
         dsn=settings.database_url,
         min_size=10,
         max_size=50,
     )
-    
-    # Run migrations
     await run_migrations(_db_pool)
-    
-    # Set db pool for local tools
     set_db_pool(_db_pool)
-    
     print(f"[MAIN] Database pool initialized with {settings.database_url}")
     print(f"[MAIN] Pool size: min=10, max=50")
-    
+
+    # Startup — Metis's own Postgres (db-metis: conversations, chat_messages, notifications)
+    _conversation_db_pool = await DatabasePool.create(
+        dsn=settings.conversation_database_url,
+        min_size=5,
+        max_size=20,
+    )
+    await run_conversation_migrations(_conversation_db_pool)
+    set_conversation_db_pool(_conversation_db_pool)
+    print(f"[MAIN] Conversation database pool initialized (db-metis)")
+
     yield
-    
+
     # Shutdown
     if _db_pool:
         await _db_pool.close()
         print("[MAIN] Database pool closed")
+    if _conversation_db_pool:
+        await _conversation_db_pool.close()
+        print("[MAIN] Conversation database pool closed")
     await close_apollo_client()
+    await close_pluto_client()
 
 
 app = FastAPI(title="k0s - v0.0.1", lifespan=lifespan)

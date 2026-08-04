@@ -20,6 +20,20 @@ from app.tools.local import (
     set_db_pool,
 )
 
+# Finance tools — separate list, never merged into all_tools (crypto). Keeps
+# the crypto pipeline's blast radius at zero and avoids exposing finance
+# tools to the LLM in nodes that have nothing to do with personal finance.
+from app.tools.finance import (
+    finance_tools,
+    get_spending_by_category,
+    get_cashflow,
+    get_budget_progress,
+    get_goal_summary,
+    get_recurrences_due,
+    list_transactions_filtered,
+    set_auth_token,
+)
+
 # Export local tools as the default
 all_tools = [
     get_live_price,
@@ -51,4 +65,12 @@ __all__ = [
     "get_feature_max_drawdown",
     "get_feature_sma",
     "get_feature_ema_return",
+    "finance_tools",
+    "get_spending_by_category",
+    "get_cashflow",
+    "get_budget_progress",
+    "get_goal_summary",
+    "get_recurrences_due",
+    "list_transactions_filtered",
+    "set_auth_token",
 ]

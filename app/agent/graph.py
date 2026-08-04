@@ -40,8 +40,15 @@ from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field, ConfigDict
 
-from app.tools import all_tools
+from app.tools import all_tools, finance_tools, set_auth_token
 from app.apollo_client import ApolloApiError, get_apollo_client
+from app.pluto_client import PlutoApiError, get_pluto_client
+from app.agent.finance_prompts import (
+    _FINANCE_GREETING,
+    _FINANCE_OUT_OF_SCOPE,
+    _FINANCE_ORCHESTRATOR_SYSTEM,
+    _FINANCE_REASONING_SYSTEM,
+)
 from app.config import get_settings
 from app.agent.forecasting import (
     assess_forecast_quality,
@@ -121,6 +128,11 @@ class NextAction(str, Enum):
     EXECUTION      = "execution"
     FINALIZE       = "finalize"
     BLOCKED        = "blocked"
+
+    # Finance persona (build_finance_graph) — separate from the crypto values
+    # above, never referenced by the crypto pipeline.
+    FINANCE_CONTEXT   = "finance_context"
+    FINANCE_REASONING = "finance_reasoning"
 
 # Multi-timeframe structure
 class TimeframeLayer(str, Enum):
@@ -250,6 +262,13 @@ class QuantAgentState(BaseModel):
     # Conversation
     messages:           list[Any]          = Field(default_factory=list)
     user_id:            str                = ""
+    # Bearer JWT forwarded from the frontend, per-request only — never persisted
+    # to conversation history (see app/memory/conversation_history.py).
+    auth_token:         str                = ""
+
+    # Finance persona context (fetched by finance_context_node from Pluto)
+    finance_profile:    dict               = Field(default_factory=dict)
+    finance_accounts:   list               = Field(default_factory=list)
 
     # Routing
     next_action:        NextAction         = NextAction.MARKET_DATA
@@ -1058,13 +1077,19 @@ async def _execute_tools(
     steps: list,
     cache: dict[str, str] | None = None,
     force_interval: str | None = None,
+    tool_map_override: dict | None = None,
 ) -> tuple[list[ToolMessage], list]:
     """Executa tool calls em paralelo, com dedup cache (por-run) e enforcement
     do `interval` canônico derivado do timeframe do orchestrator.
+
+    `tool_map_override` permite a um agente resolver tool calls contra um
+    conjunto de tools diferente do `tool_map` global (crypto) — usado pelo
+    finance_reasoning_node, que só deve enxergar `finance_tools`.
     """
     tool_messages: list[ToolMessage] = []
     steps = list(steps)
     cache = cache if cache is not None else {}
+    active_tool_map = tool_map_override if tool_map_override is not None else tool_map
 
     async def _run_one(tc):
         name = tc["name"]
@@ -1078,7 +1103,7 @@ async def _execute_tools(
         key = _cache_key(name, args)
         if key in cache:
             return name, tc["id"], cache[key], True
-        tool = tool_map.get(name)
+        tool = active_tool_map.get(name)
         if tool is None:
             return name, tc["id"], f"[ERR] Tool '{name}' não encontrada.", False
         result = await tool.ainvoke(args)
@@ -1113,6 +1138,7 @@ async def _run_agent_loop(
     force_interval: str | None = None,
     node_name: str = "unknown",
     enable_cot: bool = False,
+    tool_map_override: dict | None = None,
 ) -> tuple[str, str, NodeStatus, list[ToolMessage], list]:
     """
     Loop LLM → tool call → result para um agente especializado.
@@ -1203,7 +1229,8 @@ async def _run_agent_loop(
         # Handle both AIMessage (with tool_calls) and structured Pydantic output
         if hasattr(response, 'tool_calls') and response.tool_calls:
             tool_msgs, steps = await _execute_tools(
-                response, steps, cache=state.tool_cache, force_interval=force_interval
+                response, steps, cache=state.tool_cache, force_interval=force_interval,
+                tool_map_override=tool_map_override,
             )
             msgs.extend(tool_msgs)
             all_tool_msgs.extend(tool_msgs)
@@ -3778,6 +3805,162 @@ def get_agent_graph() -> Any:
     if _graph is None:
         _graph = build_quant_graph()
     return _graph
+
+# ─────────────────────────────────────────────
+# 9. FINANCE GRAPH  (personal finance persona — sibling to the crypto graph)
+# ─────────────────────────────────────────────
+# Bypasses the entire crypto/quant pipeline (market_data → features → forecast
+# → signal → moe → decision_engine → risk → risk_gate): none of that applies
+# to personal finance. Reuses QuantAgentState (crypto fields stay at their
+# defaults, harmless) and finalize_node as-is; everything else is new and
+# isolated so the crypto graph is never at risk of regressing.
+
+finance_tool_map = {t.name: t for t in finance_tools}
+
+
+async def finance_orchestrator_node(state: QuantAgentState) -> dict:
+    """Curto-circuita saudação/fora-de-escopo, como orchestrator_node faz para
+    cripto — reaproveita `_classify_intent` (genérico, não específico de cripto).
+    """
+    user_question = state.messages[-1].content if state.messages else ""
+
+    intent = _classify_intent(user_question)
+    if intent == "greeting":
+        return {
+            **state.model_dump(),
+            "final_answer": _FINANCE_GREETING,
+            "next_action": NextAction.FINALIZE,
+            "messages": state.messages + [AIMessage(content=_FINANCE_GREETING)],
+        }
+
+    simple_llm = _make_llm(model="gpt-4o-mini", temperature=0)
+    scope_validation = await simple_llm.ainvoke([
+        SystemMessage(content=_FINANCE_ORCHESTRATOR_SYSTEM),
+        HumanMessage(content=user_question),
+    ])
+    scope_result = scope_validation.content.strip().upper()
+
+    if scope_result != "FINANCE_OK":
+        return {
+            **state.model_dump(),
+            "final_answer": _FINANCE_OUT_OF_SCOPE,
+            "next_action": NextAction.FINALIZE,
+            "messages": state.messages + [AIMessage(content=_FINANCE_OUT_OF_SCOPE)],
+        }
+
+    return {**state.model_dump(), "next_action": NextAction.FINANCE_CONTEXT}
+
+
+async def finance_context_node(state: QuantAgentState) -> dict:
+    """Busca incondicionalmente o perfil financeiro + contas do usuário no
+    Pluto — dado de "orientação" necessário em todo turno para o assistente
+    poder sugerir proativamente com base nos objetivos declarados.
+
+    Falha (401/timeout) finaliza com mensagem amigável em vez de propagar
+    exceção, mesmo padrão usado para ApolloApiError no resto do grafo.
+    """
+    if not state.auth_token:
+        error_msg = (
+            "Não consegui acessar seus dados financeiros — sessão não "
+            "autenticada. Tente fazer login novamente."
+        )
+        return {
+            **state.model_dump(),
+            "final_answer": error_msg,
+            "next_action": NextAction.FINALIZE,
+            "messages": state.messages + [AIMessage(content=error_msg)],
+        }
+
+    try:
+        client = get_pluto_client()
+        profile = await client.get_financial_profile(token=state.auth_token)
+        accounts = await client.list_accounts(token=state.auth_token)
+        return {
+            **state.model_dump(),
+            "finance_profile": profile,
+            "finance_accounts": accounts.get("accounts", accounts) if isinstance(accounts, dict) else accounts,
+        }
+    except PlutoApiError as e:
+        error_msg = f"Não consegui acessar seus dados financeiros agora: {e}"
+        return {
+            **state.model_dump(),
+            "final_answer": error_msg,
+            "next_action": NextAction.FINALIZE,
+            "messages": state.messages + [AIMessage(content=error_msg)],
+        }
+
+
+async def finance_reasoning_node(state: QuantAgentState) -> dict:
+    """LLM com finance_tools (relatórios sob demanda), contexto de perfil
+    financeiro + contas já carregado por finance_context_node.
+    """
+    set_auth_token(state.auth_token)
+    llm = _make_llm(model="gpt-4o", temperature=0.2).bind_tools(finance_tools)
+
+    context_block = json.dumps(
+        {"financial_profile": state.finance_profile, "accounts": state.finance_accounts},
+        ensure_ascii=False, default=str,
+    )
+
+    content, cot, status, _tool_msgs, steps = await _run_agent_loop(
+        state,
+        llm,
+        system_prompt=_FINANCE_REASONING_SYSTEM,
+        extra_context=f"[PERFIL FINANCEIRO E CONTAS DO USUÁRIO]\n{context_block}",
+        clear_steps=True,
+        node_name="finance_reasoning",
+        enable_cot=False,
+        tool_map_override=finance_tool_map,
+    )
+
+    return {
+        **state.model_dump(),
+        "final_answer": content,
+        "cot": cot,
+        "intermediate_steps_agent": steps,
+        "intermediate_steps_global": state.intermediate_steps_global + steps,
+        "next_action": NextAction.FINALIZE,
+        "messages": state.messages + [AIMessage(content=content)],
+    }
+
+
+def build_finance_graph() -> Any:
+    workflow = StateGraph(QuantAgentState)
+
+    workflow.add_node("finance_orchestrator", finance_orchestrator_node)
+    workflow.add_node("finance_context",      finance_context_node)
+    workflow.add_node("finance_reasoning",    finance_reasoning_node)
+    workflow.add_node("finalize",             finalize_node)
+
+    workflow.set_entry_point("finance_orchestrator")
+
+    workflow.add_conditional_edges(
+        "finance_orchestrator",
+        lambda s: "finalize" if s.next_action == NextAction.FINALIZE else "finance_context",
+        {"finalize": "finalize", "finance_context": "finance_context"},
+    )
+
+    workflow.add_conditional_edges(
+        "finance_context",
+        lambda s: "finalize" if s.next_action == NextAction.FINALIZE else "finance_reasoning",
+        {"finalize": "finalize", "finance_reasoning": "finance_reasoning"},
+    )
+
+    workflow.add_edge("finance_reasoning", "finalize")
+    workflow.add_edge("finalize", END)
+
+    return workflow.compile()
+
+
+_finance_graph: Any | None = None
+
+
+def get_finance_agent_graph() -> Any:
+    global _finance_graph
+    if _finance_graph is None:
+        _finance_graph = build_finance_graph()
+    return _finance_graph
+
 
 async def run_analysis(user_message: str, user_id: str = "anon") -> str:
     """

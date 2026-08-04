@@ -1,9 +1,9 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, Header
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from typing import Optional
+from typing import Literal, Optional
 from langchain_core.messages import HumanMessage, AIMessage
-from app.agent.graph import get_agent_graph, QuantAgentState
+from app.agent.graph import get_agent_graph, get_finance_agent_graph, QuantAgentState
 from app.memory.conversation_history import (
     get_conversation_history,
     MessageRole,
@@ -35,9 +35,23 @@ class ChatRequest(BaseModel):
     message: str
     user_id: str
     session_id: Optional[str] = None
+    domain: Literal["finance", "crypto"] = "finance"
+
+
+def _extract_bearer_token(authorization: Optional[str]) -> str:
+    """Extracts the raw JWT from an `Authorization: Bearer <token>` header.
+
+    Returns "" when absent — callers (finance_context_node) treat a missing
+    token as an unauthenticated request and fail gracefully rather than crash.
+    """
+    if not authorization:
+        return ""
+    return authorization.removeprefix("Bearer ").strip()
+
 
 @router.post("/chat")
-async def chat(request: ChatRequest):
+async def chat(request: ChatRequest, authorization: Optional[str] = Header(None)):
+    auth_token = _extract_bearer_token(authorization)
     # Generate session_id if not provided
     session_id = request.session_id or f"{request.user_id}:{uuid.uuid4().hex}"
     
@@ -82,10 +96,11 @@ async def chat(request: ChatRequest):
     # Add current message
     messages.append(HumanMessage(content=request.message))
     
-    agent = get_agent_graph()
+    agent = get_agent_graph() if request.domain == "crypto" else get_finance_agent_graph()
     initial_state = QuantAgentState(
         messages=messages,
         user_id=request.user_id,
+        auth_token=auth_token,
     )
     # recursion_limit = 8 nós × max 6 iterações internas + margem
     final_state = await agent.ainvoke(initial_state, config={"recursion_limit": 60})
@@ -170,9 +185,10 @@ async def chat(request: ChatRequest):
 
 
 @router.post("/streaming/chat")
-async def streaming_chat(request: ChatRequest):
+async def streaming_chat(request: ChatRequest, authorization: Optional[str] = Header(None)):
     """Streaming endpoint that emits each node execution as an SSE event."""
-    
+    auth_token = _extract_bearer_token(authorization)
+
     # Generate session_id if not provided
     session_id = request.session_id or f"{request.user_id}:{uuid.uuid4().hex}"
     
@@ -218,12 +234,13 @@ async def streaming_chat(request: ChatRequest):
         # Add current message
         messages.append(HumanMessage(content=request.message))
         
-        agent = get_agent_graph()
+        agent = get_agent_graph() if request.domain == "crypto" else get_finance_agent_graph()
         initial_state = QuantAgentState(
             messages=messages,
             user_id=request.user_id,
+            auth_token=auth_token,
         )
-        
+
         # Accumulate state updates to build final state
         accumulated_state = {}
         

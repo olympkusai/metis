@@ -5,10 +5,9 @@ from typing import Optional
 
 class Settings(BaseSettings):
     openai_api_key: str = Field(..., description="OpenAI API Key")
-    database_url: str = Field(default="postgres://postgres:BGxE9aWYJP5Ai7rhLkGeQUcnt8Y4hvnq3IM282m7OgEtKIF4QjmMUbIND07qCBR9@88.99.66.165:5432/k0s_prd?sslmode=require", description="PostgreSQL connection URL")
-    redis_url: str = Field(..., description="Redis connection URL")
-    qdrant_url: str = Field(default="http://localhost:6333", description="Qdrant URL")
-    qdrant_api_key: Optional[str] = Field(default=None, description="Qdrant API Key")
+    database_url: str = Field(default="postgres://postgres:BGxE9aWYJP5Ai7rhLkGeQUcnt8Y4hvnq3IM282m7OgEtKIF4QjmMUbIND07qCBR9@88.99.66.165:5432/k0s_prd?sslmode=require", description="External k0s PostgreSQL connection URL (market data cache — owned by another system, do not repoint)")
+    conversation_database_url: str = Field(..., description="Postgres DSN for Metis's own database (db-metis) — conversations, chat_messages, notifications")
+    redis_url: Optional[str] = Field(default=None, description="Redis connection URL (currently unused — no code path consumes it)")
     api_base_url: HttpUrl = Field(default="https://api.k0s.app/api/v1", description="API base URL")
     apollo_base_url: str = Field(default="http://apollo.internal:8000", description="Apollo ML API base URL")
     apollo_prediction_lookback_days: int = Field(default=90, description="Lookback window in days for Apollo predictions")
@@ -20,6 +19,8 @@ class Settings(BaseSettings):
     apollo_train_timeout_seconds: int = Field(default=600, description="Maximum wait in seconds for Apollo training to become usable")
     apollo_confidence_threshold: float = Field(default=0.35, description="Minimum Apollo confidence to treat a forecast as actionable")
     apollo_mape_threshold: float = Field(default=5.0, description="Maximum Apollo MAPE to treat a forecast as actionable")
+    pluto_base_url: str = Field(default="https://api.olympkusai.com/pluto/api/v1", description="Pluto personal-finance API base URL (via Nike gateway)")
+    pluto_request_timeout_seconds: float = Field(default=15.0, description="Timeout in seconds for Pluto API requests")
     max_concurrent_requests: int = Field(default=10, description="Maximum concurrent API requests")
 
     class Config:

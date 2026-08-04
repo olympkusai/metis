@@ -1,12 +1,20 @@
-"""Conversation history management using Qdrant vector store."""
+"""Conversation history management using Metis's own Postgres database (db-metis).
+
+Schema follows the "communication" domain documented in
+dbml/communication.md (conversations, chat_messages), with a few
+Metis-specific extensions: `embedding`/`metadata` columns on chat_messages,
+and a separate chat_message_feedback table (feedback is sparse and added
+after the message already exists, so it doesn't belong as nullable columns
+on every row).
+"""
 
 from typing import List, Dict, Any, Optional
 from datetime import datetime, UTC
 from enum import Enum
 from langchain_openai import OpenAIEmbeddings
-from app.storage.qdrant_client import QdrantVectorStore, get_qdrant_store
+from app.storage.pool import DatabasePool
+import json
 import uuid
-import hashlib
 
 
 class FeedbackRating(str, Enum):
@@ -23,28 +31,48 @@ class MessageRole(str, Enum):
     SYSTEM = "system"
 
 
+_conversation_db_pool: Optional[DatabasePool] = None
+
+
+def set_conversation_db_pool(pool: DatabasePool) -> None:
+    """Set the database pool for conversation history (db-metis)."""
+    global _conversation_db_pool
+    _conversation_db_pool = pool
+
+
+def _get_conversation_db_pool() -> DatabasePool:
+    if _conversation_db_pool is None:
+        raise RuntimeError("Conversation DB pool not initialized. Call set_conversation_db_pool() first.")
+    return _conversation_db_pool
+
+
+def _vector_literal(vector: List[float]) -> str:
+    """Formats a float list as a pgvector text literal, e.g. "[0.1,0.2]"."""
+    return "[" + ",".join(repr(v) for v in vector) + "]"
+
+
+def _parse_metadata(value: Any) -> Dict[str, Any]:
+    """asyncpg returns jsonb as raw text (no codec registered); decode it."""
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return value
+    return json.loads(value)
+
+
 class ConversationHistory:
-    """Conversation history manager using Qdrant."""
-    
-    def __init__(self, qdrant_store: Optional[QdrantVectorStore] = None):
+    """Conversation history manager backed by Metis's own Postgres (db-metis)."""
+
+    def __init__(self, pool: Optional[DatabasePool] = None):
         """Initialize conversation history manager.
-        
+
         Args:
-            qdrant_store: Qdrant store instance. If None, uses singleton.
+            pool: Conversation DB pool. If None, uses the singleton set via
+                `set_conversation_db_pool()` (done in app/main.py's lifespan).
         """
-        self.qdrant = qdrant_store or get_qdrant_store()
+        self.pool = pool or _get_conversation_db_pool()
         self.embeddings = OpenAIEmbeddings()
-    
-    def _generate_message_id(self, session_id: str, content: str) -> str:
-        """Generate unique message ID as UUID."""
-        # Generate deterministic UUID from session_id and content
-        content_hash = hashlib.sha256(f"{session_id}:{content}".encode()).hexdigest()
-        return str(uuid.UUID(hex=content_hash[:32]))
-    
-    def _generate_session_id(self, user_id: str) -> str:
-        """Generate unique session ID."""
-        return f"{user_id}:{uuid.uuid4().hex}"
-    
+
     async def save_message(
         self,
         user_id: str,
@@ -54,47 +82,41 @@ class ConversationHistory:
         metadata: Optional[Dict[str, Any]] = None,
     ) -> str:
         """Save a message to conversation history.
-        
+
         Args:
             user_id: User identifier
-            session_id: Session identifier
+            session_id: Session identifier (maps to conversations.id)
             role: Message role (user/assistant/system)
             content: Message content
             metadata: Additional metadata (symbol, timeframe, pipeline_summary, etc.)
-            
+
         Returns:
             Message ID
         """
-        # Generate embedding
         vector = self.embeddings.embed_query(content)
-        
-        # Generate message ID
-        message_id = self._generate_message_id(session_id, content)
-        
-        # Prepare payload with complete metadata
-        payload = {
-            "user_id": user_id,
-            "session_id": session_id,
-            "role": role.value,
-            "content": content,
-            "timestamp": datetime.now(UTC).isoformat(),
-            "deleted_at": None,
-            "feedback": None,
-            "feedback_rating": None,
-            "feedback_comment": None,
-            "metadata": metadata or {},
-        }
-        
-        # Store in Qdrant
-        await self.qdrant.upsert(
-            collection_name=QdrantVectorStore.CONVERSATION_HISTORY,
-            point_id=message_id,
-            vector=vector,
-            payload=payload,
+        message_id = str(uuid.uuid4())
+        now = datetime.now(UTC)
+
+        await self.pool.execute(
+            """
+            INSERT INTO conversations (id, user_id, created_by, created_at, updated_at)
+            VALUES ($1, $2, $2, $3, $3)
+            ON CONFLICT (id) DO UPDATE SET updated_at = EXCLUDED.updated_at
+            """,
+            session_id, user_id, now,
         )
-        
+        await self.pool.execute(
+            """
+            INSERT INTO chat_messages
+                (id, conversation_id, user_id, role, content, embedding, metadata, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6::vector, $7::jsonb, $8, $8)
+            """,
+            message_id, session_id, user_id, role.value, content,
+            _vector_literal(vector), json.dumps(metadata or {}), now,
+        )
+
         return message_id
-    
+
     async def get_conversation_history(
         self,
         user_id: str,
@@ -102,246 +124,178 @@ class ConversationHistory:
         limit: int = 20,
         include_deleted: bool = False,
     ) -> List[Dict[str, Any]]:
-        """Get conversation history for a specific session.
-        
+        """Get conversation history for a specific session, oldest first.
+
         Args:
             user_id: User identifier
             session_id: Session identifier
             limit: Maximum number of messages to retrieve
             include_deleted: Whether to include soft-deleted messages
-            
+
         Returns:
             List of messages ordered by timestamp (oldest first)
         """
-        # Get all messages for this session
-        filter_payload = {
-            "user_id": user_id,
-            "session_id": session_id,
-        }
-        
-        if not include_deleted:
-            filter_payload["deleted_at"] = None
-        
-        # Use a dummy vector to retrieve all matching messages
-        import random
-        dummy_vector = [random.random() for _ in range(1536)]
-        
-        results = await self.qdrant.search(
-            collection_name=QdrantVectorStore.CONVERSATION_HISTORY,
-            query_vector=dummy_vector,
-            limit=limit * 2,  # Fetch more to account for ordering
-            filter_payload=filter_payload,
+        deleted_clause = "" if include_deleted else "AND m.deleted_at IS NULL"
+        rows = await self.pool.fetch(
+            f"""
+            SELECT * FROM (
+                SELECT m.id, m.role, m.content, m.created_at, m.metadata,
+                       f.rating AS feedback_rating, f.comment AS feedback_comment,
+                       f.created_at AS feedback_at
+                FROM chat_messages m
+                LEFT JOIN chat_message_feedback f ON f.message_id = m.id
+                WHERE m.conversation_id = $1 AND m.user_id = $2 {deleted_clause}
+                ORDER BY m.created_at DESC
+                LIMIT $3
+            ) sub
+            ORDER BY sub.created_at ASC
+            """,
+            session_id, user_id, limit,
         )
-        
-        # Filter by deleted_at if needed (Qdrant filter might not handle None properly)
-        messages = []
-        for result in results:
-            payload = result.payload
-            if not include_deleted and payload.get("deleted_at") is not None:
-                continue
-            messages.append({
-                "message_id": str(result.id),
-                "role": payload.get("role"),
-                "content": payload.get("content"),
-                "timestamp": payload.get("timestamp"),
-                "metadata": payload.get("metadata", {}),
-                "feedback": payload.get("feedback"),
-                "feedback_rating": payload.get("feedback_rating"),
-                "feedback_comment": payload.get("feedback_comment"),
-            })
-        
-        # Sort by timestamp (oldest first for conversation flow)
-        messages.sort(key=lambda m: m["timestamp"])
-        
-        # Return last N messages
-        return messages[-limit:] if len(messages) > limit else messages
-    
+        return [self._row_to_message(r) for r in rows]
+
     async def get_global_context(
         self,
         user_id: str,
         limit: int = 10,
         exclude_session_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        """Get global context across all sessions.
-        
+        """Get global context across all sessions, newest first.
+
         Args:
             user_id: User identifier
             limit: Maximum number of messages to retrieve
             exclude_session_id: Optional session ID to exclude (current session)
-            
+
         Returns:
             List of recent messages across all sessions
         """
-        filter_payload = {
-            "user_id": user_id,
-            "deleted_at": None,
-        }
-        
-        # Note: Qdrant doesn't support "not equal" directly
-        # We'll filter after retrieval
-        
-        import random
-        dummy_vector = [random.random() for _ in range(1536)]
-        
-        results = await self.qdrant.search(
-            collection_name=QdrantVectorStore.CONVERSATION_HISTORY,
-            query_vector=dummy_vector,
-            limit=limit * 3,  # Fetch more for filtering
-            filter_payload=filter_payload,
-        )
-        
-        messages = []
-        for result in results:
-            payload = result.payload
-            if payload.get("deleted_at") is not None:
-                continue
-            if exclude_session_id and payload.get("session_id") == exclude_session_id:
-                continue
-            messages.append({
-                "message_id": str(result.id),
-                "session_id": payload.get("session_id"),
-                "role": payload.get("role"),
-                "content": payload.get("content"),
-                "timestamp": payload.get("timestamp"),
-                "metadata": payload.get("metadata", {}),
-            })
-        
-        # Sort by timestamp (newest first for context)
-        messages.sort(key=lambda m: m["timestamp"], reverse=True)
-        
-        return messages[:limit]
-    
+        if exclude_session_id:
+            rows = await self.pool.fetch(
+                """
+                SELECT m.id, m.conversation_id, m.role, m.content, m.created_at, m.metadata
+                FROM chat_messages m
+                WHERE m.user_id = $1 AND m.deleted_at IS NULL AND m.conversation_id != $2
+                ORDER BY m.created_at DESC
+                LIMIT $3
+                """,
+                user_id, exclude_session_id, limit,
+            )
+        else:
+            rows = await self.pool.fetch(
+                """
+                SELECT m.id, m.conversation_id, m.role, m.content, m.created_at, m.metadata
+                FROM chat_messages m
+                WHERE m.user_id = $1 AND m.deleted_at IS NULL
+                ORDER BY m.created_at DESC
+                LIMIT $2
+                """,
+                user_id, limit,
+            )
+
+        return [
+            {
+                "message_id": str(r["id"]),
+                "session_id": r["conversation_id"],
+                "role": r["role"],
+                "content": r["content"],
+                "timestamp": r["created_at"].isoformat(),
+                "metadata": _parse_metadata(r["metadata"]),
+            }
+            for r in rows
+        ]
+
     async def get_conversation_sessions(
         self,
         user_id: str,
         limit: int = 20,
     ) -> List[Dict[str, Any]]:
-        """Get all conversation sessions for a user.
-        
+        """Get all conversation sessions for a user, newest first.
+
         Args:
             user_id: User identifier
             limit: Maximum number of sessions to retrieve
-            
+
         Returns:
             List of sessions with metadata
         """
-        filter_payload = {
-            "user_id": user_id,
-            "deleted_at": None,
-        }
-        
-        import random
-        dummy_vector = [random.random() for _ in range(1536)]
-        
-        results = await self.qdrant.search(
-            collection_name=QdrantVectorStore.CONVERSATION_HISTORY,
-            query_vector=dummy_vector,
-            limit=limit * 10,  # Fetch many to aggregate by session
-            filter_payload=filter_payload,
+        rows = await self.pool.fetch(
+            """
+            SELECT
+                c.id AS session_id,
+                COUNT(m.id) AS message_count,
+                MIN(m.created_at) AS first_message,
+                MAX(m.created_at) AS last_message,
+                BOOL_OR(f.message_id IS NOT NULL) AS has_feedback
+            FROM conversations c
+            LEFT JOIN chat_messages m ON m.conversation_id = c.id AND m.deleted_at IS NULL
+            LEFT JOIN chat_message_feedback f ON f.message_id = m.id
+            WHERE c.user_id = $1 AND c.deleted_at IS NULL
+            GROUP BY c.id
+            HAVING COUNT(m.id) > 0
+            ORDER BY MAX(m.created_at) DESC
+            LIMIT $2
+            """,
+            user_id, limit,
         )
-        
-        # Aggregate by session_id
-        sessions: Dict[str, Dict[str, Any]] = {}
-        for result in results:
-            payload = result.payload
-            if payload.get("deleted_at") is not None:
-                continue
-            
-            session_id = payload.get("session_id")
-            if session_id not in sessions:
-                sessions[session_id] = {
-                    "session_id": session_id,
-                    "message_count": 0,
-                    "first_message": payload.get("timestamp"),
-                    "last_message": payload.get("timestamp"),
-                    "has_feedback": False,
-                }
-            
-            sessions[session_id]["message_count"] += 1
-            sessions[session_id]["last_message"] = max(
-                sessions[session_id]["last_message"],
-                payload.get("timestamp")
-            )
-            sessions[session_id]["first_message"] = min(
-                sessions[session_id]["first_message"],
-                payload.get("timestamp")
-            )
-            if payload.get("feedback"):
-                sessions[session_id]["has_feedback"] = True
-        
-        # Convert to list and sort by last_message (newest first)
-        session_list = list(sessions.values())
-        session_list.sort(key=lambda s: s["last_message"], reverse=True)
-        
-        return session_list[:limit]
-    
+
+        return [
+            {
+                "session_id": r["session_id"],
+                "message_count": r["message_count"],
+                "first_message": r["first_message"].isoformat() if r["first_message"] else None,
+                "last_message": r["last_message"].isoformat() if r["last_message"] else None,
+                "has_feedback": bool(r["has_feedback"]),
+            }
+            for r in rows
+        ]
+
     async def soft_delete_conversation(self, user_id: str, session_id: str) -> int:
         """Soft delete an entire conversation session.
-        
+
         Args:
             user_id: User identifier
             session_id: Session identifier
-            
+
         Returns:
             Number of messages deleted
         """
-        # Get all messages in session
-        messages = await self.get_conversation_history(
-            user_id=user_id,
-            session_id=session_id,
-            limit=1000,
-            include_deleted=False,
+        now = datetime.now(UTC)
+        await self.pool.execute(
+            "UPDATE conversations SET deleted_at = $1 WHERE id = $2 AND user_id = $3 AND deleted_at IS NULL",
+            now, session_id, user_id,
         )
-        
-        # Mark each as deleted
-        deleted_count = 0
-        for message in messages:
-            message_id = message["message_id"]
-            success = await self.soft_delete_message(user_id, message_id)
-            if success:
-                deleted_count += 1
-        
-        return deleted_count
-    
+        rows = await self.pool.fetch(
+            """
+            UPDATE chat_messages SET deleted_at = $1
+            WHERE conversation_id = $2 AND user_id = $3 AND deleted_at IS NULL
+            RETURNING id
+            """,
+            now, session_id, user_id,
+        )
+        return len(rows)
+
     async def soft_delete_message(self, user_id: str, message_id: str) -> bool:
         """Soft delete a specific message.
-        
+
         Args:
             user_id: User identifier
             message_id: Message identifier
-            
+
         Returns:
             True if deleted successfully
         """
-        try:
-            # Get the message
-            result = await self.qdrant.get_by_id(
-                collection_name=QdrantVectorStore.CONVERSATION_HISTORY,
-                point_id=message_id,
-            )
-            
-            if not result:
-                return False
-            
-            # Verify user ownership
-            if result.payload.get("user_id") != user_id:
-                return False
-            
-            # Update with deleted_at timestamp
-            result.payload["deleted_at"] = datetime.now(UTC).isoformat()
-            
-            # Re-upsert with updated payload
-            await self.qdrant.upsert(
-                collection_name=QdrantVectorStore.CONVERSATION_HISTORY,
-                point_id=message_id,
-                vector=result.vector or [0.0] * 1536,
-                payload=result.payload,
-            )
-            
-            return True
-        except Exception:
-            return False
-    
+        now = datetime.now(UTC)
+        row = await self.pool.fetchrow(
+            """
+            UPDATE chat_messages SET deleted_at = $1
+            WHERE id = $2 AND user_id = $3 AND deleted_at IS NULL
+            RETURNING id
+            """,
+            now, message_id, user_id,
+        )
+        return row is not None
+
     async def feedback_message(
         self,
         user_id: str,
@@ -350,47 +304,34 @@ class ConversationHistory:
         comment: Optional[str] = None,
     ) -> bool:
         """Add feedback to a specific message.
-        
+
         Args:
             user_id: User identifier
             message_id: Message identifier
             rating: Feedback rating
             comment: Optional comment
-            
+
         Returns:
             True if feedback added successfully
         """
-        try:
-            # Get the message
-            result = await self.qdrant.get_by_id(
-                collection_name=QdrantVectorStore.CONVERSATION_HISTORY,
-                point_id=message_id,
-            )
-            
-            if not result:
-                return False
-            
-            # Verify user ownership
-            if result.payload.get("user_id") != user_id:
-                return False
-            
-            # Update with feedback
-            result.payload["feedback"] = datetime.now(UTC).isoformat()
-            result.payload["feedback_rating"] = rating.value
-            result.payload["feedback_comment"] = comment
-            
-            # Re-upsert with updated payload
-            await self.qdrant.upsert(
-                collection_name=QdrantVectorStore.CONVERSATION_HISTORY,
-                point_id=message_id,
-                vector=result.vector or [0.0] * 1536,
-                payload=result.payload,
-            )
-            
-            return True
-        except Exception:
+        owner = await self.pool.fetchval(
+            "SELECT user_id FROM chat_messages WHERE id = $1 AND deleted_at IS NULL",
+            message_id,
+        )
+        if owner is None or owner != user_id:
             return False
-    
+
+        await self.pool.execute(
+            """
+            INSERT INTO chat_message_feedback (message_id, rating, comment, created_at)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (message_id) DO UPDATE
+            SET rating = EXCLUDED.rating, comment = EXCLUDED.comment, created_at = EXCLUDED.created_at
+            """,
+            message_id, rating.value, comment, datetime.now(UTC),
+        )
+        return True
+
     async def feedback_conversation(
         self,
         user_id: str,
@@ -399,38 +340,48 @@ class ConversationHistory:
         comment: Optional[str] = None,
     ) -> int:
         """Add feedback to an entire conversation session.
-        
+
         Args:
             user_id: User identifier
             session_id: Session identifier
             rating: Feedback rating
             comment: Optional comment
-            
+
         Returns:
             Number of messages updated with feedback
         """
-        # Get all messages in session
         messages = await self.get_conversation_history(
             user_id=user_id,
             session_id=session_id,
             limit=1000,
             include_deleted=False,
         )
-        
-        # Add feedback to each message
+
         updated_count = 0
         for message in messages:
-            message_id = message["message_id"]
             success = await self.feedback_message(
                 user_id=user_id,
-                message_id=message_id,
+                message_id=message["message_id"],
                 rating=rating,
                 comment=comment,
             )
             if success:
                 updated_count += 1
-        
+
         return updated_count
+
+    @staticmethod
+    def _row_to_message(row) -> Dict[str, Any]:
+        return {
+            "message_id": str(row["id"]),
+            "role": row["role"],
+            "content": row["content"],
+            "timestamp": row["created_at"].isoformat(),
+            "metadata": _parse_metadata(row["metadata"]),
+            "feedback": row["feedback_at"].isoformat() if row["feedback_at"] else None,
+            "feedback_rating": row["feedback_rating"],
+            "feedback_comment": row["feedback_comment"],
+        }
 
 
 # Singleton instance
