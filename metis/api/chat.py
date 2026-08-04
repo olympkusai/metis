@@ -219,22 +219,17 @@ async def streaming_chat(request: ChatRequest, authorization: Optional[str] = He
                 if hasattr(chunk, "tool_call_chunks") and chunk.tool_call_chunks:
                     continue
 
-                # Skip tokens from finance_orchestrator — they're either:
-                # (a) scope-validation classification ("OUT_OF_SCOPE"/"FINANCE_OK")
-                #     which is internal, or
-                # (b) a static greeting/out-of-scope AIMessage echo.
-                # Static messages are fake-streamed via the updates handler below.
-                if node == "finance_orchestrator":
+                # Skip tokens from nodes that don't produce user-facing text:
+                # - finance_orchestrator: internal classification only
+                # - finance_context: no LLM, static messages fake-streamed below
+                # - data_gathering: tool calls + CoT (shown via node_execution)
+                # - analysis: CoT only (shown via node_execution), not user text
+                if node in ("finance_orchestrator", "finance_context", "data_gathering", "analysis"):
                     continue
 
-                # Skip tokens from finance_context — it doesn't use an LLM,
-                # so any "messages" chunk is a static error AIMessage echo.
-                # Fake-streamed via the updates handler below.
-                if node == "finance_context":
-                    continue
-
-                # Large chunks (static greeting/out-of-scope messages) get
-                # fake-streamed into smaller pieces for a smoother UX.
+                # Only 'synthesis' produces the user-facing answer — stream
+                # its tokens in real time. Also handle 'finance_reasoning'
+                # for backward compat (old graph).
                 async for sse_line in _yield_token_events(content, node):
                     yield sse_line
 

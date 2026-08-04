@@ -35,7 +35,9 @@ from metis.agent.finance_prompts import (
     _FINANCE_GREETING,
     _FINANCE_OUT_OF_SCOPE,
     _FINANCE_ORCHESTRATOR_SYSTEM,
-    _FINANCE_REASONING_SYSTEM,
+    _FINANCE_DATA_GATHERING_SYSTEM,
+    _FINANCE_ANALYSIS_SYSTEM,
+    _FINANCE_SYNTHESIS_SYSTEM,
 )
 from metis.config import get_settings
 from metis.utils.cost_tracker import get_cost_tracker
@@ -66,6 +68,12 @@ class FinanceAgentState(BaseModel):
     # Finance persona context (fetched by finance_context_node from Pluto)
     finance_profile:    dict               = Field(default_factory=dict)
     finance_accounts:   list               = Field(default_factory=list)
+
+    # Data gathered by data_gathering_node (tool results)
+    gathered_data:      str                = ""
+
+    # Analysis produced by analysis_node (technical reasoning)
+    analysis_text:      str                = ""
 
     # Routing
     next_action:        NextAction         = NextAction.FINANCE_CONTEXT
@@ -588,48 +596,125 @@ async def finance_context_node(state: FinanceAgentState) -> dict:
         }
 
 
-async def finance_reasoning_node(state: FinanceAgentState, config: RunnableConfig) -> dict:
-    """LLM com finance_tools (relatórios sob demanda), contexto de perfil
-    financeiro + contas já carregado por finance_context_node.
-
-    The `config` parameter is injected by LangGraph and carries the streaming
-    callbacks that enable token-by-token streaming via `stream_mode="messages"`.
+async def data_gathering_node(state: FinanceAgentState, config: RunnableConfig) -> dict:
+    """Coleta dados via ferramentas. Não analisa, não responde ao usuário.
+    Apenas chama as ferramentas necessárias e devolve os dados brutos.
     """
     set_auth_token(state.auth_token)
-    llm = _make_llm(model="gpt-4o", temperature=0.2).bind_tools(finance_tools)
+    llm = _make_llm(model="gpt-4o", temperature=0.1).bind_tools(finance_tools)
 
     context_block = json.dumps(
         {"financial_profile": state.finance_profile, "accounts": state.finance_accounts},
         ensure_ascii=False, default=str,
     )
 
-    content, cot, status, _tool_msgs, steps = await _run_agent_loop(
+    content, cot, status, tool_msgs, steps = await _run_agent_loop(
         state,
         llm,
-        system_prompt=_FINANCE_REASONING_SYSTEM,
+        system_prompt=_FINANCE_DATA_GATHERING_SYSTEM,
         extra_context=f"[PERFIL FINANCEIRO E CONTAS DO USUÁRIO]\n{context_block}",
         clear_steps=True,
-        node_name="finance_reasoning",
+        node_name="data_gathering",
         enable_cot=True,
         tool_map_override=finance_tool_map,
         config=config,
     )
 
-    print(f"[finance_reasoning_node] CoT status={status.value}, cot_len={len(cot)}, answer_len={len(content)}")
-    if not cot:
-        print(f"[finance_reasoning_node] WARNING: empty CoT! answer preview: {content[:200]}")
+    # Gather all tool results as a single data block for the analysis node
+    gathered = "\n\n".join(
+        f"[{label}]\n{result[:3000]}" for label, result in steps
+    )
+    if not gathered:
+        # No tools called — use profile + accounts as the data
+        gathered = context_block
+
+    print(f"[data_gathering_node] tools_called={len(steps)}, cot_len={len(cot)}, data_len={len(gathered)}")
+
+    return {
+        **state.model_dump(),
+        "gathered_data": gathered,
+        "cot": cot,
+        "reasoning_trail": _append_reasoning(state.reasoning_trail, "data_gathering", cot, status),
+        "intermediate_steps_agent": steps,
+        "intermediate_steps_global": state.intermediate_steps_global + steps,
+        "next_action": NextAction.FINALIZE,
+    }
+
+
+async def analysis_node(state: FinanceAgentState, config: RunnableConfig) -> dict:
+    """Analisa os dados coletados com frameworks financeiros. Sem tools, sem
+    Markdown. Produz raciocínio técnico estruturado para o nó de síntese.
+    """
+    llm = _make_llm(model="gpt-4o", temperature=0.2)
+
+    context_block = json.dumps(
+        {"financial_profile": state.finance_profile, "accounts": state.finance_accounts},
+        ensure_ascii=False, default=str,
+    )
+
+    extra = (
+        f"[PERFIL FINANCEIRO E CONTAS DO USUÁRIO]\n{context_block}\n\n"
+        f"[DADOS COLETADOS PELAS FERRAMENTAS]\n{state.gathered_data}"
+    )
+
+    content, cot, status, _tool_msgs, steps = await _run_agent_loop(
+        state,
+        llm,
+        system_prompt=_FINANCE_ANALYSIS_SYSTEM,
+        extra_context=extra,
+        clear_steps=True,
+        node_name="analysis",
+        enable_cot=True,
+        tool_map_override=None,  # no tools for analysis
+        config=config,
+    )
+
+    # The analysis is the <thought> content (the <answer> should be empty)
+    analysis_text = cot if cot else content
+
+    print(f"[analysis_node] cot_len={len(cot)}, analysis_len={len(analysis_text)}")
+
+    return {
+        **state.model_dump(),
+        "analysis_text": analysis_text,
+        "cot": cot,
+        "reasoning_trail": _append_reasoning(state.reasoning_trail, "analysis", cot, status),
+        "next_action": NextAction.FINALIZE,
+    }
+
+
+async def synthesis_node(state: FinanceAgentState, config: RunnableConfig) -> dict:
+    """Transforma a análise técnica em resposta final em Markdown para o
+    usuário. Token streaming acontece aqui — o usuário vê a resposta sendo
+    digitada em tempo real.
+    """
+    llm = _make_llm(model="gpt-4o-mini", temperature=0.3)
+
+    extra = f"[ANÁLISE DO AGENTE ESPECIALISTA]\n{state.analysis_text}"
+
+    content, cot, status, _tool_msgs, steps = await _run_agent_loop(
+        state,
+        llm,
+        system_prompt=_FINANCE_SYNTHESIS_SYSTEM,
+        extra_context=extra,
+        clear_steps=True,
+        node_name="synthesis",
+        enable_cot=True,
+        tool_map_override=None,
+        config=config,
+    )
+
+    print(f"[synthesis_node] cot_len={len(cot)}, answer_len={len(content)}")
 
     # Safety: never return an empty answer
     if not content or not content.strip():
-        content = cot or "Não consegui gerar uma resposta. Tente reformular sua pergunta."
+        content = state.analysis_text or "Não consegui gerar uma resposta. Tente reformular sua pergunta."
 
     return {
         **state.model_dump(),
         "final_answer": content,
         "cot": cot,
-        "reasoning_trail": _append_reasoning(state.reasoning_trail, "finance_reasoning", cot, status),
-        "intermediate_steps_agent": steps,
-        "intermediate_steps_global": state.intermediate_steps_global + steps,
+        "reasoning_trail": _append_reasoning(state.reasoning_trail, "synthesis", cot, status),
         "next_action": NextAction.FINALIZE,
         "messages": state.messages + [AIMessage(content=content)],
     }
@@ -649,7 +734,9 @@ def build_finance_graph() -> Any:
 
     workflow.add_node("finance_orchestrator", finance_orchestrator_node)
     workflow.add_node("finance_context",      finance_context_node)
-    workflow.add_node("finance_reasoning",    finance_reasoning_node)
+    workflow.add_node("data_gathering",       data_gathering_node)
+    workflow.add_node("analysis",             analysis_node)
+    workflow.add_node("synthesis",            synthesis_node)
     workflow.add_node("finalize",             finalize_node)
 
     workflow.set_entry_point("finance_orchestrator")
@@ -662,11 +749,13 @@ def build_finance_graph() -> Any:
 
     workflow.add_conditional_edges(
         "finance_context",
-        lambda s: "finalize" if s.next_action == NextAction.FINALIZE else "finance_reasoning",
-        {"finalize": "finalize", "finance_reasoning": "finance_reasoning"},
+        lambda s: "finalize" if s.next_action == NextAction.FINALIZE else "data_gathering",
+        {"finalize": "finalize", "data_gathering": "data_gathering"},
     )
 
-    workflow.add_edge("finance_reasoning", "finalize")
+    workflow.add_edge("data_gathering", "analysis")
+    workflow.add_edge("analysis", "synthesis")
+    workflow.add_edge("synthesis", "finalize")
     workflow.add_edge("finalize", END)
 
     return workflow.compile()
