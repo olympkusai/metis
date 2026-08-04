@@ -197,6 +197,11 @@ async def streaming_chat(request: ChatRequest, authorization: Optional[str] = He
                 for node_name, state_update in payload.items():
                     accumulated_state.update(state_update)
 
+                    # Skip terminal/pass-through nodes that don't produce new
+                    # reasoning — they just re-emit inherited state (cot, etc).
+                    if node_name in ("finalize", "__end__"):
+                        continue
+
                     # Emit node_execution with CoT if available
                     thought = ""
                     if "cot" in state_update and state_update["cot"]:
