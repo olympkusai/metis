@@ -227,6 +227,12 @@ async def streaming_chat(request: ChatRequest, authorization: Optional[str] = He
                 if node == "finance_orchestrator":
                     continue
 
+                # Skip tokens from finance_context — it doesn't use an LLM,
+                # so any "messages" chunk is a static error AIMessage echo.
+                # Fake-streamed via the updates handler below.
+                if node == "finance_context":
+                    continue
+
                 # Large chunks (static greeting/out-of-scope messages) get
                 # fake-streamed into smaller pieces for a smoother UX.
                 async for sse_line in _yield_token_events(content, node):
@@ -247,6 +253,18 @@ async def streaming_chat(request: ChatRequest, authorization: Optional[str] = He
                     # now for a smooth UX.
                     if (
                         node_name == "finance_orchestrator"
+                        and state_update.get("final_answer")
+                        and state_update.get("next_action") == NextAction.FINALIZE.value
+                    ):
+                        async for sse_line in _yield_token_events(
+                            state_update["final_answer"], node_name
+                        ):
+                            yield sse_line
+
+                    # Same for finance_context when it short-circuits on
+                    # auth/Pluto errors — the error message is static text.
+                    if (
+                        node_name == "finance_context"
                         and state_update.get("final_answer")
                         and state_update.get("next_action") == NextAction.FINALIZE.value
                     ):

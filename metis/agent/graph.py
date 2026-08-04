@@ -486,7 +486,21 @@ async def finance_context_node(state: FinanceAgentState) -> dict:
             "cot": "Buscando seu perfil financeiro e contas no Pluto...",
         }
     except PlutoApiError as e:
-        error_msg = f"Não consegui acessar seus dados financeiros agora: {e}"
+        # Sanitize: don't leak internal API names, UUIDs, or status codes
+        # to the end user. Log the full error server-side instead.
+        error_detail = str(e)
+        if "404" in error_detail or "not found" in error_detail.lower():
+            error_msg = (
+                "Ainda não tenho seus dados financeiros cadastrados. "
+                "Configure seu perfil financeiro no app para que eu possa "
+                "te ajudar com contas, gastos e orçamento."
+            )
+        else:
+            error_msg = (
+                "Não consegui acessar seus dados financeiros agora. "
+                "Tente novamente em alguns instantes."
+            )
+        print(f"[finance_context_node] PlutoApiError: {error_detail}")
         return {
             **state.model_dump(),
             "final_answer": error_msg,
