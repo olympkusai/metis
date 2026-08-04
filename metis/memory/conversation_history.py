@@ -97,11 +97,12 @@ class ConversationHistory:
 
         await self.pool.execute(
             """
-            INSERT INTO conversations (id, user_id, created_by, created_at, updated_at)
-            VALUES ($1, $2, $2, $3, $3)
+            INSERT INTO conversations (id, user_id, created_by, created_at, updated_at, title)
+            VALUES ($1, $2, $2, $3, $3, $4)
             ON CONFLICT (id) DO UPDATE SET updated_at = EXCLUDED.updated_at
             """,
             session_id, user_id, now,
+            self._derive_title(content) if role == MessageRole.USER else None,
         )
         await self.pool.execute(
             """
@@ -221,6 +222,7 @@ class ConversationHistory:
             """
             SELECT
                 c.id AS session_id,
+                c.title AS title,
                 COUNT(m.id) AS message_count,
                 MIN(m.created_at) AS first_message,
                 MAX(m.created_at) AS last_message,
@@ -229,7 +231,7 @@ class ConversationHistory:
             LEFT JOIN chat_messages m ON m.conversation_id = c.id AND m.deleted_at IS NULL
             LEFT JOIN chat_message_feedback f ON f.message_id = m.id
             WHERE c.user_id = $1 AND c.deleted_at IS NULL
-            GROUP BY c.id
+            GROUP BY c.id, c.title
             HAVING COUNT(m.id) > 0
             ORDER BY MAX(m.created_at) DESC
             LIMIT $2
@@ -240,6 +242,7 @@ class ConversationHistory:
         return [
             {
                 "session_id": r["session_id"],
+                "title": r["title"] or "",
                 "message_count": r["message_count"],
                 "first_message": r["first_message"].isoformat() if r["first_message"] else None,
                 "last_message": r["last_message"].isoformat() if r["last_message"] else None,
@@ -367,6 +370,14 @@ class ConversationHistory:
                 updated_count += 1
 
         return updated_count
+
+    @staticmethod
+    def _derive_title(content: str, max_len: int = 60) -> str:
+        """Deriva um título curto a partir do conteúdo da primeira mensagem."""
+        text = content.strip().replace("\n", " ")
+        if len(text) <= max_len:
+            return text
+        return text[:max_len - 3] + "..."
 
     @staticmethod
     def _row_to_message(row) -> Dict[str, Any]:

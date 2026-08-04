@@ -20,6 +20,7 @@ class FeedbackRequest(BaseModel):
 
 class SessionResponse(BaseModel):
     session_id: str
+    title: str = ""
     message_count: int
     first_message: str
     last_message: str
