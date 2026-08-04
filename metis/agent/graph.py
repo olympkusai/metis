@@ -341,10 +341,17 @@ async def _run_agent_loop(
             )
             msgs.extend(tool_msgs)
             all_tool_msgs.extend(tool_msgs)
-        elif isinstance(response, (str, dict)) or hasattr(response, 'model_dump'):
-            if hasattr(response, 'model_dump'):
-                content = json.dumps(response.model_dump(), ensure_ascii=False, indent=2)
-            elif isinstance(response, dict):
+        elif hasattr(response, 'content'):
+            # AIMessage / AIMessageChunk — use .content (the actual text),
+            # NOT model_dump() which serializes the entire message object
+            # (metadata, usage, id, …) as JSON.
+            cot, answer = _extract_cot_and_answer(response.content) if enable_cot else ("", response.content)
+            if enable_cot and not cot and steps:
+                cot = _synthesize_cot_from_steps(steps)
+            status = NodeStatus.OK if (cot or not enable_cot) else NodeStatus.NO_COT
+            return answer, cot, status, all_tool_msgs, steps
+        elif isinstance(response, (str, dict)):
+            if isinstance(response, dict):
                 content = json.dumps(response, ensure_ascii=False, indent=2)
             else:
                 content = str(response)
@@ -354,7 +361,9 @@ async def _run_agent_loop(
             status = NodeStatus.OK if (cot or not enable_cot) else NodeStatus.NO_COT
             return answer, cot, status, all_tool_msgs, steps
         else:
-            cot, answer = _extract_cot_and_answer(response.content) if enable_cot else ("", response.content)
+            # Last-resort fallback for unexpected response types
+            content = str(response)
+            cot, answer = _extract_cot_and_answer(content) if enable_cot else ("", content)
             if enable_cot and not cot and steps:
                 cot = _synthesize_cot_from_steps(steps)
             status = NodeStatus.OK if (cot or not enable_cot) else NodeStatus.NO_COT
