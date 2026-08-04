@@ -308,4 +308,12 @@ async def streaming_chat(request: ChatRequest, authorization: Optional[str] = He
 
         yield f"data: {json.dumps(final_event)}\n\n"
 
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # disable proxy buffering (nginx/Railway edge)
+        },
+    )
