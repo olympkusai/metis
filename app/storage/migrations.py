@@ -100,11 +100,13 @@ async def run_migrations(pool) -> None:
 # the external k0s Postgres above. Schema follows the "communication"
 # domain documented in the cross-service dbml/communication.md, with a
 # few Metis-specific extensions (embedding, metadata, feedback table).
+#
+# pgvector was removed from the critical path: no feature consumes the
+# `embedding` column today (see app/memory/conversation_history.py).
+# The column is kept nullable and index-free so existing rows aren't
+# broken and re-adding pgvector later is a one-line migration
+# (`CREATE EXTENSION vector` + ivfflat index + embed_query call).
 # ─────────────────────────────────────────────────────────────
-
-CREATE_PGVECTOR_EXTENSION = """
-CREATE EXTENSION IF NOT EXISTS vector;
-"""
 
 CREATE_CONVERSATIONS_TABLE = """
 CREATE TABLE IF NOT EXISTS conversations (
@@ -123,10 +125,11 @@ CREATE INDEX IF NOT EXISTS idx_conversations_deleted_at ON conversations (delete
 """
 
 # `embedding`/`metadata` are Metis-specific extensions beyond the canonical
-# communication.md shape: embedding has no consumer yet (reserved for future
-# semantic recall over chat history), metadata carries per-message pipeline
-# info (reasoning steps, tools used, chain-of-thought) already produced by
-# app/api/chat.py on every assistant reply.
+# communication.md shape: `embedding` is reserved for future semantic recall
+# over chat history (no consumer yet — kept as a nullable plain column so the
+# table shape is stable; pgvector is not required to run this migration).
+# `metadata` carries per-message pipeline info (reasoning steps, tools used,
+# chain-of-thought) already produced by app/api/chat.py on every assistant reply.
 CREATE_CHAT_MESSAGES_TABLE = """
 CREATE TABLE IF NOT EXISTS chat_messages (
     id varchar PRIMARY KEY,
@@ -134,7 +137,7 @@ CREATE TABLE IF NOT EXISTS chat_messages (
     user_id varchar NOT NULL,
     role varchar NOT NULL,
     content text NOT NULL,
-    embedding vector(1536),
+    embedding float8[],
     metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
     created_at timestamptz NOT NULL DEFAULT now(),
     updated_at timestamptz NOT NULL DEFAULT now(),
@@ -145,7 +148,6 @@ CREATE INDEX IF NOT EXISTS idx_chat_messages_conversation_id ON chat_messages (c
 CREATE INDEX IF NOT EXISTS idx_chat_messages_user_id ON chat_messages (user_id);
 CREATE INDEX IF NOT EXISTS idx_chat_messages_conversation_id_created_at ON chat_messages (conversation_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_chat_messages_deleted_at ON chat_messages (deleted_at);
-CREATE INDEX IF NOT EXISTS idx_chat_messages_embedding ON chat_messages USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
 """
 
 # Feedback is sparse (most messages never get one) and added after the
@@ -192,7 +194,6 @@ async def run_conversation_migrations(pool) -> None:
         pool: Database connection pool for the conversation DB (not the
             external k0s pool passed to `run_migrations`).
     """
-    await pool.execute(CREATE_PGVECTOR_EXTENSION)
     await pool.execute(CREATE_CONVERSATIONS_TABLE)
     await pool.execute(CREATE_CHAT_MESSAGES_TABLE)
     await pool.execute(CREATE_CHAT_MESSAGE_FEEDBACK_TABLE)

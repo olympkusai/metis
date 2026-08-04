@@ -6,12 +6,17 @@ Metis-specific extensions: `embedding`/`metadata` columns on chat_messages,
 and a separate chat_message_feedback table (feedback is sparse and added
 after the message already exists, so it doesn't belong as nullable columns
 on every row).
+
+The `embedding` column is reserved for future semantic recall but is not
+populated today — no feature consumes it, so we avoid the OpenAI embedding
+call (latency + cost) and the pgvector extension dependency. Re-adding it
+later is a localized change: `CREATE EXTENSION vector`, alter the column
+type to `vector(1536)`, and call `embed_query` in `save_message`.
 """
 
 from typing import List, Dict, Any, Optional
 from datetime import datetime, UTC
 from enum import Enum
-from langchain_openai import OpenAIEmbeddings
 from app.storage.pool import DatabasePool
 import json
 import uuid
@@ -46,11 +51,6 @@ def _get_conversation_db_pool() -> DatabasePool:
     return _conversation_db_pool
 
 
-def _vector_literal(vector: List[float]) -> str:
-    """Formats a float list as a pgvector text literal, e.g. "[0.1,0.2]"."""
-    return "[" + ",".join(repr(v) for v in vector) + "]"
-
-
 def _parse_metadata(value: Any) -> Dict[str, Any]:
     """asyncpg returns jsonb as raw text (no codec registered); decode it."""
     if value is None:
@@ -71,7 +71,6 @@ class ConversationHistory:
                 `set_conversation_db_pool()` (done in app/main.py's lifespan).
         """
         self.pool = pool or _get_conversation_db_pool()
-        self.embeddings = OpenAIEmbeddings()
 
     async def save_message(
         self,
@@ -93,7 +92,6 @@ class ConversationHistory:
         Returns:
             Message ID
         """
-        vector = self.embeddings.embed_query(content)
         message_id = str(uuid.uuid4())
         now = datetime.now(UTC)
 
@@ -108,11 +106,11 @@ class ConversationHistory:
         await self.pool.execute(
             """
             INSERT INTO chat_messages
-                (id, conversation_id, user_id, role, content, embedding, metadata, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6::vector, $7::jsonb, $8, $8)
+                (id, conversation_id, user_id, role, content, metadata, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $7)
             """,
             message_id, session_id, user_id, role.value, content,
-            _vector_literal(vector), json.dumps(metadata or {}), now,
+            json.dumps(metadata or {}), now,
         )
 
         return message_id
