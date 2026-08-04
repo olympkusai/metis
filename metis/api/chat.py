@@ -102,7 +102,18 @@ async def chat(request: ChatRequest, authorization: Optional[str] = Header(None)
 
 @router.post("/streaming/chat")
 async def streaming_chat(request: ChatRequest, authorization: Optional[str] = Header(None)):
-    """Streaming endpoint that emits each node execution as an SSE event."""
+    """Streaming endpoint that emits SSE events in real time.
+
+    Uses two LangGraph stream modes simultaneously:
+    - "messages": token-by-token LLM output (real-time reasoning as it's generated)
+    - "updates": node completion events (CoT, final answer, state changes)
+
+    SSE event types emitted:
+    - { type: "node_start", node } — a node started executing
+    - { type: "token", node, content } — a token chunk from the LLM (live reasoning)
+    - { type: "node_execution", node, thought } — a node completed with its CoT
+    - { type: "completion", response, session_id } — final answer
+    """
     auth_token = _extract_bearer_token(authorization)
 
     session_id = request.session_id or f"{request.user_id}:{uuid.uuid4().hex}"
@@ -150,51 +161,56 @@ async def streaming_chat(request: ChatRequest, authorization: Optional[str] = He
             auth_token=auth_token,
         )
 
-        accumulated_state = {}
+        accumulated_state: dict = {}
+        current_node: str = ""
 
-        async for event in agent.astream(
+        # stream_mode=["messages", "updates"] gives us both token-level
+        # streaming AND node completion events in a single iteration.
+        async for mode, payload in agent.astream(
             initial_state,
             config={"recursion_limit": 60},
-            stream_mode="updates"
+            stream_mode=["messages", "updates"],
         ):
-            for node_name, state_update in event.items():
-                accumulated_state.update(state_update)
+            if mode == "messages":
+                # payload is (chunk, metadata) — chunk is an AIMessageChunk
+                # with token content, metadata tells us which node it came from.
+                chunk, metadata = payload
+                node = metadata.get("langgraph_node", current_node) if isinstance(metadata, dict) else current_node
+                current_node = node
 
-                step_data = {
-                    "node": node_name,
-                    "type": "node_execution",
-                    "timestamp": asyncio.get_event_loop().time(),
-                    "reasoning": "",
-                    "thought": ""
+                content = getattr(chunk, "content", "")
+                if not content:
+                    continue
+
+                # Skip tool call chunks (they have no text content)
+                if hasattr(chunk, "tool_call_chunks") and chunk.tool_call_chunks:
+                    continue
+
+                token_event = {
+                    "type": "token",
+                    "node": node,
+                    "content": content,
                 }
+                yield f"data: {json.dumps(token_event)}\n\n"
 
-                # Extract CoT (chain-of-thought) if available
-                if "cot" in state_update and state_update["cot"]:
-                    step_data["thought"] = state_update["cot"]
+            elif mode == "updates":
+                for node_name, state_update in payload.items():
+                    accumulated_state.update(state_update)
 
-                # Extract reasoning from messages if available
-                if "messages" in state_update:
-                    msgs = state_update["messages"]
-                    if msgs:
-                        last_message = msgs[-1]
-                        if hasattr(last_message, 'content') and last_message.content:
-                            content = last_message.content
-                            if isinstance(content, dict) and "content" in content:
-                                content = content["content"]
-                            elif isinstance(content, str):
-                                try:
-                                    parsed = json.loads(content)
-                                    if isinstance(parsed, dict) and "content" in parsed:
-                                        content = parsed["content"]
-                                except:
-                                    pass
+                    # Emit node_execution with CoT if available
+                    thought = ""
+                    if "cot" in state_update and state_update["cot"]:
+                        thought = state_update["cot"]
 
-                            if isinstance(content, str) and len(content) > 500:
-                                content = content[:500] + "..."
-                            step_data["reasoning"] = content
-
-                # Emit SSE event
-                yield f"data: {json.dumps(step_data)}\n\n"
+                    # Emit node_execution event (backward compat with afrodite)
+                    step_data = {
+                        "node": node_name,
+                        "type": "node_execution",
+                        "timestamp": asyncio.get_event_loop().time(),
+                        "reasoning": "",
+                        "thought": thought,
+                    }
+                    yield f"data: {json.dumps(step_data)}\n\n"
 
         final_event = {
             "node": "final",

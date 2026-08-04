@@ -24,6 +24,7 @@ from enum import Enum
 from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.runnables import RunnableConfig
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field, ConfigDict
@@ -228,6 +229,7 @@ async def _run_agent_loop(
     node_name: str = "unknown",
     enable_cot: bool = False,
     tool_map_override: dict | None = None,
+    config: RunnableConfig | None = None,
 ) -> tuple[str, str, NodeStatus, list[ToolMessage], list]:
     """Loop LLM → tool call → result para um agente especializado."""
     original_query = _latest_user_message(state.messages)
@@ -278,7 +280,7 @@ async def _run_agent_loop(
         response = None
         for attempt in range(MAX_RETRIES):
             try:
-                response = await llm.ainvoke(msgs, timeout=30)
+                response = await llm.ainvoke(msgs, config=config, timeout=30)
 
                 cost_tracker = get_cost_tracker()
                 if hasattr(response, 'response_metadata'):
@@ -337,7 +339,7 @@ async def _run_agent_loop(
 
     # Força finalização se exceder iterações
     try:
-        final = await llm.ainvoke(msgs + [HumanMessage(content="Sintetize os resultados obtidos até agora.")])
+        final = await llm.ainvoke(msgs + [HumanMessage(content="Sintetize os resultados obtidos até agora.")], config=config)
     except Exception as e:
         error_msg = f"[LLM ERROR on forced finalize]: {str(e)}"
         return error_msg, _failure_cot(node_name, error_msg), NodeStatus.ERROR, all_tool_msgs, steps
@@ -483,9 +485,12 @@ async def finance_context_node(state: FinanceAgentState) -> dict:
         }
 
 
-async def finance_reasoning_node(state: FinanceAgentState) -> dict:
+async def finance_reasoning_node(state: FinanceAgentState, config: RunnableConfig) -> dict:
     """LLM com finance_tools (relatórios sob demanda), contexto de perfil
     financeiro + contas já carregado por finance_context_node.
+
+    The `config` parameter is injected by LangGraph and carries the streaming
+    callbacks that enable token-by-token streaming via `stream_mode="messages"`.
     """
     set_auth_token(state.auth_token)
     llm = _make_llm(model="gpt-4o", temperature=0.2).bind_tools(finance_tools)
@@ -504,6 +509,7 @@ async def finance_reasoning_node(state: FinanceAgentState) -> dict:
         node_name="finance_reasoning",
         enable_cot=True,
         tool_map_override=finance_tool_map,
+        config=config,
     )
 
     return {
