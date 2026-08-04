@@ -117,6 +117,7 @@ def _extract_cot_and_answer(content: str) -> tuple[str, str]:
     <thought>...</thought><answer>...</answer>
 
     Retorna (cot, answer). Se não encontrar formato, retorna ("", content).
+    Fallback: se answer vazio, usa o conteúdo sem as tags thought.
     """
     thought_match = re.search(r'<thought>(.*?)</thought>', content, re.DOTALL)
     answer_match = re.search(r'<answer>(.*?)</answer>', content, re.DOTALL)
@@ -124,10 +125,18 @@ def _extract_cot_and_answer(content: str) -> tuple[str, str]:
     if thought_match and answer_match:
         cot = thought_match.group(1).strip()
         answer = answer_match.group(1).strip()
+        # Fallback: if answer is empty, use content without thought tags
+        if not answer:
+            answer = re.sub(r'<thought>.*?</thought>', '', content, flags=re.DOTALL).strip()
+            answer = re.sub(r'</?answer>', '', answer).strip()
         return cot, answer
     elif thought_match:
         cot = thought_match.group(1).strip()
         answer = re.sub(r'<thought>.*?</thought>', '', content, flags=re.DOTALL).strip()
+        # Also strip any answer tags
+        answer = re.sub(r'</?answer>', '', answer).strip()
+        if not answer:
+            answer = cot  # last resort: use the thought as the answer
         return cot, answer
     else:
         return "", content
@@ -511,6 +520,10 @@ async def finance_reasoning_node(state: FinanceAgentState, config: RunnableConfi
         tool_map_override=finance_tool_map,
         config=config,
     )
+
+    # Safety: never return an empty answer
+    if not content or not content.strip():
+        content = cot or "Não consegui gerar uma resposta. Tente reformular sua pergunta."
 
     return {
         **state.model_dump(),
