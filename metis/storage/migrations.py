@@ -85,10 +85,10 @@ CREATE INDEX IF NOT EXISTS idx_market_candles_latest
     ON market_candles (symbol, interval, close_time DESC)
     WHERE closed = true;
 
--- Index for day-aligned queries (date_trunc on close_time)
+-- Index for day-aligned queries (close_time for time-based filtering)
 -- Used for daily aggregation and time-based filtering
-CREATE INDEX IF NOT EXISTS idx_market_candles_date_trunc 
-    ON market_candles (symbol, interval, date_trunc('day', close_time));
+CREATE INDEX IF NOT EXISTS idx_market_candles_close_time
+    ON market_candles (symbol, interval, close_time);
 
 -- Composite index for symbol/interval filtering
 -- General purpose index for all queries filtering by symbol and interval

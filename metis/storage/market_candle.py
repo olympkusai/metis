@@ -26,7 +26,7 @@ class MarketCandleQueries:
         
         Optimized to use:
         - idx_market_candles_intraday_lookup for 1m candles
-        - idx_market_candles_date_trunc for day-aligned queries
+        - idx_market_candles_close_time for day-aligned queries
         - Materialized views for pre-aggregated data when available
         
         Args:
