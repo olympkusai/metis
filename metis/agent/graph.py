@@ -309,6 +309,17 @@ async def _run_agent_loop(
     # final summary.
     reasoning_lines: list[str] = []
 
+    # Human-readable names for each finance tool, so the CoT shows
+    # "Consultando gastos por categoria" instead of "Consultando get_spending_by_category".
+    _TOOL_LABELS: dict[str, str] = {
+        "get_spending_by_category": "gastos por categoria",
+        "get_cashflow": "fluxo de caixa",
+        "get_budget_progress": "progresso do orçamento",
+        "get_goal_summary": "resumo de metas",
+        "get_recurrences_due": "contas recorrentes a vencer",
+        "list_transactions_filtered": "transações filtradas",
+    }
+
     def _build_cot(final_cot: str) -> str:
         """Combine accumulated reasoning lines with the final thought."""
         if final_cot and reasoning_lines:
@@ -353,13 +364,17 @@ async def _run_agent_loop(
             # Record each tool call as a reasoning step
             for tc in response.tool_calls:
                 tool_name = tc.get("name", "unknown")
+                friendly = _TOOL_LABELS.get(tool_name, tool_name.replace("_", " "))
                 args = dict(tc.get("args") or {})
                 # Build a short human-readable description of the call
                 if args:
-                    arg_str = ", ".join(f"{k}={v}" for k, v in args.items() if k not in ("auth_token",))
-                    reasoning_lines.append(f"Consultando {tool_name}({arg_str})")
+                    arg_str = ", ".join(
+                        f"{k}={v}" for k, v in args.items()
+                        if k not in ("auth_token",) and v
+                    )
+                    reasoning_lines.append(f"Consultando {friendly}({arg_str})" if arg_str else f"Consultando {friendly}")
                 else:
-                    reasoning_lines.append(f"Consultando {tool_name}")
+                    reasoning_lines.append(f"Consultando {friendly}")
             tool_msgs, steps = await _execute_tools(
                 response, steps, cache=state.tool_cache,
                 tool_map_override=tool_map_override,
@@ -541,7 +556,7 @@ async def finance_context_node(state: FinanceAgentState) -> dict:
         client = get_pluto_client()
         profile = await client.get_financial_profile(token=state.auth_token)
         accounts = await client.list_accounts(token=state.auth_token)
-        cot_text = "Buscando seu perfil financeiro e contas no Pluto..."
+        cot_text = "Buscando seu perfil financeiro e contas..."
         return {
             **state.model_dump(),
             "finance_profile": profile,
