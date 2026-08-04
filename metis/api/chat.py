@@ -3,7 +3,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Optional
 from langchain_core.messages import HumanMessage, AIMessage
-from metis.agent.graph import get_finance_agent_graph, FinanceAgentState
+from metis.agent.graph import get_finance_agent_graph, FinanceAgentState, NextAction
 from metis.memory.conversation_history import (
     get_conversation_history,
     MessageRole,
@@ -13,6 +13,39 @@ import asyncio
 import uuid
 
 router = APIRouter()
+
+
+# ─────────────────────────────────────────────
+# Helpers for fake-streaming static messages
+# ─────────────────────────────────────────────
+
+# When the orchestrator short-circuits with a static greeting or out-of-scope
+# message, LangGraph emits the full AIMessage as a single "messages" chunk.
+# This splits large chunks into word groups with small delays so the frontend
+# gets a smooth streaming UX even for non-LLM responses.
+_STATIC_CHUNK_THRESHOLD = 80  # chars — below this, emit as-is
+_STATIC_CHUNK_DELAY = 0.02    # seconds between fake chunks
+
+
+async def _yield_token_events(content: str, node: str):
+    """Yield SSE token events, splitting large chunks for a streaming feel."""
+    if len(content) <= _STATIC_CHUNK_THRESHOLD:
+        yield f"data: {json.dumps({'type': 'token', 'node': node, 'content': content})}\n\n"
+        return
+
+    # Split into word groups of ~3-5 words for natural pacing
+    words = content.split(" ")
+    i = 0
+    while i < len(words):
+        group_size = 3 + (i % 3)  # 3, 4, 5, 3, 4, 5, ...
+        chunk_words = words[i:i + group_size]
+        chunk = " ".join(chunk_words)
+        # Preserve leading space if we're not at the start
+        if i > 0 and not chunk.startswith(" ") and not content[i - 1] == " ":
+            pass  # words.join handles spacing
+        yield f"data: {json.dumps({'type': 'token', 'node': node, 'content': chunk})}\n\n"
+        i += group_size
+        await asyncio.sleep(_STATIC_CHUNK_DELAY)
 
 
 class ChatRequest(BaseModel):
@@ -186,12 +219,18 @@ async def streaming_chat(request: ChatRequest, authorization: Optional[str] = He
                 if hasattr(chunk, "tool_call_chunks") and chunk.tool_call_chunks:
                     continue
 
-                token_event = {
-                    "type": "token",
-                    "node": node,
-                    "content": content,
-                }
-                yield f"data: {json.dumps(token_event)}\n\n"
+                # Skip tokens from finance_orchestrator — they're either:
+                # (a) scope-validation classification ("OUT_OF_SCOPE"/"FINANCE_OK")
+                #     which is internal, or
+                # (b) a static greeting/out-of-scope AIMessage echo.
+                # Static messages are fake-streamed via the updates handler below.
+                if node == "finance_orchestrator":
+                    continue
+
+                # Large chunks (static greeting/out-of-scope messages) get
+                # fake-streamed into smaller pieces for a smoother UX.
+                async for sse_line in _yield_token_events(content, node):
+                    yield sse_line
 
             elif mode == "updates":
                 for node_name, state_update in payload.items():
@@ -201,6 +240,20 @@ async def streaming_chat(request: ChatRequest, authorization: Optional[str] = He
                     # reasoning — they just re-emit inherited state (cot, etc).
                     if node_name in ("finalize", "__end__"):
                         continue
+
+                    # When the orchestrator short-circuits (greeting /
+                    # out-of-scope), it sets final_answer directly — no LLM
+                    # tokens were streamed, so fake-stream the static message
+                    # now for a smooth UX.
+                    if (
+                        node_name == "finance_orchestrator"
+                        and state_update.get("final_answer")
+                        and state_update.get("next_action") == NextAction.FINALIZE.value
+                    ):
+                        async for sse_line in _yield_token_events(
+                            state_update["final_answer"], node_name
+                        ):
+                            yield sse_line
 
                     # Emit node_execution with CoT if available
                     thought = ""

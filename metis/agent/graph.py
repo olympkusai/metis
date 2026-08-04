@@ -97,6 +97,7 @@ def _make_llm(model: str = _BASE_MODEL, temperature: float = 0.1, **kw) -> ChatO
         model=model,
         temperature=temperature,
         api_key=settings.openai_api_key,
+        streaming=True,
         **kw,
     )
 
