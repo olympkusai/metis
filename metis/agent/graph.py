@@ -155,6 +155,23 @@ def _failure_cot(node: str, reason: str) -> str:
     return f"Nó '{node}' não pôde concluir: {reason}"
 
 
+def _synthesize_cot_from_steps(steps: list[tuple[str, str]]) -> str:
+    """Fallback: sintetiza um CoT a partir das tool calls executadas quando
+    o LLM não produziu as tags <thought>/<answer> espontaneamente."""
+    if not steps:
+        return ""
+    tool_names = []
+    for label, _result in steps:
+        name = label.split(" [cached]")[0].strip()
+        if name not in tool_names:
+            tool_names.append(name)
+    if not tool_names:
+        return ""
+    if len(tool_names) == 1:
+        return f"Consultei {tool_names[0]} para obter os dados necessários."
+    return f"Consultei {', '.join(tool_names[:-1])} e {tool_names[-1]} para reunir os dados necessários."
+
+
 def _append_reasoning(
     trail: list[tuple[str, str, str]],
     node_name: str,
@@ -253,10 +270,11 @@ async def _run_agent_loop(
     cot_instruction = ""
     if enable_cot:
         cot_instruction = (
-            "\n\nFORMATO DE RESPOSTA OBRIGATÓRIO:\n"
+            "\n\nFORMATO DE RESPOSTA OBRIGATÓRIO (único):\n"
             "<thought>Resumo CONCISO do seu raciocínio (max 2-3 frases). "
             "Ex: 'Obtive o indicador X que está em Y, indicando Z.'</thought>\n"
-            "<answer>Sua resposta final aqui</answer>"
+            "<answer>Sua resposta final em Markdown aqui (siga as "
+            "diretrizes de estilo acima)</answer>"
         )
 
     enhanced_prompt = system_prompt + tool_instruction + cot_instruction
@@ -331,10 +349,14 @@ async def _run_agent_loop(
             else:
                 content = str(response)
             cot, answer = _extract_cot_and_answer(content) if enable_cot else ("", content)
+            if enable_cot and not cot and steps:
+                cot = _synthesize_cot_from_steps(steps)
             status = NodeStatus.OK if (cot or not enable_cot) else NodeStatus.NO_COT
             return answer, cot, status, all_tool_msgs, steps
         else:
             cot, answer = _extract_cot_and_answer(response.content) if enable_cot else ("", response.content)
+            if enable_cot and not cot and steps:
+                cot = _synthesize_cot_from_steps(steps)
             status = NodeStatus.OK if (cot or not enable_cot) else NodeStatus.NO_COT
             return answer, cot, status, all_tool_msgs, steps
 
@@ -354,6 +376,8 @@ async def _run_agent_loop(
         error_msg = f"[LLM ERROR on forced finalize]: {str(e)}"
         return error_msg, _failure_cot(node_name, error_msg), NodeStatus.ERROR, all_tool_msgs, steps
     cot, answer = _extract_cot_and_answer(final.content) if enable_cot else ("", final.content)
+    if enable_cot and not cot and steps:
+        cot = _synthesize_cot_from_steps(steps)
     status = NodeStatus.OK if (cot or not enable_cot) else NodeStatus.NO_COT
     return answer, cot, status, all_tool_msgs, steps
 
@@ -479,11 +503,13 @@ async def finance_context_node(state: FinanceAgentState) -> dict:
         client = get_pluto_client()
         profile = await client.get_financial_profile(token=state.auth_token)
         accounts = await client.list_accounts(token=state.auth_token)
+        cot_text = "Buscando seu perfil financeiro e contas no Pluto..."
         return {
             **state.model_dump(),
             "finance_profile": profile,
             "finance_accounts": accounts.get("accounts", accounts) if isinstance(accounts, dict) else accounts,
-            "cot": "Buscando seu perfil financeiro e contas no Pluto...",
+            "cot": cot_text,
+            "reasoning_trail": _append_reasoning(state.reasoning_trail, "finance_context", cot_text),
         }
     except PlutoApiError as e:
         # Sanitize: don't leak internal API names, UUIDs, or status codes
@@ -536,6 +562,10 @@ async def finance_reasoning_node(state: FinanceAgentState, config: RunnableConfi
         config=config,
     )
 
+    print(f"[finance_reasoning_node] CoT status={status.value}, cot_len={len(cot)}, answer_len={len(content)}")
+    if not cot:
+        print(f"[finance_reasoning_node] WARNING: empty CoT! answer preview: {content[:200]}")
+
     # Safety: never return an empty answer
     if not content or not content.strip():
         content = cot or "Não consegui gerar uma resposta. Tente reformular sua pergunta."
@@ -544,6 +574,7 @@ async def finance_reasoning_node(state: FinanceAgentState, config: RunnableConfi
         **state.model_dump(),
         "final_answer": content,
         "cot": cot,
+        "reasoning_trail": _append_reasoning(state.reasoning_trail, "finance_reasoning", cot, status),
         "intermediate_steps_agent": steps,
         "intermediate_steps_global": state.intermediate_steps_global + steps,
         "next_action": NextAction.FINALIZE,
