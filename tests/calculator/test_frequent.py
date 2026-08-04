@@ -3,9 +3,9 @@ import pytest
 import asyncio
 from datetime import datetime, timedelta
 
-from app.calculator.types import Candle, FeatureResult, IndicatorResult
-from app.calculator.frequent import FrequentCalculator, FrequentCalculation, PersistedCalculation, create_frequent_calculator
-from app.calculator.returns import ReturnsCalculator
+from metis.calculator.types import Candle, FeatureResult, IndicatorResult
+from metis.calculator.frequent import FrequentCalculator, FrequentCalculation, PersistedCalculation, create_frequent_calculator
+from metis.calculator.returns import ReturnsCalculator
 
 
 def generate_test_candles(count: int) -> list[Candle]:

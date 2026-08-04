@@ -1,6 +1,6 @@
 from datetime import UTC, datetime
 
-from app.agent.forecasting import (
+from metis.agent.forecasting import (
     assess_forecast_quality,
     build_prediction_window,
     calculate_error_pct,

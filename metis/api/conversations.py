@@ -3,7 +3,7 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 from typing import Optional, List
-from app.memory.conversation_history import (
+from metis.memory.conversation_history import (
     get_conversation_history,
     FeedbackRating,
 )

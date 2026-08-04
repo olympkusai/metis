@@ -7,18 +7,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 
 if __package__ in {None, ""}:
-    # Support direct execution via `python app/main.py` by ensuring the
-    # project root is searched before any installed `app` package.
+    # Support direct execution via `python metis/main.py` by ensuring the
+    # project root is searched before any installed `metis` package.
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.api import register_routes
-from app.apollo_client import close_apollo_client
-from app.pluto_client import close_pluto_client
-from app.config import get_settings
-from app.storage import DatabasePool
-from app.storage.migrations import run_migrations, run_conversation_migrations
-from app.tools import set_db_pool
-from app.memory.conversation_history import set_conversation_db_pool
+from metis.api import register_routes
+from metis.apollo_client import close_apollo_client
+from metis.pluto_client import close_pluto_client
+from metis.config import get_settings
+from metis.storage import DatabasePool
+from metis.storage.migrations import run_migrations, run_conversation_migrations
+from metis.tools import set_db_pool
+from metis.memory.conversation_history import set_conversation_db_pool
 
 
 # Global database pools
@@ -66,7 +66,7 @@ async def lifespan(app: FastAPI):
     await close_pluto_client()
 
 
-app = FastAPI(title="k0s - v0.0.1", lifespan=lifespan)
+app = FastAPI(title="Metis", lifespan=lifespan)
 
 # Configure CORS
 app.add_middleware(
@@ -85,7 +85,7 @@ register_routes(app)
 
 @app.get("/")
 async def root():
-    return {"message": "k0s - v0.0.1"}
+    return {"message": "Metis"}
 
 @app.get("/health")
 async def health():
@@ -93,4 +93,4 @@ async def health():
 
 
 if __name__ == "__main__":
-    uvicorn.run("app.main:app", host="0.0.0.0", port=8082, reload=False)
+    uvicorn.run("metis.main:app", host="0.0.0.0", port=8082, reload=False)

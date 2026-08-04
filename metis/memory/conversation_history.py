@@ -17,7 +17,7 @@ type to `vector(1536)`, and call `embed_query` in `save_message`.
 from typing import List, Dict, Any, Optional
 from datetime import datetime, UTC
 from enum import Enum
-from app.storage.pool import DatabasePool
+from metis.storage.pool import DatabasePool
 import json
 import uuid
 

@@ -7,7 +7,7 @@ abril/2026 onde substrings como "oi" em "bitcoin" disparavam saudação.
 """
 import pytest
 
-from app.agent.graph import _classify_intent, _normalize_text
+from metis.agent.graph import _classify_intent, _normalize_text
 
 
 # ───────── Normalization ─────────

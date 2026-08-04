@@ -20,7 +20,7 @@ RUN poetry config virtualenvs.create false \
     && poetry install --no-interaction --no-ansi --no-root
 
 # Copy application code
-COPY ./app ./app
+COPY ./metis ./metis
 
 # Set PYTHONPATH
 ENV PYTHONPATH=/app
@@ -29,4 +29,4 @@ ENV PYTHONPATH=/app
 EXPOSE 8082
 
 # Run the application
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8082", "--loop", "asyncio"]
+CMD ["uvicorn", "metis.main:app", "--host", "0.0.0.0", "--port", "8082", "--loop", "asyncio"]

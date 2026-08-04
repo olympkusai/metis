@@ -1,10 +1,10 @@
 [tool.poetry]
-name = "crypto-agent"
+name = "metis"
 version = "0.1.0"
-description = "Agente de Investimento Cripto com Raciocínio"
-authors = ["Your Name <you@example.com>"]
+description = "Metis — assistente de finanças pessoais (olympkusai)"
+authors = ["olympkusai <dev@olympkusai.com>"]
 readme = "README.md"
-packages = [{ include = "app" }]
+packages = [{ include = "metis" }]
 
 [tool.poetry.dependencies]
 python = "^3.14"

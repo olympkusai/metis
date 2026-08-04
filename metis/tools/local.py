@@ -3,12 +3,12 @@ from datetime import datetime, timedelta
 import json
 
 from langchain_core.tools import tool
-from app.storage.market_candle import MarketCandleQueries
-from app.storage.cache import CalculationCache
-from app.calculator.engine import CalculationEngine, CalculationRequest, create_calculation_engine
-from app.calculator.types import Candle
-from app.storage.models import MarketCandle
-from app.utils.timing import timed_async
+from metis.storage.market_candle import MarketCandleQueries
+from metis.storage.cache import CalculationCache
+from metis.calculator.engine import CalculationEngine, CalculationRequest, create_calculation_engine
+from metis.calculator.types import Candle
+from metis.storage.models import MarketCandle
+from metis.utils.timing import timed_async
 
 def _normalize_symbol(symbol: str) -> str:
     """Normaliza o símbolo para o formato BTCUSDT."""

@@ -9,12 +9,12 @@ from typing import Any, Optional
 
 import httpx
 
-from app.agent.schemas import (
+from metis.agent.schemas import (
     ApolloBacktestOutput,
     ApolloPredictionOutput,
     ApolloTrainingOutput,
 )
-from app.config import get_settings
+from metis.config import get_settings
 
 logger = logging.getLogger(__name__)
 

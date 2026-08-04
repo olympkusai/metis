@@ -4,7 +4,7 @@ Uses CalculationEngine and MarketCandleQueries for all calculations.
 """
 
 # Import local tools (use these for production - no external API calls)
-from app.tools.local import (
+from metis.tools.local import (
     get_live_price,
     get_indicators,
     calculate_risk,
@@ -23,7 +23,7 @@ from app.tools.local import (
 # Finance tools — separate list, never merged into all_tools (crypto). Keeps
 # the crypto pipeline's blast radius at zero and avoids exposing finance
 # tools to the LLM in nodes that have nothing to do with personal finance.
-from app.tools.finance import (
+from metis.tools.finance import (
     finance_tools,
     get_spending_by_category,
     get_cashflow,

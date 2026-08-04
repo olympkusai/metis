@@ -2,12 +2,12 @@
 import pytest
 from datetime import datetime, timedelta
 
-from app.calculator.types import Candle
-from app.calculator.batch import BatchCalculator, default_batch_calculator
-from app.calculator.engine import CalculationEngine, CalculationRequest, create_calculation_engine
-from app.calculator.returns import ReturnsCalculator
-from app.calculator.rsi import rsi_14
-from app.calculator.moving_average import ma_7
+from metis.calculator.types import Candle
+from metis.calculator.batch import BatchCalculator, default_batch_calculator
+from metis.calculator.engine import CalculationEngine, CalculationRequest, create_calculation_engine
+from metis.calculator.returns import ReturnsCalculator
+from metis.calculator.rsi import rsi_14
+from metis.calculator.moving_average import ma_7
 
 
 def generate_test_candles(count: int) -> list[Candle]:

@@ -5,7 +5,7 @@ Tests for deterministic extraction helpers in the orchestrator:
 """
 import pytest
 
-from app.agent.graph import (
+from metis.agent.graph import (
     AnalysisTimeframe,
     _extract_symbol,
     _extract_timeframe_hint,

@@ -1,6 +1,6 @@
 """Check which intervals have data in database and test aggregation.
 
-Debug utility. Reads DATABASE_URL from environment (or .env via app.config).
+Debug utility. Reads DATABASE_URL from environment (or .env via metis.config).
 Optional CLI args: SYMBOL DAYS (defaults to BTCUSDT, 30 days).
 """
 import asyncio
@@ -10,9 +10,9 @@ from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from app.config import get_settings
-from app.storage.market_candle import MarketCandleQueries
-from app.storage.pool import create_pool
+from metis.config import get_settings
+from metis.storage.market_candle import MarketCandleQueries
+from metis.storage.pool import create_pool
 
 
 async def check_intervals(symbol: str = "BTCUSDT", days: int = 30) -> None:

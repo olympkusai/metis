@@ -19,7 +19,7 @@ from contextvars import ContextVar
 
 from langchain_core.tools import tool
 
-from app.pluto_client import PlutoApiError, get_pluto_client
+from metis.pluto_client import PlutoApiError, get_pluto_client
 
 _auth_token: ContextVar[str] = ContextVar("finance_auth_token", default="")
 

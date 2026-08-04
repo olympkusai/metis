@@ -3,8 +3,8 @@
 Covers the bug where `state_update["assets"]` is `dict[str, AssetState]`
 (Pydantic objects) and the SSE layer tried to call `.get()` on them.
 """
-from app.api.chat import _as_dict
-from app.agent.graph import AssetState
+from metis.api.chat import _as_dict
+from metis.agent.graph import AssetState
 
 
 class TestAsDict:

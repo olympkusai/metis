@@ -5,7 +5,7 @@ next_action and that the build process is intact.
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 
-from app.agent.graph import (
+from metis.agent.graph import (
     NextAction,
     QuantAgentState,
     build_quant_graph,
@@ -48,7 +48,7 @@ class TestRouteAfterOrchestrator:
         return QuantAgentState(**kwargs)
 
     def test_finalize_action_routes_to_finalize(self):
-        from app.agent.graph import build_quant_graph
+        from metis.agent.graph import build_quant_graph
         # Reextrai a função interna via re-importação do módulo.
         # Como route_after_orchestrator é local, validamos via comportamento:
         # next_action=FINALIZE deve resultar em rota "finalize".

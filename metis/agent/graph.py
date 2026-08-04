@@ -31,8 +31,8 @@ import unicodedata
 from datetime import UTC, datetime
 from enum import Enum
 from functools import lru_cache
-from app.utils.timing import timed_async, timed
-from app.utils.cost_tracker import get_cost_tracker
+from metis.utils.timing import timed_async, timed
+from metis.utils.cost_tracker import get_cost_tracker
 from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -40,24 +40,24 @@ from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field, ConfigDict
 
-from app.tools import all_tools, finance_tools, set_auth_token
-from app.apollo_client import ApolloApiError, get_apollo_client
-from app.pluto_client import PlutoApiError, get_pluto_client
-from app.agent.finance_prompts import (
+from metis.tools import all_tools, finance_tools, set_auth_token
+from metis.apollo_client import ApolloApiError, get_apollo_client
+from metis.pluto_client import PlutoApiError, get_pluto_client
+from metis.agent.finance_prompts import (
     _FINANCE_GREETING,
     _FINANCE_OUT_OF_SCOPE,
     _FINANCE_ORCHESTRATOR_SYSTEM,
     _FINANCE_REASONING_SYSTEM,
 )
-from app.config import get_settings
-from app.agent.forecasting import (
+from metis.config import get_settings
+from metis.agent.forecasting import (
     assess_forecast_quality,
     build_prediction_window,
     calculate_error_pct,
     calculate_return_pct,
     overlay_forecast_on_signal,
 )
-from app.agent.schemas import (
+from metis.agent.schemas import (
     ApolloBacktestOutput,
     ApolloPredictionOutput,
     OrchestratorOutput,
@@ -72,19 +72,19 @@ from app.agent.schemas import (
     CVaROutput,
     MaxDrawdownOutput,
 )
-from app.agent.moe import MoESignalLayer
-from app.agent.quant_engine import (
+from metis.agent.moe import MoESignalLayer
+from metis.agent.quant_engine import (
     compute_signal_score,
     determine_risk_level,
     calculate_position_size,
 )
-from app.agent.trend_state import (
+from metis.agent.trend_state import (
     TrendStateMachine,
     MultiTimeframeInterpreter,
     TrendState,
     TrendDirection,
 )
-from app.agent.decision_engine import (
+from metis.agent.decision_engine import (
     DecisionEngine,
     DecisionOutput,
     MacroTrend,
@@ -92,7 +92,7 @@ from app.agent.decision_engine import (
     FinalSignal,
     SignalType,
 )
-from app.agent.portfolio import (
+from metis.agent.portfolio import (
     PortfolioState,
     PortfolioConstraints,
     check_portfolio_constraints,

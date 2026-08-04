@@ -3,24 +3,24 @@ import pytest
 from datetime import datetime, timedelta
 import math
 
-from app.calculator.types import Candle, FeatureResult, IndicatorResult
-from app.calculator.returns import ReturnsCalculator, LogReturnsCalculator
-from app.calculator.moving_average import MovingAverageCalculator, ma_7, ma_21, ma_50
-from app.calculator.volatility import VolatilityCalculator, volatility_7, volatility_21
-from app.calculator.volume_ratio import VolumeRatioCalculator
-from app.calculator.time_features import DayOfWeekCalculator, MonthCalculator
-from app.calculator.target import TargetCalculator
-from app.calculator.momentum import MomentumCalculator, momentum_30d
-from app.calculator.ewma import EWMACalculator, ewma_30d
-from app.calculator.ema_return import EMAReturnCalculator, ema_return_60
-from app.calculator.rsi import RSICalculator, rsi_14
-from app.calculator.macd import MACDCalculator, MACDSignalCalculator, macd, macd_signal
-from app.calculator.bollinger_bands import BollingerBandsCalculator, BBUpperCalculator, BBLowerCalculator, bb
-from app.calculator.cvar import CVaRCalculator, cvar_95
-from app.calculator.drawdown import MaxDrawdownCalculator, new_max_drawdown_calculator
-from app.calculator.risk_metrics import SharpeCalculator, CalmarCalculator, sharpe, calmar
-from app.calculator.bootstrap import BootstrapCalculator, bootstrap_20
-from app.calculator.aggregation import aggregate_ohlcv, INTERVAL_TO_MINUTES
+from metis.calculator.types import Candle, FeatureResult, IndicatorResult
+from metis.calculator.returns import ReturnsCalculator, LogReturnsCalculator
+from metis.calculator.moving_average import MovingAverageCalculator, ma_7, ma_21, ma_50
+from metis.calculator.volatility import VolatilityCalculator, volatility_7, volatility_21
+from metis.calculator.volume_ratio import VolumeRatioCalculator
+from metis.calculator.time_features import DayOfWeekCalculator, MonthCalculator
+from metis.calculator.target import TargetCalculator
+from metis.calculator.momentum import MomentumCalculator, momentum_30d
+from metis.calculator.ewma import EWMACalculator, ewma_30d
+from metis.calculator.ema_return import EMAReturnCalculator, ema_return_60
+from metis.calculator.rsi import RSICalculator, rsi_14
+from metis.calculator.macd import MACDCalculator, MACDSignalCalculator, macd, macd_signal
+from metis.calculator.bollinger_bands import BollingerBandsCalculator, BBUpperCalculator, BBLowerCalculator, bb
+from metis.calculator.cvar import CVaRCalculator, cvar_95
+from metis.calculator.drawdown import MaxDrawdownCalculator, new_max_drawdown_calculator
+from metis.calculator.risk_metrics import SharpeCalculator, CalmarCalculator, sharpe, calmar
+from metis.calculator.bootstrap import BootstrapCalculator, bootstrap_20
+from metis.calculator.aggregation import aggregate_ohlcv, INTERVAL_TO_MINUTES
 
 
 def generate_test_candles(count: int) -> list[Candle]:

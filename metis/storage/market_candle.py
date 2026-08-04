@@ -7,7 +7,7 @@ from typing import List
 
 from .pool import DatabasePool
 from .models import MarketCandle
-from app.utils.timing import timed_async
+from metis.utils.timing import timed_async
 
 
 class MarketCandleQueries:

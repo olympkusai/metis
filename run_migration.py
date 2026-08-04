@@ -1,6 +1,6 @@
 """Run database migration to create make_interval function.
 
-Reads DATABASE_URL from environment (or .env via app.config). Never commit
+Reads DATABASE_URL from environment (or .env via metis.config). Never commit
 credentials to source control.
 """
 import asyncio
@@ -9,9 +9,9 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from app.config import get_settings
-from app.storage.migrations import run_migrations
-from app.storage.pool import create_pool
+from metis.config import get_settings
+from metis.storage.migrations import run_migrations
+from metis.storage.pool import create_pool
 
 
 async def main() -> None:

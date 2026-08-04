@@ -12,7 +12,7 @@ from __future__ import annotations
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
-from app.agent.graph import (
+from metis.agent.graph import (
     AnalysisTimeframe,
     AssetState,
     QuantAgentState,
@@ -238,32 +238,32 @@ class TestComparativeIntent:
     ativo (ex.: 'bitcoin vs etherium' → heurística pega só BTC, LLM resgata ETH)."""
 
     def test_versus_token(self):
-        from app.agent.graph import _has_comparative_intent
+        from metis.agent.graph import _has_comparative_intent
         assert _has_comparative_intent("bitcoin vs ethereum")
         assert _has_comparative_intent("BTC versus ETH")
 
     def test_compare_verb(self):
-        from app.agent.graph import _has_comparative_intent
+        from metis.agent.graph import _has_comparative_intent
         assert _has_comparative_intent("compare bitcoin com etherium")
         assert _has_comparative_intent("comparar BTC e SOL")
 
     def test_better_than_phrase(self):
-        from app.agent.graph import _has_comparative_intent
+        from metis.agent.graph import _has_comparative_intent
         assert _has_comparative_intent("XRP é melhor que Chainlink?")
         assert _has_comparative_intent("ETH is better than BTC")
 
     def test_or_token(self):
-        from app.agent.graph import _has_comparative_intent
+        from metis.agent.graph import _has_comparative_intent
         assert _has_comparative_intent("compro BTC ou ETH?")
 
     def test_non_comparative_returns_false(self):
-        from app.agent.graph import _has_comparative_intent
+        from metis.agent.graph import _has_comparative_intent
         assert not _has_comparative_intent("como está o bitcoin?")
         assert not _has_comparative_intent("qual o preço do ETH?")
         assert not _has_comparative_intent("explica o que é DeFi")
 
     def test_empty_text_returns_false(self):
-        from app.agent.graph import _has_comparative_intent
+        from metis.agent.graph import _has_comparative_intent
         assert not _has_comparative_intent("")
         assert not _has_comparative_intent(None)  # type: ignore[arg-type]
 
