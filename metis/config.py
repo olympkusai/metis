@@ -5,10 +5,10 @@ from typing import Optional
 
 class Settings(BaseSettings):
     openai_api_key: str = Field(..., description="OpenAI API Key")
-    database_url: str = Field(default="postgres://postgres:BGxE9aWYJP5Ai7rhLkGeQUcnt8Y4hvnq3IM282m7OgEtKIF4QjmMUbIND07qCBR9@88.99.66.165:5432/k0s_prd?sslmode=require", description="External k0s PostgreSQL connection URL (market data cache — owned by another system, do not repoint)")
-    conversation_database_url: str = Field(..., description="Postgres DSN for Metis's own database (db-metis) — conversations, chat_messages, notifications")
+    database_url: str = Field(..., description="Postgres DSN for db-metis (market data, calculator tables)")
+    conversation_database_url: str = Field(..., description="Postgres DSN for db-metis (conversations, chat_messages, notifications)")
     redis_url: Optional[str] = Field(default=None, description="Redis connection URL (currently unused — no code path consumes it)")
-    api_base_url: HttpUrl = Field(default="https://api.k0s.app/api/v1", description="API base URL")
+    api_base_url: HttpUrl = Field(default="https://api.olympkusai.com/api/v1", description="API base URL")
     apollo_base_url: str = Field(default="http://apollo.internal:8000", description="Apollo ML API base URL")
     apollo_prediction_lookback_days: int = Field(default=90, description="Lookback window in days for Apollo predictions")
     apollo_train_lookback_days: int = Field(default=365, description="Lookback window in days for Apollo model training")

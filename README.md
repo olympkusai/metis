@@ -38,8 +38,8 @@ LangGraph Agent (metis.agent.graph)
   │
   ↓
 Bancos de dados
-  ├── db-metis (Postgres próprio)     → conversations, chat_messages, notifications
-  └── k0s Postgres (externo, read-only) → market_candles (cache de dados de mercado)
+  └── db-metis (Postgres no Railway)  → market_candles, calculator tables,
+                                        conversations, chat_messages, notifications
   │
   ↓
 Serviços externos
@@ -80,7 +80,7 @@ metis/
 │   ├── storage/              # camada de dados (Postgres)
 │   │   ├── pool.py           # DatabasePool (asyncpg)
 │   │   ├── migrations.py     # DDL: tabelas calculator + conversation schema
-│   │   ├── market_candle.py  # leitura de market_candles (k0s Postgres)
+│   │   ├── market_candle.py  # queries de market_candles (db-metis)
 │   │   ├── cache.py, crud.py, models.py
 │   ├── apollo_client.py      # cliente HTTP Apollo (ML)
 │   ├── pluto_client.py       # cliente HTTP Pluto (finanças pessoais)
@@ -91,7 +91,7 @@ metis/
 ├── Dockerfile
 ├── docker-compose.yml
 ├── pyproject.toml            # Poetry, pacote `metis`
-├── run_migration.py          # script: rodar migrations do k0s Postgres
+├── run_migration.py          # script: rodar migrations do db-metis
 ├── check_db_intervals.py     # debug: checar disponibilidade de candles
 └── .env.example              # template de variáveis de ambiente
 ```
@@ -102,7 +102,6 @@ metis/
 - Poetry
 - Docker (opcional, para rodar local via docker-compose)
 - Acesso ao db-metis (Postgres no Railway)
-- Acesso ao k0s Postgres (externo, read-only — cache de market data)
 - OPENAI_API_KEY
 - APOLLO_BASE_URL (serviço Apollo ML)
 - PLUTO_BASE_URL (serviço Pluto finanças pessoais)
@@ -137,11 +136,11 @@ docker-compose up --build
 | Variável | Descrição |
 |----------|-----------|
 | `OPENAI_API_KEY` | Chave da OpenAI (LLM) |
-| `CONVERSATION_DATABASE_URL` | DSN do db-metis (Postgres próprio — conversas) |
-| `DATABASE_URL` | DSN do k0s Postgres (externo, read-only — market data) |
+| `CONVERSATION_DATABASE_URL` | DSN do db-metis (conversas, chat_messages, notifications) |
+| `DATABASE_URL` | DSN do db-metis (market_candles, calculator tables) |
 | `APOLLO_BASE_URL` | URL base do serviço Apollo (ML) |
 | `PLUTO_BASE_URL` | URL base do serviço Pluto (finanças pessoais) |
-| `API_BASE_URL` | URL base da API de dados cripto (k0s.app) |
+| `API_BASE_URL` | URL base da API de dados cripto (olympkusai) |
 
 ## Endpoints
 
@@ -185,14 +184,20 @@ docker-compose up --build
 
 ## Banco de dados (db-metis)
 
-Postgres próprio, schema seguindo o domínio "communication" (dbml/communication.md):
+Postgres no Railway. Todas as tabelas do Metis vivem no mesmo banco:
 
+**Calculator / market data** (`run_migrations`):
+- **`market_candles`** — candles de mercado (symbol, interval, OHLCV, close_time, closed)
+- **`frequent_calculations`** — cache de cálculos frequentes
+- **`persisted_calculations`** — cache de cálculos persistidos com expiração
+
+**Conversation schema** (`run_conversation_migrations`):
 - **`conversations`** — sessões de conversa (id, user_id, title, timestamps, soft-delete)
 - **`chat_messages`** — mensagens (role, content, metadata jsonb, embedding reservado, soft-delete)
 - **`chat_message_feedback`** — feedback por mensagem (rating, comment)
 - **`notifications`** — notificações (reservado, sem consumidor ainda)
 
-Migrations rodam automaticamente no startup (`run_conversation_migrations` em `metis/storage/migrations.py`).
+Migrations rodam automaticamente no startup (`metis/storage/migrations.py`).
 
 A coluna `embedding` em `chat_messages` é reservada para recall semântico futuro — hoje não é populada nem consumida por nenhuma feature. Quando o feature for implementado, re-adicionar pgvector é localizado: `CREATE EXTENSION vector` + `ALTER COLUMN embedding TYPE vector(1536)` + índice ivfflat + chamada `embed_query` no `save_message`.
 
@@ -207,7 +212,7 @@ poetry run python -m pytest
 ## Scripts auxiliares
 
 ```bash
-# Rodar migrations do k0s Postgres (make_interval, tabelas calculator)
+# Rodar migrations do db-metis (make_interval, calculator tables, market_candles)
 poetry run python run_migration.py
 
 # Checar disponibilidade de candles por intervalo

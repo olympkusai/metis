@@ -31,7 +31,7 @@ async def lifespan(app: FastAPI):
     """Lifespan manager for database pool initialization."""
     global _db_pool, _conversation_db_pool
 
-    # Startup — external k0s Postgres (market data cache, owned by another system)
+    # Startup — db-metis Postgres (market data + calculator tables)
     settings = get_settings()
     _db_pool = await DatabasePool.create(
         dsn=settings.database_url,
@@ -43,7 +43,7 @@ async def lifespan(app: FastAPI):
     print(f"[MAIN] Database pool initialized with {settings.database_url}")
     print(f"[MAIN] Pool size: min=10, max=50")
 
-    # Startup — Metis's own Postgres (db-metis: conversations, chat_messages, notifications)
+    # Startup — db-metis Postgres (conversations, chat_messages, notifications)
     _conversation_db_pool = await DatabasePool.create(
         dsn=settings.conversation_database_url,
         min_size=5,
@@ -73,8 +73,9 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:8080",
-        "https://k0s.app",
-        "https://www.k0s.app",
+        "https://olympkusai.com",
+        "https://www.olympkusai.com",
+        "https://api.olympkusai.com",
     ],
     allow_credentials=True,
     allow_methods=["*"],  # Allows all methods

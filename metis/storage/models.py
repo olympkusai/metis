@@ -1,4 +1,4 @@
-"""Database models for frequent calculations and market candles (read-only)."""
+"""Database models for frequent calculations and market candles."""
 from datetime import datetime
 from dataclasses import dataclass
 from typing import Any
@@ -6,10 +6,7 @@ from typing import Any
 
 @dataclass
 class MarketCandle:
-    """Represents a market candle (READ-ONLY).
-    
-    Metis only reads from this table, never writes.
-    """
+    """Represents a market candle."""
     symbol: str = ""
     interval: str = ""
     open_time: datetime | None = None

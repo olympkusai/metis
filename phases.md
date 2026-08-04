@@ -64,7 +64,7 @@ Este documento divide o plano de implementação em fases sequenciais para facil
 ### Tarefas
 - [x] Implementar `get_indicators` (RSI, MACD, médias, OHLCV)
 - [x] Implementar `calculate_risk` (VaR, CVaR, Sharpe, drawdown)
-- [x] Implementar integração com API externa (k0s.app) via HTTP REST
+- [x] Implementar integração com API externa (olympkusai) via HTTP REST
 - [ ] Implementar `predict_future` (integração com modelo ML)
 - [ ] Implementar `optimize_portfolio` (Markowitz)
 - [ ] Criar modelos ML (Transformer + XGBoost)

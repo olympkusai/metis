@@ -1,4 +1,4 @@
-"""Run database migration to create make_interval function.
+"""Run database migrations for db-metis (make_interval, calculator tables, market_candles).
 
 Reads DATABASE_URL from environment (or .env via metis.config). Never commit
 credentials to source control.

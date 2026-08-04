@@ -1,7 +1,4 @@
-"""Read-only queries for market_candle table.
-
-Metis only reads from market_candle table, never writes.
-"""
+"""Queries for market_candles table."""
 from datetime import datetime
 from typing import List
 
@@ -11,7 +8,7 @@ from metis.utils.timing import timed_async
 
 
 class MarketCandleQueries:
-    """Read-only queries for market_candle table."""
+    """Queries for market_candles table."""
     
     def __init__(self, pool: DatabasePool):
         self.pool = pool

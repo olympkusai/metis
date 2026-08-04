@@ -1,4 +1,4 @@
-"""Database migration scripts for calculator tables."""
+"""Database migration scripts for Metis database (db-metis)."""
 
 # Migration for make_interval function (PostgreSQL interval function)
 CREATE_MAKE_INTERVAL_FUNCTION = """
@@ -56,9 +56,23 @@ CREATE INDEX IF NOT EXISTS idx_persisted_calculations_cache_lookup
     ON persisted_calculations (symbol, interval, calculation_type, name, expires_at);
 """
 
-# Migration for market_candles table indexes (table is managed externally, Metis only reads)
-# These indexes optimize the query patterns used in MarketCandleQueries
-CREATE_MARKET_CANDLES_INDEXES = """
+# Migration for market_candles table — Metis owns this table.
+CREATE_MARKET_CANDLES_TABLE = """
+CREATE TABLE IF NOT EXISTS market_candles (
+    symbol VARCHAR(50) NOT NULL,
+    interval VARCHAR(20) NOT NULL,
+    open_time TIMESTAMPTZ NOT NULL,
+    close_time TIMESTAMPTZ NOT NULL,
+    open_price NUMERIC(20, 8) NOT NULL,
+    high_price NUMERIC(20, 8) NOT NULL,
+    low_price NUMERIC(20, 8) NOT NULL,
+    close_price NUMERIC(20, 8) NOT NULL,
+    base_volume NUMERIC(28, 8) NOT NULL DEFAULT 0,
+    quote_volume NUMERIC(28, 8) NOT NULL DEFAULT 0,
+    closed BOOLEAN NOT NULL DEFAULT FALSE,
+    received_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 -- Covering index for intraday candle lookups (symbol, interval, close_time)
 -- Used by get_candles for 1m candles and aggregation queries
 CREATE INDEX IF NOT EXISTS idx_market_candles_intraday_lookup 
@@ -92,17 +106,17 @@ async def run_migrations(pool) -> None:
     await pool.execute(CREATE_MAKE_INTERVAL_FUNCTION)
     await pool.execute(CREATE_FREQUENT_CALCULATIONS_TABLE)
     await pool.execute(CREATE_PERSISTED_CALCULATIONS_TABLE)
-    await pool.execute(CREATE_MARKET_CANDLES_INDEXES)
+    await pool.execute(CREATE_MARKET_CANDLES_TABLE)
 
 
 # ─────────────────────────────────────────────────────────────
-# Conversation DB (db-metis) — Metis's own database, separate from
-# the external k0s Postgres above. Schema follows the "communication"
-# domain documented in the cross-service dbml/communication.md, with a
-# few Metis-specific extensions (embedding, metadata, feedback table).
+# Conversation schema — runs on the same db-metis Postgres. Schema
+# follows the "communication" domain documented in the cross-service
+# dbml/communication.md, with a few Metis-specific extensions
+# (embedding, metadata, feedback table).
 #
 # pgvector was removed from the critical path: no feature consumes the
-# `embedding` column today (see app/memory/conversation_history.py).
+# `embedding` column today (see metis/memory/conversation_history.py).
 # The column is kept nullable and index-free so existing rows aren't
 # broken and re-adding pgvector later is a one-line migration
 # (`CREATE EXTENSION vector` + ivfflat index + embed_query call).
@@ -188,11 +202,10 @@ CREATE INDEX IF NOT EXISTS idx_notifications_deleted_at ON notifications (delete
 
 
 async def run_conversation_migrations(pool) -> None:
-    """Run migrations for Metis's own conversation database (db-metis).
+    """Run migrations for the conversation schema (db-metis).
 
     Args:
-        pool: Database connection pool for the conversation DB (not the
-            external k0s pool passed to `run_migrations`).
+        pool: Database connection pool for db-metis.
     """
     await pool.execute(CREATE_CONVERSATIONS_TABLE)
     await pool.execute(CREATE_CHAT_MESSAGES_TABLE)
