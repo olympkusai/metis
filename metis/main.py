@@ -34,13 +34,13 @@ async def lifespan(app: FastAPI):
     # Startup — db-metis Postgres (market data + calculator tables)
     settings = get_settings()
     _db_pool = await DatabasePool.create(
-        dsn=settings.database_url,
+        dsn=settings.database_dsn,
         min_size=10,
         max_size=50,
     )
     await run_migrations(_db_pool)
     set_db_pool(_db_pool)
-    print(f"[MAIN] Database pool initialized with {settings.database_url}")
+    print(f"[MAIN] Database pool initialized with {settings.database_dsn}")
     print(f"[MAIN] Pool size: min=10, max=50")
 
     # Startup — db-metis Postgres (conversations, chat_messages, notifications)

@@ -137,7 +137,7 @@ docker-compose up --build
 |----------|-----------|
 | `OPENAI_API_KEY` | Chave da OpenAI (LLM) |
 | `CONVERSATION_DATABASE_URL` | DSN do db-metis (conversas, chat_messages, notifications) |
-| `DATABASE_URL` | DSN do db-metis (market_candles, calculator tables) |
+| `DATABASE_DSN` | DSN do db-metis (market_candles, calculator tables) |
 | `APOLLO_BASE_URL` | URL base do serviço Apollo (ML) |
 | `PLUTO_BASE_URL` | URL base do serviço Pluto (finanças pessoais) |
 | `API_BASE_URL` | URL base da API de dados cripto (olympkusai) |

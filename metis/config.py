@@ -5,7 +5,7 @@ from typing import Optional
 
 class Settings(BaseSettings):
     openai_api_key: str = Field(..., description="OpenAI API Key")
-    database_url: str = Field(..., description="Postgres DSN for db-metis (market data, calculator tables)")
+    database_dsn: str = Field(..., description="Postgres DSN for db-metis (market data, calculator tables)")
     conversation_database_url: str = Field(..., description="Postgres DSN for db-metis (conversations, chat_messages, notifications)")
     redis_url: Optional[str] = Field(default=None, description="Redis connection URL (currently unused — no code path consumes it)")
     api_base_url: HttpUrl = Field(default="https://api.olympkusai.com/api/v1", description="API base URL")

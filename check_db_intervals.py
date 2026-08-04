@@ -1,6 +1,6 @@
 """Check which intervals have data in database and test aggregation.
 
-Debug utility. Reads DATABASE_URL from environment (or .env via metis.config).
+Debug utility. Reads DATABASE_DSN from environment (or .env via metis.config).
 Optional CLI args: SYMBOL DAYS (defaults to BTCUSDT, 30 days).
 """
 import asyncio
@@ -16,10 +16,10 @@ from metis.storage.pool import create_pool
 
 
 async def check_intervals(symbol: str = "BTCUSDT", days: int = 30) -> None:
-    dsn = get_settings().database_url
+    dsn = get_settings().database_dsn
     if not dsn:
         raise SystemExit(
-            "DATABASE_URL is not configured. Set it in .env or as an environment variable."
+            "DATABASE_DSN is not configured. Set it in .env or as an environment variable."
         )
 
     pool = await create_pool(dsn)

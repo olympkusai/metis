@@ -1,6 +1,6 @@
 """Run database migrations for db-metis (make_interval, calculator tables, market_candles).
 
-Reads DATABASE_URL from environment (or .env via metis.config). Never commit
+Reads DATABASE_DSN from environment (or .env via metis.config). Never commit
 credentials to source control.
 """
 import asyncio
@@ -15,10 +15,10 @@ from metis.storage.pool import create_pool
 
 
 async def main() -> None:
-    dsn = get_settings().database_url
+    dsn = get_settings().database_dsn
     if not dsn:
         raise SystemExit(
-            "DATABASE_URL is not configured. Set it in .env or as an environment variable."
+            "DATABASE_DSN is not configured. Set it in .env or as an environment variable."
         )
 
     pool = await create_pool(dsn)
