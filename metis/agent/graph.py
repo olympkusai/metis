@@ -304,6 +304,21 @@ async def _run_agent_loop(
     previous_step_count = len(steps)
     no_progress_count = 0
 
+    # Accumulate each tool call as a reasoning step so the CoT is a real
+    # chain (step 1 → step 2 → … → final thought) instead of just the
+    # final summary.
+    reasoning_lines: list[str] = []
+
+    def _build_cot(final_cot: str) -> str:
+        """Combine accumulated reasoning lines with the final thought."""
+        if final_cot and reasoning_lines:
+            return "\n".join(reasoning_lines + [final_cot])
+        if final_cot:
+            return final_cot
+        if reasoning_lines:
+            return "\n".join(reasoning_lines)
+        return ""
+
     for iteration in range(MAX_ITERATIONS):
         response = None
         for attempt in range(MAX_RETRIES):
@@ -335,6 +350,16 @@ async def _run_agent_loop(
         msgs.append(response)
 
         if hasattr(response, 'tool_calls') and response.tool_calls:
+            # Record each tool call as a reasoning step
+            for tc in response.tool_calls:
+                tool_name = tc.get("name", "unknown")
+                args = dict(tc.get("args") or {})
+                # Build a short human-readable description of the call
+                if args:
+                    arg_str = ", ".join(f"{k}={v}" for k, v in args.items() if k not in ("auth_token",))
+                    reasoning_lines.append(f"Consultando {tool_name}({arg_str})")
+                else:
+                    reasoning_lines.append(f"Consultando {tool_name}")
             tool_msgs, steps = await _execute_tools(
                 response, steps, cache=state.tool_cache,
                 tool_map_override=tool_map_override,
@@ -348,8 +373,9 @@ async def _run_agent_loop(
             cot, answer = _extract_cot_and_answer(response.content) if enable_cot else ("", response.content)
             if enable_cot and not cot and steps:
                 cot = _synthesize_cot_from_steps(steps)
-            status = NodeStatus.OK if (cot or not enable_cot) else NodeStatus.NO_COT
-            return answer, cot, status, all_tool_msgs, steps
+            final_cot = _build_cot(cot) if enable_cot else ""
+            status = NodeStatus.OK if (final_cot or not enable_cot) else NodeStatus.NO_COT
+            return answer, final_cot, status, all_tool_msgs, steps
         elif isinstance(response, (str, dict)):
             if isinstance(response, dict):
                 content = json.dumps(response, ensure_ascii=False, indent=2)
@@ -358,16 +384,18 @@ async def _run_agent_loop(
             cot, answer = _extract_cot_and_answer(content) if enable_cot else ("", content)
             if enable_cot and not cot and steps:
                 cot = _synthesize_cot_from_steps(steps)
-            status = NodeStatus.OK if (cot or not enable_cot) else NodeStatus.NO_COT
-            return answer, cot, status, all_tool_msgs, steps
+            final_cot = _build_cot(cot) if enable_cot else ""
+            status = NodeStatus.OK if (final_cot or not enable_cot) else NodeStatus.NO_COT
+            return answer, final_cot, status, all_tool_msgs, steps
         else:
             # Last-resort fallback for unexpected response types
             content = str(response)
             cot, answer = _extract_cot_and_answer(content) if enable_cot else ("", content)
             if enable_cot and not cot and steps:
                 cot = _synthesize_cot_from_steps(steps)
-            status = NodeStatus.OK if (cot or not enable_cot) else NodeStatus.NO_COT
-            return answer, cot, status, all_tool_msgs, steps
+            final_cot = _build_cot(cot) if enable_cot else ""
+            status = NodeStatus.OK if (final_cot or not enable_cot) else NodeStatus.NO_COT
+            return answer, final_cot, status, all_tool_msgs, steps
 
         if len(steps) == previous_step_count:
             no_progress_count += 1
@@ -387,8 +415,9 @@ async def _run_agent_loop(
     cot, answer = _extract_cot_and_answer(final.content) if enable_cot else ("", final.content)
     if enable_cot and not cot and steps:
         cot = _synthesize_cot_from_steps(steps)
-    status = NodeStatus.OK if (cot or not enable_cot) else NodeStatus.NO_COT
-    return answer, cot, status, all_tool_msgs, steps
+    final_cot = _build_cot(cot) if enable_cot else ""
+    status = NodeStatus.OK if (final_cot or not enable_cot) else NodeStatus.NO_COT
+    return answer, final_cot, status, all_tool_msgs, steps
 
 
 # ─────────────────────────────────────────────
