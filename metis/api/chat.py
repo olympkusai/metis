@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Header
+from fastapi import APIRouter, Header, HTTPException, Depends
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Optional
@@ -8,6 +8,8 @@ from metis.memory.conversation_history import (
     get_conversation_history,
     MessageRole,
 )
+from metis.jwt_verifier import JWTVerifier, InvalidTokenError
+from metis.api.deps import get_jwt_verifier
 import json
 import asyncio
 import uuid
@@ -50,7 +52,7 @@ async def _yield_token_events(content: str, node: str):
 
 class ChatRequest(BaseModel):
     message: str
-    user_id: str
+    user_id: Optional[str] = None  # Deprecated — user_id is extracted from the JWT
     session_id: Optional[str] = None
 
 
@@ -61,26 +63,53 @@ def _extract_bearer_token(authorization: Optional[str]) -> str:
     return authorization.removeprefix("Bearer ").strip()
 
 
+async def _validate_and_get_user_id(
+    authorization: Optional[str],
+    verifier: JWTVerifier,
+) -> tuple[str, str]:
+    """Validate the JWT and return (user_id, raw_token).
+
+    The raw token is returned so it can be forwarded to downstream services
+    (e.g. Pluto) that need it. The user_id is extracted from the `sub` claim.
+    """
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
+
+    token = authorization.removeprefix("Bearer ").strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Empty bearer token")
+
+    try:
+        identity = await verifier.verify(token)
+        return identity.user_id, token
+    except InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+
 @router.post("/chat")
-async def chat(request: ChatRequest, authorization: Optional[str] = Header(None)):
-    auth_token = _extract_bearer_token(authorization)
-    session_id = request.session_id or f"{request.user_id}:{uuid.uuid4().hex}"
+async def chat(
+    request: ChatRequest,
+    authorization: Optional[str] = Header(None),
+    verifier: JWTVerifier = Depends(get_jwt_verifier),
+):
+    user_id, auth_token = await _validate_and_get_user_id(authorization, verifier)
+    session_id = request.session_id or f"{user_id}:{uuid.uuid4().hex}"
 
     conv_history = get_conversation_history()
     await conv_history.save_message(
-        user_id=request.user_id,
+        user_id=user_id,
         session_id=session_id,
         role=MessageRole.USER,
         content=request.message,
     )
 
     session_history = await conv_history.get_conversation_history(
-        user_id=request.user_id,
+        user_id=user_id,
         session_id=session_id,
         limit=20,
     )
     global_context = await conv_history.get_global_context(
-        user_id=request.user_id,
+        user_id=user_id,
         limit=10,
         exclude_session_id=session_id,
     )
@@ -104,7 +133,7 @@ async def chat(request: ChatRequest, authorization: Optional[str] = Header(None)
     agent = get_finance_agent_graph()
     initial_state = FinanceAgentState(
         messages=messages,
-        user_id=request.user_id,
+        user_id=user_id,
         auth_token=auth_token,
     )
 
@@ -115,7 +144,7 @@ async def chat(request: ChatRequest, authorization: Optional[str] = Header(None)
     cot = final_state.get("cot", "")
 
     await conv_history.save_message(
-        user_id=request.user_id,
+        user_id=user_id,
         session_id=session_id,
         role=MessageRole.ASSISTANT,
         content=final_answer,
@@ -134,7 +163,11 @@ async def chat(request: ChatRequest, authorization: Optional[str] = Header(None)
 
 
 @router.post("/streaming/chat")
-async def streaming_chat(request: ChatRequest, authorization: Optional[str] = Header(None)):
+async def streaming_chat(
+    request: ChatRequest,
+    authorization: Optional[str] = Header(None),
+    verifier: JWTVerifier = Depends(get_jwt_verifier),
+):
     """Streaming endpoint that emits SSE events in real time.
 
     Uses two LangGraph stream modes simultaneously:
@@ -147,13 +180,12 @@ async def streaming_chat(request: ChatRequest, authorization: Optional[str] = He
     - { type: "node_execution", node, thought } — a node completed with its CoT
     - { type: "completion", response, session_id } — final answer
     """
-    auth_token = _extract_bearer_token(authorization)
-
-    session_id = request.session_id or f"{request.user_id}:{uuid.uuid4().hex}"
+    user_id, auth_token = await _validate_and_get_user_id(authorization, verifier)
+    session_id = request.session_id or f"{user_id}:{uuid.uuid4().hex}"
 
     conv_history = get_conversation_history()
     await conv_history.save_message(
-        user_id=request.user_id,
+        user_id=user_id,
         session_id=session_id,
         role=MessageRole.USER,
         content=request.message,
@@ -161,12 +193,12 @@ async def streaming_chat(request: ChatRequest, authorization: Optional[str] = He
 
     async def event_generator():
         session_history = await conv_history.get_conversation_history(
-            user_id=request.user_id,
+            user_id=user_id,
             session_id=session_id,
             limit=20,
         )
         global_context = await conv_history.get_global_context(
-            user_id=request.user_id,
+            user_id=user_id,
             limit=10,
             exclude_session_id=session_id,
         )
@@ -190,7 +222,7 @@ async def streaming_chat(request: ChatRequest, authorization: Optional[str] = He
         agent = get_finance_agent_graph()
         initial_state = FinanceAgentState(
             messages=messages,
-            user_id=request.user_id,
+            user_id=user_id,
             auth_token=auth_token,
         )
 
@@ -291,7 +323,7 @@ async def streaming_chat(request: ChatRequest, authorization: Optional[str] = He
         }
 
         await conv_history.save_message(
-            user_id=request.user_id,
+            user_id=user_id,
             session_id=session_id,
             role=MessageRole.ASSISTANT,
             content=accumulated_state.get("final_answer", ""),

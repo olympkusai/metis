@@ -12,21 +12,25 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from metis.api import register_routes
+from metis.api.deps import set_jwt_verifier
 from metis.pluto_client import close_pluto_client
+from metis.soter_client import close_soter_client
+from metis.jwt_verifier import JWTVerifier
 from metis.config import get_settings
 from metis.storage import DatabasePool
 from metis.storage.migrations import run_conversation_migrations
 from metis.memory.conversation_history import set_conversation_db_pool
 
 
-# Global database pool
+# Global resources
 _conversation_db_pool: DatabasePool | None = None
+_jwt_verifier: JWTVerifier | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Lifespan manager for database pool initialization."""
-    global _conversation_db_pool
+    """Lifespan manager for database pool and JWT verifier initialization."""
+    global _conversation_db_pool, _jwt_verifier
 
     # Startup — db-metis Postgres (conversations, chat_messages, notifications)
     settings = get_settings()
@@ -39,13 +43,27 @@ async def lifespan(app: FastAPI):
     set_conversation_db_pool(_conversation_db_pool)
     print(f"[MAIN] Conversation database pool initialized (db-metis)")
 
+    # JWT verifier (JWKS from Soter)
+    _jwt_verifier = JWTVerifier(
+        jwks_url=settings.soter_jwks_url,
+        issuer=settings.oidc_issuer,
+        cache_ttl=settings.jwks_cache_ttl_seconds,
+    )
+    await _jwt_verifier.warm()
+    set_jwt_verifier(_jwt_verifier)
+    print("[MAIN] JWT verifier initialized (JWKS from Soter)")
+
     yield
 
     # Shutdown
+    if _jwt_verifier:
+        await _jwt_verifier.close()
+        print("[MAIN] JWT verifier closed")
     if _conversation_db_pool:
         await _conversation_db_pool.close()
         print("[MAIN] Conversation database pool closed")
     await close_pluto_client()
+    await close_soter_client()
 
 
 app = FastAPI(title="Metis", lifespan=lifespan)

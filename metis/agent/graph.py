@@ -31,6 +31,7 @@ from pydantic import BaseModel, Field, ConfigDict
 
 from metis.tools import finance_tools, set_auth_token
 from metis.pluto_client import PlutoApiError, get_pluto_client
+from metis.soter_client import SoterApiError, get_soter_client
 from metis.agent.finance_prompts import (
     _FINANCE_GREETING,
     _FINANCE_OUT_OF_SCOPE,
@@ -68,6 +69,9 @@ class FinanceAgentState(BaseModel):
     # Finance persona context (fetched by finance_context_node from Pluto)
     finance_profile:    dict               = Field(default_factory=dict)
     finance_accounts:   list               = Field(default_factory=list)
+
+    # AI personalization (fetched by finance_context_node from Soter)
+    personalization:    dict               = Field(default_factory=dict)
 
     # Data gathered by data_gathering_node (tool results)
     gathered_data:      str                = ""
@@ -562,13 +566,36 @@ async def finance_context_node(state: FinanceAgentState) -> dict:
 
     try:
         client = get_pluto_client()
-        profile = await client.get_financial_profile(token=state.auth_token)
-        accounts = await client.list_accounts(token=state.auth_token)
+        soter = get_soter_client()
+        profile, accounts = await asyncio.gather(
+            client.get_financial_profile(token=state.auth_token),
+            client.list_accounts(token=state.auth_token),
+        )
+
+        # Fetch AI personalization from Soter (best-effort — don't fail
+        # the whole node if Soter is unreachable or preferences don't
+        # exist yet).
+        personalization: dict = {}
+        try:
+            app_id = await soter.get_app_id_by_client_id(
+                client_id="pluto", token=state.auth_token,
+            )
+            pers = await soter.get_personalization(
+                token=state.auth_token, app_id=app_id,
+            )
+            if pers:
+                personalization = pers
+        except SoterApiError as e:
+            print(f"[finance_context_node] Soter personalization unavailable: {e}")
+        except Exception as e:
+            print(f"[finance_context_node] Soter error: {e}")
+
         cot_text = "Buscando seu perfil financeiro e contas..."
         return {
             **state.model_dump(),
             "finance_profile": profile,
             "finance_accounts": accounts.get("accounts", accounts) if isinstance(accounts, dict) else accounts,
+            "personalization": personalization,
             "cot": cot_text,
             "reasoning_trail": _append_reasoning(state.reasoning_trail, "finance_context", cot_text),
         }
@@ -692,10 +719,50 @@ async def synthesis_node(state: FinanceAgentState, config: RunnableConfig) -> di
 
     extra = f"[ANÁLISE DO AGENTE ESPECIALISTA]\n{state.analysis_text}"
 
+    # Build a personalization directive from the user's Soter preferences.
+    # This adjusts tone, display name, and language of the final response.
+    system_prompt = _FINANCE_SYNTHESIS_SYSTEM
+    pers = state.personalization
+    if pers and isinstance(pers, dict):
+        tone = pers.get("tone", "friendly")
+        display_name = pers.get("display_name")
+        language = pers.get("language", "pt_BR")
+        personality_notes = pers.get("personality_notes")
+
+        tone_directives: list[str] = []
+        tone_map = {
+            "formal": "Use um tom formal e profissional, com linguagem técnica precisa.",
+            "casual": "Use um tom casual e descontraído, como uma conversa entre amigos.",
+            "friendly": "Use um tom amigável e acolhedor, sendo encorajador e empático.",
+            "direct": "Use um tom direto e objetivo, sem rodeios. Vá direto ao ponto.",
+            "motivational": "Use um tom motivacional e energético, inspirando o usuário a agir.",
+            "playful": "Use um tom divertido e leve, com humor quando apropriado.",
+        }
+        directive = tone_map.get(tone, tone_map["friendly"])
+        tone_directives.append(directive)
+
+        if display_name:
+            tone_directives.append(f'Chame o usuário de "{display_name}" quando se dirigir a ele (mas não em toda frase).')
+        if personality_notes:
+            tone_directives.append(f"Notas de personalidade do usuário: {personality_notes}")
+        if language and language != "pt_BR":
+            lang_map = {
+                "en_US": "Respond in English.",
+                "es_ES": "Responde en español.",
+                "fr_FR": "Réponds en français.",
+                "zh_CN": "用中文回答。",
+            }
+            lang_directive = lang_map.get(language)
+            if lang_directive:
+                tone_directives.append(lang_directive)
+
+        if tone_directives:
+            system_prompt = system_prompt + "\n\n" + "\n".join(tone_directives)
+
     content, cot, status, _tool_msgs, steps = await _run_agent_loop(
         state,
         llm,
-        system_prompt=_FINANCE_SYNTHESIS_SYSTEM,
+        system_prompt=system_prompt,
         extra_context=extra,
         clear_steps=True,
         node_name="synthesis",

@@ -1,12 +1,14 @@
 """API endpoints for conversation history management."""
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Header, Depends
 from pydantic import BaseModel, Field
 from typing import Optional, List
 from metis.memory.conversation_history import (
     get_conversation_history,
     FeedbackRating,
 )
+from metis.jwt_verifier import JWTVerifier, InvalidTokenError
+from metis.api.deps import get_jwt_verifier
 import uuid
 
 router = APIRouter()
@@ -43,9 +45,38 @@ class ConversationResponse(BaseModel):
     messages: List[MessageResponse]
 
 
+async def _require_matching_user(
+    user_id: str,
+    authorization: Optional[str] = Header(None),
+    verifier: JWTVerifier = Depends(get_jwt_verifier),
+) -> str:
+    """Validate the JWT and ensure the token's user_id matches the path user_id.
+
+    Prevents IDOR — a user cannot access another user's conversations by
+    changing the path parameter.
+    """
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
+
+    token = authorization.removeprefix("Bearer ").strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Empty bearer token")
+
+    try:
+        identity = await verifier.verify(token)
+    except InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+    if identity.user_id != user_id:
+        raise HTTPException(status_code=403, detail="Forbidden: token does not match requested user")
+
+    return user_id
+
+
 @router.get("/conversations/{user_id}", response_model=List[SessionResponse])
 async def list_conversations(
     user_id: str,
+    _: str = Depends(_require_matching_user),
     limit: int = 20,
 ):
     """List all conversation sessions for a user.
@@ -69,6 +100,7 @@ async def list_conversations(
 async def get_conversation(
     user_id: str,
     session_id: str,
+    _: str = Depends(_require_matching_user),
     limit: int = 100,
 ):
     """Get all messages in a specific conversation session.
@@ -98,6 +130,7 @@ async def get_conversation(
 async def delete_conversation(
     user_id: str,
     session_id: str,
+    _: str = Depends(_require_matching_user),
 ):
     """Soft delete a conversation session.
     
@@ -122,6 +155,7 @@ async def feedback_conversation(
     user_id: str,
     session_id: str,
     feedback: FeedbackRequest,
+    _: str = Depends(_require_matching_user),
 ):
     """Add feedback to an entire conversation session.
     
@@ -150,6 +184,7 @@ async def feedback_message(
     session_id: str,
     message_id: str,
     feedback: FeedbackRequest,
+    _: str = Depends(_require_matching_user),
 ):
     """Add feedback to a specific message.
     

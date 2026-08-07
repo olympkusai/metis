@@ -67,29 +67,8 @@ CREATE TABLE IF NOT EXISTS chat_message_feedback (
 );
 """
 
-# No Metis feature produces notifications yet — table exists to match the
-# canonical communication.md domain shape ahead of that feature landing.
-CREATE_NOTIFICATIONS_TABLE = """
-CREATE TABLE IF NOT EXISTS notifications (
-    id varchar PRIMARY KEY,
-    user_id varchar NOT NULL,
-    type varchar NOT NULL,
-    title varchar NOT NULL,
-    message text NOT NULL,
-    related_resource_type varchar,
-    related_resource_id varchar,
-    is_read boolean NOT NULL DEFAULT false,
-    read_at timestamptz,
-    created_at timestamptz NOT NULL DEFAULT now(),
-    updated_at timestamptz NOT NULL DEFAULT now(),
-    deleted_at timestamptz
-);
-
-CREATE INDEX IF NOT EXISTS idx_notifications_user_id ON notifications (user_id);
-CREATE INDEX IF NOT EXISTS idx_notifications_user_id_is_read ON notifications (user_id, is_read);
-CREATE INDEX IF NOT EXISTS idx_notifications_related_resource ON notifications (related_resource_type, related_resource_id);
-CREATE INDEX IF NOT EXISTS idx_notifications_deleted_at ON notifications (deleted_at);
-"""
+# Notifications have been moved to Stentor (db-stentor).
+# The notifications table is no longer created in db-metis.
 
 
 async def run_conversation_migrations(pool) -> None:
@@ -101,4 +80,3 @@ async def run_conversation_migrations(pool) -> None:
     await pool.execute(CREATE_CONVERSATIONS_TABLE)
     await pool.execute(CREATE_CHAT_MESSAGES_TABLE)
     await pool.execute(CREATE_CHAT_MESSAGE_FEEDBACK_TABLE)
-    await pool.execute(CREATE_NOTIFICATIONS_TABLE)
