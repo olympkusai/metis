@@ -307,8 +307,6 @@ async def _run_agent_loop(
     enhanced_prompt = system_prompt + tool_instruction + cot_instruction
 
     msgs: list = [SystemMessage(content=enhanced_prompt)]
-    if original_query:
-        msgs.append(original_query)
 
     if state.reasoning_trail:
         trail_block = (
@@ -322,6 +320,10 @@ async def _run_agent_loop(
 
     if extra_context:
         msgs.append(HumanMessage(content=f"[CONTEXTO DO PIPELINE]\n{extra_context}"))
+
+    # User's message goes LAST so the LLM treats it as the current request
+    if original_query:
+        msgs.append(original_query)
 
     all_tool_msgs: list[ToolMessage] = []
     steps = [] if clear_steps else list(state.intermediate_steps_agent)
