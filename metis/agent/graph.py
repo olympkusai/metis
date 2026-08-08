@@ -128,11 +128,24 @@ logger = logging.getLogger(__name__)
 
 
 def _latest_user_message(messages: list) -> HumanMessage | None:
-    """Retorna a ÚLTIMA `HumanMessage` da lista, ou None se não houver."""
-    return next(
-        (m for m in reversed(messages) if isinstance(m, HumanMessage)),
-        None,
-    )
+    """Retorna a ÚLTIMA `HumanMessage` da lista, ou None se não houver.
+
+    Handles both HumanMessage objects and dict representations (which occur
+    after state serialization via model_dump()).
+    """
+    for m in reversed(messages):
+        if isinstance(m, HumanMessage):
+            return m
+        if isinstance(m, dict):
+            # Check if it's a serialized HumanMessage (has 'content' and
+            # type indicator like 'role' or 'type' key)
+            if m.get("type") == "human" or m.get("role") == "user":
+                return HumanMessage(content=m.get("content", ""))
+            # Fallback: if it has content and looks like a user message
+            # (no 'tool_calls' or 'type' indicating AI/tool)
+            if "content" in m and not m.get("tool_calls") and m.get("type") != "ai":
+                return HumanMessage(content=m["content"])
+    return None
 
 
 def _extract_cot_and_answer(content: str) -> tuple[str, str]:
