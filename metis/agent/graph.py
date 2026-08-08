@@ -328,6 +328,12 @@ async def _run_agent_loop(
     if original_query:
         msgs.append(original_query)
 
+    # Debug: log messages for action node
+    if node_name == "action":
+        for i, m in enumerate(msgs):
+            content_preview = str(m.content)[:150] if hasattr(m, 'content') and m.content else "(empty)"
+            logger.info(f"[action_node] msg[{i}] type={type(m).__name__}: {content_preview}")
+
     all_tool_msgs: list[ToolMessage] = []
     steps = [] if clear_steps else list(state.intermediate_steps_agent)
     MAX_ITERATIONS = 6
@@ -389,6 +395,14 @@ async def _run_agent_loop(
         if response is None:
             error_msg = "[LLM ERROR] Failed to get response after retries"
             return error_msg, _failure_cot(node_name, error_msg), NodeStatus.ERROR, all_tool_msgs, steps
+
+        # Debug: log LLM response for action node
+        if node_name == "action":
+            has_tc = hasattr(response, 'tool_calls') and bool(response.tool_calls)
+            content_preview = str(response.content)[:200] if response.content else "(empty)"
+            logger.info(f"[action_node] LLM response: has_tool_calls={has_tc}, content_preview={content_preview}")
+            if has_tc:
+                logger.info(f"[action_node] tool_calls: {response.tool_calls}")
 
         msgs.append(response)
 
