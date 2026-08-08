@@ -37,6 +37,7 @@ from metis.agent.finance_prompts import (
     _FINANCE_GREETING,
     _FINANCE_OUT_OF_SCOPE,
     _FINANCE_ORCHESTRATOR_SYSTEM,
+    _FINANCE_ACTION_SYSTEM,
     _FINANCE_DATA_GATHERING_SYSTEM,
     _FINANCE_ANALYSIS_SYSTEM,
     _FINANCE_SYNTHESIS_SYSTEM,
@@ -53,6 +54,7 @@ from metis.utils.cost_tracker import get_cost_tracker
 class NextAction(str, Enum):
     FINANCE_CONTEXT   = "finance_context"
     FINANCE_REASONING = "finance_reasoning"
+    ACTION            = "action"
     FINALIZE          = "finalize"
 
 
@@ -525,7 +527,9 @@ def _classify_intent(question: Any) -> str:
 # ─────────────────────────────────────────────
 
 async def finance_orchestrator_node(state: FinanceAgentState) -> dict:
-    """Curto-circuita saudação/fora-de-escopo."""
+    """Classifica intenção: greeting, out-of-scope, analysis (FINANCE_OK)
+    ou action (ACTION). Action vai direto para o action_node, pulando o
+    pipeline de análise."""
     user_question = state.messages[-1].content if state.messages else ""
 
     intent = _classify_intent(user_question)
@@ -543,6 +547,9 @@ async def finance_orchestrator_node(state: FinanceAgentState) -> dict:
         HumanMessage(content=user_question),
     ])
     scope_result = scope_validation.content.strip().upper()
+
+    if scope_result == "ACTION":
+        return {**state.model_dump(), "next_action": NextAction.ACTION}
 
     if scope_result != "FINANCE_OK":
         return {
@@ -628,26 +635,86 @@ async def finance_context_node(state: FinanceAgentState) -> dict:
         }
 
 
-async def data_gathering_node(state: FinanceAgentState, config: RunnableConfig) -> dict:
-    """Coleta dados via ferramentas. Não analisa, não responde ao usuário.
-    Apenas chama as ferramentas necessárias e devolve os dados brutos.
+async def action_node(state: FinanceAgentState, config: RunnableConfig) -> dict:
+    """Executa operações de escrita/gestão (criar, atualizar, excluir, pagar,
+    etc.) usando as tools do Hermes (MCP server).
 
-    Combina as tools de leitura (finance_tools — relatórios do Pluto) com as
-    tools de escrita do Hermes (MCP server — create/update/delete operations).
-    As tools do Hermes são descobertas automaticamente via MCP — adicionar uma
-    tool nova no Hermes não requer mudança aqui.
+    Este nó é ativado quando o orchestrator classifica a intenção como ACTION.
+    Diferente do pipeline de análise (data_gathering → analysis → synthesis),
+    este nó chama a tool apropriada e responde diretamente ao usuário — sem
+    passar por análise financeira.
+    """
+    if not state.auth_token:
+        return {
+            **state.model_dump(),
+            "final_answer": "Não consegui executar essa operação — sessão não autenticada. Tente fazer login novamente.",
+            "next_action": NextAction.FINALIZE,
+            "messages": state.messages + [AIMessage(content="Não consegui executar essa operação — sessão não autenticada.")],
+        }
+
+    set_auth_token(state.auth_token)
+
+    # Discover write tools from Hermes
+    hermes_tools, hermes_client = await discover_hermes_tools(state.auth_token)
+
+    if not hermes_tools:
+        return {
+            **state.model_dump(),
+            "final_answer": "Não consegui conectar ao serviço de operações financeiras agora. Tente novamente em alguns instantes.",
+            "next_action": NextAction.FINALIZE,
+            "messages": state.messages + [AIMessage(content="Não consegui conectar ao serviço de operações financeiras agora.")],
+        }
+
+    tool_map = {t.name: t for t in hermes_tools}
+    llm = _make_llm(model="gpt-4o", temperature=0.1).bind_tools(hermes_tools)
+
+    # Build context with the user's accounts so the LLM can resolve
+    # account_id automatically when the user says "minha conta principal".
+    context_block = json.dumps(
+        {"accounts": state.finance_accounts},
+        ensure_ascii=False, default=str,
+    )
+
+    content, cot, status, tool_msgs, steps = await _run_agent_loop(
+        state,
+        llm,
+        system_prompt=_FINANCE_ACTION_SYSTEM,
+        extra_context=f"[CONTAS DO USUÁRIO]\n{context_block}",
+        clear_steps=True,
+        node_name="action",
+        enable_cot=False,
+        tool_map_override=tool_map,
+        config=config,
+    )
+
+    await close_hermes_client(hermes_client)
+
+    # The action node produces the final answer directly — no analysis/synthesis
+    answer = content or "Não consegui executar a operação. Pode tentar novamente?"
+
+    print(f"[action_node] tools_called={len(steps)}, answer_len={len(answer)}")
+
+    return {
+        **state.model_dump(),
+        "final_answer": answer,
+        "cot": "",
+        "reasoning_trail": _append_reasoning(state.reasoning_trail, "action", "", status),
+        "intermediate_steps_agent": steps,
+        "intermediate_steps_global": state.intermediate_steps_global + steps,
+        "next_action": NextAction.FINALIZE,
+        "messages": state.messages + [AIMessage(content=answer)],
+    }
+
+
+async def data_gathering_node(state: FinanceAgentState, config: RunnableConfig) -> dict:
+    """Coleta dados via ferramentas de LEITURA. Não analisa, não responde ao
+    usuário. Apenas chama as ferramentas necessárias e devolve os dados brutos.
+
+    As tools de escrita (Hermes MCP) são tratadas pelo action_node, não aqui.
     """
     set_auth_token(state.auth_token)
 
-    # Discover write tools from Hermes (MCP server) — best-effort: if Hermes
-    # is unreachable, continue with read-only tools only.
-    hermes_tools, hermes_client = await discover_hermes_tools(state.auth_token)
-
-    # Combine read tools (local) + write tools (Hermes MCP)
-    all_tools = list(finance_tools) + hermes_tools
-    all_tool_map = {t.name: t for t in all_tools}
-
-    llm = _make_llm(model="gpt-4o", temperature=0.1).bind_tools(all_tools)
+    llm = _make_llm(model="gpt-4o", temperature=0.1).bind_tools(finance_tools)
 
     context_block = json.dumps(
         {"financial_profile": state.finance_profile, "accounts": state.finance_accounts},
@@ -662,12 +729,9 @@ async def data_gathering_node(state: FinanceAgentState, config: RunnableConfig) 
         clear_steps=True,
         node_name="data_gathering",
         enable_cot=True,
-        tool_map_override=all_tool_map,
+        tool_map_override=finance_tool_map,
         config=config,
     )
-
-    # Close the Hermes MCP client — we're done with tool calls
-    await close_hermes_client(hermes_client)
 
     # Gather all tool results as a single data block for the analysis node
     gathered = "\n\n".join(
@@ -677,7 +741,7 @@ async def data_gathering_node(state: FinanceAgentState, config: RunnableConfig) 
         # No tools called — use profile + accounts as the data
         gathered = context_block
 
-    print(f"[data_gathering_node] tools_called={len(steps)}, hermes_tools={len(hermes_tools)}, cot_len={len(cot)}, data_len={len(gathered)}")
+    print(f"[data_gathering_node] tools_called={len(steps)}, cot_len={len(cot)}, data_len={len(gathered)}")
 
     return {
         **state.model_dump(),
@@ -822,6 +886,7 @@ def build_finance_graph() -> Any:
 
     workflow.add_node("finance_orchestrator", finance_orchestrator_node)
     workflow.add_node("finance_context",      finance_context_node)
+    workflow.add_node("action",              action_node)
     workflow.add_node("data_gathering",       data_gathering_node)
     workflow.add_node("analysis",             analysis_node)
     workflow.add_node("synthesis",            synthesis_node)
@@ -829,18 +894,28 @@ def build_finance_graph() -> Any:
 
     workflow.set_entry_point("finance_orchestrator")
 
+    # orchestrator → finalize (greeting/out-of-scope)
+    # orchestrator → finance_context (FINANCE_OK or ACTION — both need context)
     workflow.add_conditional_edges(
         "finance_orchestrator",
         lambda s: "finalize" if s.next_action == NextAction.FINALIZE else "finance_context",
         {"finalize": "finalize", "finance_context": "finance_context"},
     )
 
+    # finance_context → finalize (error)
+    # finance_context → action (if next_action == ACTION)
+    # finance_context → data_gathering (if next_action == FINANCE_CONTEXT)
     workflow.add_conditional_edges(
         "finance_context",
-        lambda s: "finalize" if s.next_action == NextAction.FINALIZE else "data_gathering",
-        {"finalize": "finalize", "data_gathering": "data_gathering"},
+        lambda s: (
+            "finalize" if s.next_action == NextAction.FINALIZE
+            else "action" if s.next_action == NextAction.ACTION
+            else "data_gathering"
+        ),
+        {"finalize": "finalize", "action": "action", "data_gathering": "data_gathering"},
     )
 
+    workflow.add_edge("action", "finalize")
     workflow.add_edge("data_gathering", "analysis")
     workflow.add_edge("analysis", "synthesis")
     workflow.add_edge("synthesis", "finalize")
