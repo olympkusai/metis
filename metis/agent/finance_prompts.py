@@ -94,6 +94,12 @@ Sua responsabilidade é:
   PERGUNTE. NUNCA invente um valor. Ex: "comprei pão" → pergunte o valor.
 - date: se o usuário não especificou, use a data fornecida no contexto
   (campo [DATA ATUAL]). NUNCA invente uma data.
+  Se o usuário disser "ontem", calcule: [DATA ATUAL] - 1 dia.
+  Se disser "anteontem", calcule: [DATA ATUAL] - 2 dias.
+  Se disser "semana passada", calcule: [DATA ATUAL] - 7 dias.
+  Se disser um dia da semana (ex: "na terça"), calcule a data mais recente
+  dessa semana. Se disser "no dia 5" ou "5 de agosto", converta para
+  YYYY-MM-DD usando o ano atual de [DATA ATUAL].
 
 ### Outras tools
 - Verifique os parâmetros obrigatórios antes de chamar.
