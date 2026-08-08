@@ -1,4 +1,5 @@
 from pathlib import Path
+import logging
 import sys
 
 import uvicorn
@@ -20,6 +21,7 @@ from metis.config import get_settings
 from metis.storage import DatabasePool
 from metis.storage.migrations import run_conversation_migrations
 from metis.memory.conversation_history import set_conversation_db_pool
+from metis.request_id import RequestIdMiddleware, RequestIdLogFilter
 
 
 # Global resources
@@ -68,6 +70,14 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Metis", lifespan=lifespan)
 
+# Configure logging with request ID
+logging.basicConfig(
+    level=logging.INFO,
+    stream=sys.stderr,
+    format="%(asctime)s [%(name)s] [req=%(request_id)s] %(levelname)s: %(message)s",
+)
+logging.getLogger().addFilter(RequestIdLogFilter())
+
 # Configure CORS
 app.add_middleware(
     CORSMiddleware,
@@ -81,6 +91,9 @@ app.add_middleware(
     allow_methods=["*"],  # Allows all methods
     allow_headers=["*"],  # Allows all headers
 )
+
+# Request ID middleware — must be after CORS so the header is visible
+app.add_middleware(RequestIdMiddleware)
 
 register_routes(app)
 

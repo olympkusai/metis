@@ -20,6 +20,7 @@ from mcp.client.streamable_http import streamable_http_client
 from mcp.types import Tool as MCPTool
 
 from metis.config import get_settings
+from metis.request_id import get_request_id
 
 logger = logging.getLogger(__name__)
 
@@ -114,8 +115,13 @@ async def discover_hermes_tools(auth_token: str) -> tuple[list[BaseTool], Client
     hermes_url = settings.hermes_base_url
 
     try:
+        headers = {"Authorization": f"Bearer {auth_token}"}
+        rid = get_request_id()
+        if rid:
+            headers["X-Request-ID"] = rid
+
         http_client = httpx.AsyncClient(
-            headers={"Authorization": f"Bearer {auth_token}"},
+            headers=headers,
             timeout=settings.hermes_request_timeout_seconds,
         )
 

@@ -15,6 +15,7 @@ from typing import Any, Optional
 import httpx
 
 from metis.config import get_settings
+from metis.request_id import get_request_id
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +121,9 @@ class SoterApiClient:
         client = await self._get_client()
         url = f"{self.base_url}{path}"
         headers = {"Content-Type": "application/json", "Authorization": f"Bearer {token}"}
+        rid = get_request_id()
+        if rid:
+            headers["X-Request-ID"] = rid
 
         logger.debug(f"[SOTER] HTTP {method} {url}")
 
