@@ -39,6 +39,7 @@ from metis.agent.finance_prompts import (
     _FINANCE_DATA_GATHERING_SYSTEM,
     _FINANCE_ANALYSIS_SYSTEM,
     _FINANCE_SYNTHESIS_SYSTEM,
+    build_personalization_directives,
 )
 from metis.config import get_settings
 from metis.utils.cost_tracker import get_cost_tracker
@@ -684,10 +685,29 @@ async def analysis_node(state: FinanceAgentState, config: RunnableConfig) -> dic
         f"[DADOS COLETADOS PELAS FERRAMENTAS]\n{state.gathered_data}"
     )
 
+    # Apply personalization (currency + obfuscation) to the analysis prompt
+    # too, so the technical reasoning uses the correct currency symbol and
+    # respects the user's privacy level — the synthesis node may quote
+    # numbers from this analysis verbatim.
+    system_prompt = _FINANCE_ANALYSIS_SYSTEM
+    pers = state.personalization
+    profile_currency = state.finance_profile.get("currency") if isinstance(state.finance_profile, dict) else None
+    if pers and isinstance(pers, dict):
+        directives = build_personalization_directives(
+            tone=pers.get("tone", "friendly"),
+            display_name=pers.get("display_name"),
+            personality_notes=pers.get("personality_notes"),
+            language=pers.get("language", "pt_BR"),
+            obfuscation_level=pers.get("obfuscation_level", "none"),
+            profile_currency=profile_currency,
+        )
+        if directives:
+            system_prompt = system_prompt + "\n\n" + directives
+
     content, cot, status, _tool_msgs, steps = await _run_agent_loop(
         state,
         llm,
-        system_prompt=_FINANCE_ANALYSIS_SYSTEM,
+        system_prompt=system_prompt,
         extra_context=extra,
         clear_steps=True,
         node_name="analysis",
@@ -720,44 +740,24 @@ async def synthesis_node(state: FinanceAgentState, config: RunnableConfig) -> di
     extra = f"[ANÁLISE DO AGENTE ESPECIALISTA]\n{state.analysis_text}"
 
     # Build a personalization directive from the user's Soter preferences.
-    # This adjusts tone, display name, and language of the final response.
+    # This adjusts tone, display name, language, currency and obfuscation
+    # of the final response — applied consistently across all nodes.
     system_prompt = _FINANCE_SYNTHESIS_SYSTEM
     pers = state.personalization
+    profile_currency = None
+    if isinstance(state.finance_profile, dict):
+        profile_currency = state.finance_profile.get("currency")
     if pers and isinstance(pers, dict):
-        tone = pers.get("tone", "friendly")
-        display_name = pers.get("display_name")
-        language = pers.get("language", "pt_BR")
-        personality_notes = pers.get("personality_notes")
-
-        tone_directives: list[str] = []
-        tone_map = {
-            "formal": "Use um tom formal e profissional, com linguagem técnica precisa.",
-            "casual": "Use um tom casual e descontraído, como uma conversa entre amigos.",
-            "friendly": "Use um tom amigável e acolhedor, sendo encorajador e empático.",
-            "direct": "Use um tom direto e objetivo, sem rodeios. Vá direto ao ponto.",
-            "motivational": "Use um tom motivacional e energético, inspirando o usuário a agir.",
-            "playful": "Use um tom divertido e leve, com humor quando apropriado.",
-        }
-        directive = tone_map.get(tone, tone_map["friendly"])
-        tone_directives.append(directive)
-
-        if display_name:
-            tone_directives.append(f'Chame o usuário de "{display_name}" quando se dirigir a ele (mas não em toda frase).')
-        if personality_notes:
-            tone_directives.append(f"Notas de personalidade do usuário: {personality_notes}")
-        if language and language != "pt_BR":
-            lang_map = {
-                "en_US": "Respond in English.",
-                "es_ES": "Responde en español.",
-                "fr_FR": "Réponds en français.",
-                "zh_CN": "用中文回答。",
-            }
-            lang_directive = lang_map.get(language)
-            if lang_directive:
-                tone_directives.append(lang_directive)
-
-        if tone_directives:
-            system_prompt = system_prompt + "\n\n" + "\n".join(tone_directives)
+        directives = build_personalization_directives(
+            tone=pers.get("tone", "friendly"),
+            display_name=pers.get("display_name"),
+            personality_notes=pers.get("personality_notes"),
+            language=pers.get("language", "pt_BR"),
+            obfuscation_level=pers.get("obfuscation_level", "none"),
+            profile_currency=profile_currency,
+        )
+        if directives:
+            system_prompt = system_prompt + "\n\n" + directives
 
     content, cot, status, _tool_msgs, steps = await _run_agent_loop(
         state,

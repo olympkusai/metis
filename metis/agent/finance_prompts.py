@@ -182,8 +182,8 @@ ESTILO DA RESPOSTA:
 - Use **negrito** para destacar valores importantes e categorias.
 - Use listas com bullets (-) para enumerações.
 - Use ### para subtítulos quando organizar a resposta em seções.
-- Para valores monetários, use o formato R$ X.XXX,XX.
-- Comece com a conclusão principal (ex: "Seus gastos somam R$ 130 este mês"),
+- Para valores monetários, use o símbolo da moeda do usuário (definido nas
+  diretivas de personalização abaixo). Ex: "Seus gastos somam 130 este mês",
   depois detalhe.
 - Inclua 1-2 sugestões práticas no final quando relevante.
 - Seja conciso: priorize informação sobre enfeites.
@@ -192,3 +192,131 @@ IMPORTANTE: Escreva DIRETAMENTE a resposta em Markdown. NÃO use tags
 <thought> ou <answer>. Seu output é transmitido token-a-token para o
 usuário em tempo real.
 """.strip()
+
+
+# ─────────────────────────────────────────────
+# Personalization directives — built from the user's Soter preferences
+# and appended to every system prompt that produces user-facing text.
+# Keeps tone, display name, language, currency and obfuscation consistent
+# across orchestrator → analysis → synthesis.
+# ─────────────────────────────────────────────
+
+# Map app language code → (ISO currency code, symbol) used by the frontend.
+_CURRENCY_BY_LANG = {
+    "pt_BR": ("BRL", "R$"),
+    "en_US": ("USD", "$"),
+    "es_ES": ("EUR", "€"),
+    "fr_FR": ("EUR", "€"),
+    "zh_CN": ("CNY", "¥"),
+}
+
+# ISO code → symbol, for resolving a profile currency directly.
+_SYMBOL_BY_ISO = {
+    "BRL": "R$",
+    "USD": "$",
+    "EUR": "€",
+    "GBP": "£",
+    "CNY": "¥",
+    "JPY": "¥",
+}
+
+
+def currency_symbol_for(language: str, profile_currency: str | None) -> str:
+    """Resolve which currency symbol the AI should use in its answer.
+
+    Priority:
+    1. The currency declared in the user's financial profile (Pluto).
+    2. The currency mapped from the user's language preference.
+    3. BRL (R$) as a last resort.
+    """
+    if profile_currency and profile_currency in _SYMBOL_BY_ISO:
+        return _SYMBOL_BY_ISO[profile_currency]
+    return _CURRENCY_BY_LANG.get(language, ("BRL", "R$"))[1]
+
+
+_OBFUSCATION_DIRECTIVES = {
+    "none": (
+        "NÍVEL DE PRIVACIDADE: none. Mostre todos os valores monetários "
+        "integralmente, sem ocultar nada."
+    ),
+    "standard": (
+        "NÍVEL DE PRIVACIDADE: standard. Ao citar valores monetários "
+        "individuais (gastos, contas), mostre-os normalmente. Mas ao citar "
+        "SALDO TOTAL ou PATRIMÔNIO, use faixas aproximadas (ex: \"entre "
+        "R$ 1.000 e R$ 5.000\") em vez do valor exato."
+    ),
+    "strict": (
+        "NÍVEL DE PRIVACIDADE: strict. NUNCA mostre valores monetários "
+        "exatos. Sempre use faixas aproximadas ou categorias (ex: \"gasto "
+        "alto\", \"entre R$ 100 e R$ 500\", \"saldo positivo\"). Mesmo em "
+        "tabelas, use faixas em vez de números precisos."
+    ),
+}
+
+
+def build_personalization_directives(
+    *,
+    tone: str = "friendly",
+    display_name: str | None = None,
+    personality_notes: str | None = None,
+    language: str = "pt_BR",
+    obfuscation_level: str = "none",
+    profile_currency: str | None = None,
+) -> str:
+    """Build the personalization block appended to a node's system prompt.
+
+    Returns an empty string when there is nothing to personalize (so the
+    caller can just do `prompt + directives` without conditional checks).
+    """
+    tone_map = {
+        "formal": "Use um tom formal e profissional, com linguagem técnica precisa.",
+        "casual": "Use um tom casual e descontraído, como uma conversa entre amigos.",
+        "friendly": "Use um tom amigável e acolhedor, sendo encorajador e empático.",
+        "direct": "Use um tom direto e objetivo, sem rodeios. Vá direto ao ponto.",
+        "motivational": "Use um tom motivacional e energético, inspirando o usuário a agir.",
+        "playful": "Use um tom divertido e leve, com humor quando apropriado.",
+    }
+
+    directives: list[str] = []
+
+    # Tone
+    directives.append(tone_map.get(tone, tone_map["friendly"]))
+
+    # Display name
+    if display_name:
+        directives.append(
+            f'Chame o usuário de "{display_name}" quando se dirigir a ele '
+            f"(mas não em toda frase)."
+        )
+
+    # Personality notes
+    if personality_notes:
+        directives.append(f"Notas de personalidade do usuário: {personality_notes}")
+
+    # Language
+    if language and language != "pt_BR":
+        lang_map = {
+            "en_US": "Respond in English.",
+            "es_ES": "Responde en español.",
+            "fr_FR": "Réponds en français.",
+            "zh_CN": "用中文回答。",
+        }
+        lang_directive = lang_map.get(language)
+        if lang_directive:
+            directives.append(lang_directive)
+
+    # Currency — replace the hardcoded R$ in the base prompt with the
+    # user's actual currency symbol.
+    symbol = currency_symbol_for(language, profile_currency)
+    directives.append(
+        f'Para valores monetários, use o símbolo "{symbol}" '
+        f"(ex: {symbol} 1.234,56). NUNCA use R$ se a moeda do usuário "
+        f"for diferente."
+    )
+
+    # Obfuscation
+    obf = _OBFUSCATION_DIRECTIVES.get(obfuscation_level, _OBFUSCATION_DIRECTIVES["none"])
+    directives.append(obf)
+
+    return "\n\n".join(directives)
+
