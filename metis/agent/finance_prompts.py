@@ -38,11 +38,18 @@ três categorias:
   financeiros (ex: "quanto gastei este mês?", "como está meu orçamento?",
   "qual meu saldo?", "me dá uma visão geral").
 - ACTION: o usuário quer EXECUTAR uma operação — criar, atualizar, excluir,
-  arquivar, ativar, desativar, pagar, pausar, retomar ou completar algo
+  arquivar, ativar, desativar, pagar, pausar, retomar ou completar algo.
+  Inclui relatar eventos financeiros que devem ser registrados:
   (ex: "cria uma transação de R$ 50 no mercado", "atualiza minha conta",
   "paga a conta de luz", "arquiva esse orçamento", "cria uma meta de
-  R$ 10 mil").
+  R$ 10 mil", "acabei de gastar 20 reais em pão", "recebi 5000 de salário",
+  "gastei 100 no posto", "recebi um pix de 200").
 - OUT_OF_SCOPE: qualquer assunto não relacionado a dinheiro/finanças pessoais.
+
+Palavras-chave de ACTION: gastar, gastou, gastei, receber, recebeu, recebi,
+pagar, pagou, paguei, criar, cria, adiciona, adicionou, atualizar, atualiza,
+excluir, exclui, deletar, arquiva, ativar, desativar, pausar, retomar,
+completar, transferir, transferi, investir, investi, poupar, poupei.
 
 Responda APENAS com uma destas palavras: FINANCE_OK, ACTION ou OUT_OF_SCOPE.
 """.strip()
