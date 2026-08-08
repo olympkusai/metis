@@ -32,6 +32,7 @@ from pydantic import BaseModel, Field, ConfigDict
 from metis.tools import finance_tools, set_auth_token
 from metis.pluto_client import PlutoApiError, get_pluto_client
 from metis.soter_client import SoterApiError, get_soter_client
+from metis.mcp_client import discover_hermes_tools, close_hermes_client
 from metis.agent.finance_prompts import (
     _FINANCE_GREETING,
     _FINANCE_OUT_OF_SCOPE,
@@ -93,6 +94,9 @@ class FinanceAgentState(BaseModel):
     cot:                str                = ""
     # Reasoning trail: cumulative <thought> de cada nó, alimenta nós downstream.
     reasoning_trail:    list[tuple[str, str, str]] = Field(default_factory=list)
+
+    # MCP client for Hermes (kept alive during the run, closed in finalize)
+    _hermes_client:     Any                = None
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -627,9 +631,23 @@ async def finance_context_node(state: FinanceAgentState) -> dict:
 async def data_gathering_node(state: FinanceAgentState, config: RunnableConfig) -> dict:
     """Coleta dados via ferramentas. Não analisa, não responde ao usuário.
     Apenas chama as ferramentas necessárias e devolve os dados brutos.
+
+    Combina as tools de leitura (finance_tools — relatórios do Pluto) com as
+    tools de escrita do Hermes (MCP server — create/update/delete operations).
+    As tools do Hermes são descobertas automaticamente via MCP — adicionar uma
+    tool nova no Hermes não requer mudança aqui.
     """
     set_auth_token(state.auth_token)
-    llm = _make_llm(model="gpt-4o", temperature=0.1).bind_tools(finance_tools)
+
+    # Discover write tools from Hermes (MCP server) — best-effort: if Hermes
+    # is unreachable, continue with read-only tools only.
+    hermes_tools, hermes_client = await discover_hermes_tools(state.auth_token)
+
+    # Combine read tools (local) + write tools (Hermes MCP)
+    all_tools = list(finance_tools) + hermes_tools
+    all_tool_map = {t.name: t for t in all_tools}
+
+    llm = _make_llm(model="gpt-4o", temperature=0.1).bind_tools(all_tools)
 
     context_block = json.dumps(
         {"financial_profile": state.finance_profile, "accounts": state.finance_accounts},
@@ -644,9 +662,12 @@ async def data_gathering_node(state: FinanceAgentState, config: RunnableConfig) 
         clear_steps=True,
         node_name="data_gathering",
         enable_cot=True,
-        tool_map_override=finance_tool_map,
+        tool_map_override=all_tool_map,
         config=config,
     )
+
+    # Close the Hermes MCP client — we're done with tool calls
+    await close_hermes_client(hermes_client)
 
     # Gather all tool results as a single data block for the analysis node
     gathered = "\n\n".join(
@@ -656,7 +677,7 @@ async def data_gathering_node(state: FinanceAgentState, config: RunnableConfig) 
         # No tools called — use profile + accounts as the data
         gathered = context_block
 
-    print(f"[data_gathering_node] tools_called={len(steps)}, cot_len={len(cot)}, data_len={len(gathered)}")
+    print(f"[data_gathering_node] tools_called={len(steps)}, hermes_tools={len(hermes_tools)}, cot_len={len(cot)}, data_len={len(gathered)}")
 
     return {
         **state.model_dump(),

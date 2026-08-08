@@ -15,6 +15,8 @@ class Settings(BaseSettings):
     pluto_request_timeout_seconds: float = Field(default=15.0, description="Timeout in seconds for Pluto API requests")
     soter_base_url: str = Field(default="https://api.olympkusai.com/soter", description="Soter auth/identity service base URL")
     soter_request_timeout_seconds: float = Field(default=10.0, description="Timeout in seconds for Soter API requests")
+    hermes_base_url: str = Field(default="https://api.olympkusai.com/hermes/mcp", description="Hermes MCP server URL (via Nike gateway)")
+    hermes_request_timeout_seconds: float = Field(default=30.0, description="Timeout in seconds for Hermes MCP requests")
     soter_jwks_url: str = Field(default="https://api.olympkusai.com/soter/.well-known/jwks.json", description="Soter JWKS endpoint for RS256 token validation")
     oidc_issuer: str = Field(default="https://auth.olympkusai.com", description="Expected JWT issuer (must match Soter's OIDC_ISSUER)")
     jwks_cache_ttl_seconds: float = Field(default=600.0, description="TTL in seconds for cached JWKS keys")
