@@ -342,14 +342,6 @@ async def _run_agent_loop(
         msgs.append(original_query)
     else:
         logger.warning(f"[{node_name}] No user message found in state.messages (len={len(state.messages)})")
-        for i, m in enumerate(state.messages):
-            logger.info(f"[{node_name}] state.messages[{i}] type={type(m).__name__}: {str(getattr(m, 'content', m))[:100]}")
-
-    # Debug: log messages for action node
-    if node_name == "action":
-        for i, m in enumerate(msgs):
-            content_preview = str(m.content)[:150] if hasattr(m, 'content') and m.content else "(empty)"
-            logger.info(f"[action_node] msg[{i}] type={type(m).__name__}: {content_preview}")
 
     all_tool_msgs: list[ToolMessage] = []
     steps = [] if clear_steps else list(state.intermediate_steps_agent)
@@ -412,14 +404,6 @@ async def _run_agent_loop(
         if response is None:
             error_msg = "[LLM ERROR] Failed to get response after retries"
             return error_msg, _failure_cot(node_name, error_msg), NodeStatus.ERROR, all_tool_msgs, steps
-
-        # Debug: log LLM response for action node
-        if node_name == "action":
-            has_tc = hasattr(response, 'tool_calls') and bool(response.tool_calls)
-            content_preview = str(response.content)[:200] if response.content else "(empty)"
-            logger.info(f"[action_node] LLM response: has_tool_calls={has_tc}, content_preview={content_preview}")
-            if has_tc:
-                logger.info(f"[action_node] tool_calls: {response.tool_calls}")
 
         msgs.append(response)
 
@@ -711,19 +695,6 @@ async def action_node(state: FinanceAgentState, config: RunnableConfig) -> dict:
 
     tool_map = {t.name: t for t in hermes_tools}
     llm = _make_llm(model="gpt-4o", temperature=0.1).bind_tools(hermes_tools)
-
-    # Debug: log tool binding info
-    tool_names = [t.name for t in hermes_tools]
-    logger.info(f"[action_node] bound {len(hermes_tools)} tools: {tool_names[:5]}...")
-    if hermes_tools:
-        first = hermes_tools[0]
-        logger.info(f"[action_node] first tool: name={first.name}, desc={first.description[:80] if first.description else 'None'}")
-        if hasattr(first, 'args_schema') and first.args_schema:
-            try:
-                schema = first.args_schema.model_json_schema()
-                logger.info(f"[action_node] first tool schema keys: {list(schema.get('properties', {}).keys())}")
-            except Exception as e:
-                logger.info(f"[action_node] schema error: {e}")
 
     # Build context with the user's accounts so the LLM can resolve
     # account_id automatically when the user says "minha conta principal".
