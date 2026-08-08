@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import unicodedata
 from enum import Enum
@@ -122,6 +123,8 @@ def _make_llm(model: str = _BASE_MODEL, temperature: float = 0.1, **kw) -> ChatO
 
 
 finance_tool_map = {t.name: t for t in finance_tools}
+
+logger = logging.getLogger(__name__)
 
 
 def _latest_user_message(messages: list) -> HumanMessage | None:
@@ -678,14 +681,18 @@ async def action_node(state: FinanceAgentState, config: RunnableConfig) -> dict:
     tool_map = {t.name: t for t in hermes_tools}
     llm = _make_llm(model="gpt-4o", temperature=0.1).bind_tools(hermes_tools)
 
-    # Debug: log tool names and first tool's schema
+    # Debug: log tool binding info
     tool_names = [t.name for t in hermes_tools]
-    print(f"[action_node] bound {len(hermes_tools)} tools: {tool_names[:5]}...")
+    logger.info(f"[action_node] bound {len(hermes_tools)} tools: {tool_names[:5]}...")
     if hermes_tools:
         first = hermes_tools[0]
-        print(f"[action_node] first tool: name={first.name}, desc={first.description[:80] if first.description else 'None'}")
-        if hasattr(first, 'args_schema'):
-            print(f"[action_node] first tool schema: {first.args_schema.model_json_schema() if hasattr(first.args_schema, 'model_json_schema') else 'no schema method'}")
+        logger.info(f"[action_node] first tool: name={first.name}, desc={first.description[:80] if first.description else 'None'}")
+        if hasattr(first, 'args_schema') and first.args_schema:
+            try:
+                schema = first.args_schema.model_json_schema()
+                logger.info(f"[action_node] first tool schema keys: {list(schema.get('properties', {}).keys())}")
+            except Exception as e:
+                logger.info(f"[action_node] schema error: {e}")
 
     # Build context with the user's accounts so the LLM can resolve
     # account_id automatically when the user says "minha conta principal".
