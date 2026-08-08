@@ -299,9 +299,13 @@ async def _run_agent_loop(
     if node_name == "action":
         tool_instruction = (
             "\n\nIMPORTANTE: A mensagem do usuário é um pedido de AÇÃO. "
-            "Interprete o que ele quer e chame a ferramenta apropriada "
-            "IMEDIATAMENTE. Não pergunte qual operação ele quer realizar — "
-            "a mensagem já é o pedido. Chame a tool e depois confirme."
+            "Interprete o que ele quer e chame a ferramenta apropriada. "
+            "ANTES de chamar qualquer tool, verifique se TODOS os "
+            "parâmetros obrigatórios estão presentes na mensagem do "
+            "usuário. Se faltar qualquer campo obrigatório (ex: valor "
+            "de uma transação), PERGUNTE ao usuário — NUNCA invente "
+            "ou assuma um valor. Só chame a tool quando tiver todos "
+            "os dados necessários."
         )
     else:
         tool_instruction = (
