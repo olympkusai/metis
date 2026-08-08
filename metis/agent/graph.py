@@ -678,6 +678,15 @@ async def action_node(state: FinanceAgentState, config: RunnableConfig) -> dict:
     tool_map = {t.name: t for t in hermes_tools}
     llm = _make_llm(model="gpt-4o", temperature=0.1).bind_tools(hermes_tools)
 
+    # Debug: log tool names and first tool's schema
+    tool_names = [t.name for t in hermes_tools]
+    print(f"[action_node] bound {len(hermes_tools)} tools: {tool_names[:5]}...")
+    if hermes_tools:
+        first = hermes_tools[0]
+        print(f"[action_node] first tool: name={first.name}, desc={first.description[:80] if first.description else 'None'}")
+        if hasattr(first, 'args_schema'):
+            print(f"[action_node] first tool schema: {first.args_schema.model_json_schema() if hasattr(first.args_schema, 'model_json_schema') else 'no schema method'}")
+
     # Build context with the user's accounts so the LLM can resolve
     # account_id automatically when the user says "minha conta principal".
     context_block = json.dumps(
