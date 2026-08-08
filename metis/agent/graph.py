@@ -280,11 +280,19 @@ async def _run_agent_loop(
     """Loop LLM → tool call → result para um agente especializado."""
     original_query = _latest_user_message(state.messages)
 
-    tool_instruction = (
-        "\n\nIMPORTANTE: Você tem acesso a ferramentas. Você DEVE chamar as "
-        "ferramentas apropriadas antes de fornecer sua análise final. Não "
-        "responda sem chamar as ferramentas primeiro."
-    )
+    if node_name == "action":
+        tool_instruction = (
+            "\n\nIMPORTANTE: A mensagem do usuário é um pedido de AÇÃO. "
+            "Interprete o que ele quer e chame a ferramenta apropriada "
+            "IMEDIATAMENTE. Não pergunte qual operação ele quer realizar — "
+            "a mensagem já é o pedido. Chame a tool e depois confirme."
+        )
+    else:
+        tool_instruction = (
+            "\n\nIMPORTANTE: Você tem acesso a ferramentas. Você DEVE chamar as "
+            "ferramentas apropriadas antes de fornecer sua análise final. Não "
+            "responda sem chamar as ferramentas primeiro."
+        )
 
     cot_instruction = ""
     if enable_cot:
