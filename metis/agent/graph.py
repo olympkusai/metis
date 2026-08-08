@@ -327,6 +327,10 @@ async def _run_agent_loop(
     # User's message goes LAST so the LLM treats it as the current request
     if original_query:
         msgs.append(original_query)
+    else:
+        logger.warning(f"[{node_name}] No user message found in state.messages (len={len(state.messages)})")
+        for i, m in enumerate(state.messages):
+            logger.info(f"[{node_name}] state.messages[{i}] type={type(m).__name__}: {str(getattr(m, 'content', m))[:100]}")
 
     # Debug: log messages for action node
     if node_name == "action":
