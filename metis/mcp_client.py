@@ -135,8 +135,19 @@ async def discover_hermes_tools(auth_token: str) -> tuple[list[BaseTool], Client
         logger.info(f"[MCP] Discovered {len(tools)} tools from Hermes")
         return tools, client
 
-    except Exception as e:
-        logger.warning(f"[MCP] Failed to connect to Hermes: {e}")
+    except BaseException as e:
+        # Unwrap ExceptionGroup (Python 3.11+ — MCP SDK wraps errors)
+        detail = str(e)
+        if hasattr(e, 'exceptions'):
+            sub_details = []
+            for sub in e.exceptions:
+                if hasattr(sub, 'exceptions'):
+                    for sub2 in sub.exceptions:
+                        sub_details.append(f"{type(sub2).__name__}: {sub2}")
+                else:
+                    sub_details.append(f"{type(sub).__name__}: {sub}")
+            detail = "; ".join(sub_details) if sub_details else str(e)
+        logger.warning(f"[MCP] Failed to connect to Hermes at {hermes_url}: {detail}")
         return [], None
 
 
