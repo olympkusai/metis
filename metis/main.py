@@ -21,7 +21,7 @@ from metis.config import get_settings
 from metis.storage import DatabasePool
 from metis.storage.migrations import run_conversation_migrations
 from metis.memory.conversation_history import set_conversation_db_pool
-from metis.request_id import RequestIdMiddleware, RequestIdLogFilter
+from metis.request_id import RequestIdMiddleware, RequestIdLogFormatter
 
 
 # Global resources
@@ -33,6 +33,19 @@ _jwt_verifier: JWTVerifier | None = None
 async def lifespan(app: FastAPI):
     """Lifespan manager for database pool and JWT verifier initialization."""
     global _conversation_db_pool, _jwt_verifier
+
+    # Reconfigure logging — uvicorn overrides logging config on startup,
+    # so we need to set our custom formatter on all handlers AFTER uvicorn
+    # has configured its own loggers.
+    _handler = logging.StreamHandler(sys.stderr)
+    _handler.setFormatter(_formatter)
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    root.handlers = [_handler]
+    for name in ("uvicorn", "uvicorn.access", "uvicorn.error"):
+        lg = logging.getLogger(name)
+        lg.handlers = [_handler]
+        lg.propagate = False
 
     # Startup — db-metis Postgres (conversations, chat_messages, notifications)
     settings = get_settings()
@@ -70,13 +83,10 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Metis", lifespan=lifespan)
 
-# Configure logging with request ID
-logging.basicConfig(
-    level=logging.INFO,
-    stream=sys.stderr,
-    format="%(asctime)s [%(name)s] [req=%(request_id)s] %(levelname)s: %(message)s",
-)
-logging.getLogger().addFilter(RequestIdLogFilter())
+# Configure logging with request ID — done in lifespan after uvicorn sets
+# up its own loggers, so we can override their handlers with our formatter.
+_LOG_FORMAT = "%(asctime)s [%(name)s] [req=%(request_id)s] %(levelname)s: %(message)s"
+_formatter = RequestIdLogFormatter(_LOG_FORMAT)
 
 # Configure CORS
 app.add_middleware(

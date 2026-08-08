@@ -49,9 +49,11 @@ class RequestIdMiddleware:
         await self.app(scope, receive, send_with_rid)
 
 
-class RequestIdLogFilter(logging.Filter):
-    """Logging filter that injects the current request_id into every log record."""
+class RequestIdLogFormatter(logging.Formatter):
+    """Logging formatter that injects the current request_id into every log
+    record. Uses a Formatter (not a Filter) so it works with uvicorn's own
+    handlers which don't inherit from the root logger."""
 
-    def filter(self, record: logging.LogRecord) -> bool:
+    def format(self, record: logging.LogRecord) -> str:
         record.request_id = get_request_id() or "-"
-        return True
+        return super().format(record)
