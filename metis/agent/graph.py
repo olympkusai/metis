@@ -21,7 +21,7 @@ import json
 import logging
 import re
 import unicodedata
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
@@ -703,7 +703,9 @@ async def action_node(state: FinanceAgentState, config: RunnableConfig) -> dict:
 
     # Build context with the user's accounts so the LLM can resolve
     # account_id automatically when the user says "minha conta principal".
-    today = datetime.now().strftime("%Y-%m-%d")
+    now_utc = datetime.now(timezone.utc)
+    today = now_utc.strftime("%Y-%m-%d")
+    time_utc = now_utc.strftime("%H:%M")
     context_block = json.dumps(
         {"accounts": state.finance_accounts},
         ensure_ascii=False, default=str,
@@ -714,8 +716,10 @@ async def action_node(state: FinanceAgentState, config: RunnableConfig) -> dict:
         llm,
         system_prompt=_FINANCE_ACTION_SYSTEM,
         extra_context=(
-            f"[DATA ATUAL] {today} (use esta data quando o usuário não "
-            f"especificar uma data)\n\n[CONTAS DO USUÁRIO]\n{context_block}"
+            f"[DATA ATUAL] {today} (UTC) — use esta data quando o usuário não "
+            f"especificar uma data. NUNCA use data futura.\n"
+            f"[HORÁRIO ATUAL] {time_utc} (UTC)\n\n"
+            f"[CONTAS DO USUÁRIO]\n{context_block}"
         ),
         clear_steps=True,
         node_name="action",
