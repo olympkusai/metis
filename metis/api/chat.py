@@ -266,7 +266,11 @@ async def streaming_chat(
                 # - finance_context: no LLM, static messages fake-streamed below
                 # - data_gathering: tool calls + CoT (shown via node_execution)
                 # - analysis: CoT only (shown via node_execution), not user text
-                if node in ("finance_orchestrator", "finance_context", "data_gathering", "analysis"):
+                # - finance_agent_v2: ReAct loop streams ALL iterations (intermediate
+                #   reasoning + tool-call deliberation + final answer) which mixes
+                #   messages. Skip live tokens; fake-stream the final answer from
+                #   the state update below (same as greeting/out-of-scope).
+                if node in ("finance_orchestrator", "finance_context", "data_gathering", "analysis", "finance_agent_v2"):
                     continue
 
                 # 'synthesis' streams the user-facing answer directly —
@@ -303,6 +307,19 @@ async def streaming_chat(
                         node_name == "finance_context"
                         and state_update.get("final_answer")
                         and state_update.get("next_action") == NextAction.FINALIZE.value
+                    ):
+                        async for sse_line in _yield_token_events(
+                            state_update["final_answer"], node_name
+                        ):
+                            yield sse_line
+
+                    # v2: finance_agent_v2 sets final_answer in its state update.
+                    # Live tokens were skipped (see filter above) to avoid
+                    # mixing intermediate ReAct reasoning with the final answer.
+                    # Fake-stream the final answer now for a smooth UX.
+                    if (
+                        node_name == "finance_agent_v2"
+                        and state_update.get("final_answer")
                     ):
                         async for sse_line in _yield_token_events(
                             state_update["final_answer"], node_name
