@@ -239,15 +239,23 @@ async def streaming_chat(
         accumulated_state: dict = {}
         current_node: str = ""
 
-        # v2 real token streaming: the AgentRuntime calls stream_callback for
-        # each text chunk of the final answer (bypassing LangGraph's
-        # stream_mode which mixes intermediate ReAct reasoning). The callback
-        # pushes tokens to a queue; we drain it after each agent.astream event.
-        token_queue: asyncio.Queue = asyncio.Queue()
+        # v2 real-time streaming via callbacks (bypassing LangGraph's
+        # stream_mode which mixes intermediate reasoning with final answer
+        # and fires node_execution only after the node completes).
+        #
+        # event_queue holds typed tuples: ("reasoning", text) or ("token", text)
+        # - reasoning: emitted as node_execution SSE events (shows "Consultando X...")
+        # - token: emitted as token SSE events (final answer, token by token)
+        # The queue preserves order: reasoning lines are pushed during tool
+        # calls (before the final answer), so they appear first in the UI.
+        event_queue: asyncio.Queue = asyncio.Queue()
         v2_tokens_streamed = False
 
         async def stream_callback(content: str) -> None:
-            token_queue.put_nowait(content)
+            event_queue.put_nowait(("token", content))
+
+        async def reasoning_callback(content: str) -> None:
+            event_queue.put_nowait(("reasoning", content))
 
         # stream_mode=["messages", "updates"] gives us both token-level
         # streaming AND node completion events in a single iteration.
@@ -255,7 +263,10 @@ async def streaming_chat(
             initial_state,
             config={
                 "recursion_limit": 60,
-                "metadata": {"stream_callback": stream_callback},
+                "metadata": {
+                    "stream_callback": stream_callback,
+                    "reasoning_callback": reasoning_callback,
+                },
             },
             stream_mode=["messages", "updates"],
         ):
@@ -339,7 +350,13 @@ async def streaming_chat(
                         ):
                             yield sse_line
 
-                    # Emit node_execution with CoT if available
+                    # Emit node_execution with CoT if available.
+                    # Skip for finance_agent_v2 — reasoning was already
+                    # emitted in real time via reasoning_callback (one
+                    # node_execution per tool call, before the answer).
+                    if node_name == "finance_agent_v2":
+                        continue
+
                     thought = ""
                     if "cot" in state_update and state_update["cot"]:
                         thought = state_update["cot"]
@@ -354,21 +371,46 @@ async def streaming_chat(
                     }
                     yield f"data: {json.dumps(step_data)}\n\n"
 
-            # Drain the token queue after every event (messages or updates).
-            # The AgentRuntime's stream_callback pushes final-answer tokens
-            # here in real time; we emit them as SSE token events.
-            while not token_queue.empty():
-                content = token_queue.get_nowait()
+            # Drain the event queue after every astream event.
+            # The queue holds typed tuples pushed by the AgentRuntime's
+            # callbacks in real time:
+            #   ("reasoning", text) → emit as node_execution SSE event
+            #   ("token", text)     → emit as token SSE event
+            # Order is preserved: reasoning lines (from tool calls) are
+            # pushed before token lines (from the final answer), so the
+            # UI shows "Consultando X..." before the answer streams.
+            while not event_queue.empty():
+                event_type, content = event_queue.get_nowait()
+                if event_type == "reasoning":
+                    step_data = {
+                        "node": "finance_agent_v2",
+                        "type": "node_execution",
+                        "timestamp": asyncio.get_event_loop().time(),
+                        "reasoning": "",
+                        "thought": content,
+                    }
+                    yield f"data: {json.dumps(step_data)}\n\n"
+                elif event_type == "token":
+                    v2_tokens_streamed = True
+                    async for sse_line in _yield_token_events(content, "finance_agent_v2"):
+                        yield sse_line
+
+        # Final drain — catch any events pushed after the last astream event.
+        while not event_queue.empty():
+            event_type, content = event_queue.get_nowait()
+            if event_type == "reasoning":
+                step_data = {
+                    "node": "finance_agent_v2",
+                    "type": "node_execution",
+                    "timestamp": asyncio.get_event_loop().time(),
+                    "reasoning": "",
+                    "thought": content,
+                }
+                yield f"data: {json.dumps(step_data)}\n\n"
+            elif event_type == "token":
                 v2_tokens_streamed = True
                 async for sse_line in _yield_token_events(content, "finance_agent_v2"):
                     yield sse_line
-
-        # Final drain — catch any tokens pushed after the last astream event.
-        while not token_queue.empty():
-            content = token_queue.get_nowait()
-            v2_tokens_streamed = True
-            async for sse_line in _yield_token_events(content, "finance_agent_v2"):
-                yield sse_line
 
         final_event = {
             "node": "final",

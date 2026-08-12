@@ -157,15 +157,20 @@ async def finance_agent_v2_node(
             system_prompt = system_prompt + "\n\n" + directives
 
     # ── 5. Run AgentRuntime ─────────────────────────────────────
-    # Extract stream_callback from RunnableConfig.metadata if present.
-    # chat.py injects it so the runtime can stream the final answer's
-    # tokens in real time via SSE, bypassing LangGraph's stream_mode
-    # (which mixes intermediate ReAct reasoning with the final answer).
+    # Extract callbacks from RunnableConfig.metadata if present.
+    # chat.py injects them so the runtime can:
+    # - stream_callback: stream final answer tokens in real time via SSE
+    # - reasoning_callback: emit tool-call reasoning in real time so the
+    #   UI shows "Consultando X..." BEFORE the final answer appears
+    # Both bypass LangGraph's stream_mode (which mixes intermediate ReAct
+    # reasoning with the final answer and fires node_execution too late).
     stream_callback = None
+    reasoning_callback = None
     if config:
         metadata = config.get("metadata", {}) if hasattr(config, "get") else {}
         if isinstance(metadata, dict):
             stream_callback = metadata.get("stream_callback")
+            reasoning_callback = metadata.get("reasoning_callback")
 
     try:
         runtime = AgentRuntime(
@@ -177,6 +182,7 @@ async def finance_agent_v2_node(
             enable_cot=False,
             node_name="finance_agent_v2",
             stream_callback=stream_callback,
+            reasoning_callback=reasoning_callback,
         )
 
         result: AgentResult = await runtime.run(

@@ -239,6 +239,7 @@ class AgentRuntime:
         node_name: str = "agent",
         tool_labels: dict[str, str] | None = None,
         stream_callback: Callable[[str], Awaitable[None]] | None = None,
+        reasoning_callback: Callable[[str], Awaitable[None]] | None = None,
     ):
         self.system_prompt = system_prompt
         self.tools = tools
@@ -250,6 +251,7 @@ class AgentRuntime:
         self.node_name = node_name
         self.tool_labels = tool_labels if tool_labels is not None else dict(_DEFAULT_TOOL_LABELS)
         self.stream_callback = stream_callback
+        self.reasoning_callback = reasoning_callback
 
         settings = get_settings()
         self.llm = ChatOpenAI(
@@ -498,11 +500,16 @@ class AgentRuntime:
                             f"{k}={v}" for k, v in args.items()
                             if k not in ("auth_token",) and v
                         )
-                        reasoning_lines.append(
+                        reasoning_line = (
                             f"Consultando {friendly}({arg_str})" if arg_str else f"Consultando {friendly}"
                         )
                     else:
-                        reasoning_lines.append(f"Consultando {friendly}")
+                        reasoning_line = f"Consultando {friendly}"
+                    reasoning_lines.append(reasoning_line)
+                    # Emit reasoning in real time so the UI shows what the
+                    # agent is doing BEFORE the final answer streams.
+                    if self.reasoning_callback is not None:
+                        await self.reasoning_callback(reasoning_line)
                     # Track for repetition/cycle detection
                     try:
                         args_key = json.dumps(args, sort_keys=True, default=str)
