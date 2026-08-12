@@ -743,6 +743,15 @@ class AgentRuntime:
                     for tc in response.tool_calls
                 )
 
+                if has_write_tool:
+                    tool_names = [tc.get("name", "") for tc in response.tool_calls]
+                    logger.info(
+                        f"[{self.node_name}] Write tool detected: {tool_names}, "
+                        f"user_confirmed={user_confirmed}, "
+                        f"user_cancelled={user_cancelled}, "
+                        f"user_msg='{user_message_text[:50]}'"
+                    )
+
                 if has_write_tool and not user_confirmed:
                     if user_cancelled:
                         # User cancelled — return immediately, don't loop
