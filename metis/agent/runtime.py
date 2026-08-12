@@ -729,13 +729,13 @@ class AgentRuntime:
                 # If the LLM calls a write tool (create_*, delete_*, etc.)
                 # and the user hasn't confirmed yet (no confirmation word in
                 # their latest message), BLOCK the tool and emit an
-                # action_request automatically. This enforces the
-                # confirmation flow regardless of what the LLM does.
+                # action_request automatically. Then STOP the loop and
+                # return a final answer telling the user to confirm.
                 #
                 # If the user HAS confirmed (said "Sim", "Confirmar", etc.),
                 # allow the write tool to execute.
-                # If the user cancelled ("Cancelar", "Não"), block and tell
-                # the LLM the action was cancelled.
+                # If the user cancelled ("Cancelar", "Não"), return a
+                # cancellation message.
                 user_confirmed = _user_confirmed(user_message_text)
                 user_cancelled = _user_cancelled(user_message_text)
                 has_write_tool = any(
@@ -745,111 +745,49 @@ class AgentRuntime:
 
                 if has_write_tool and not user_confirmed:
                     if user_cancelled:
-                        # User cancelled — don't execute, tell the LLM
-                        blocked_msgs = []
-                        for tc in response.tool_calls:
-                            tool_name = tc.get("name", "unknown")
-                            if _is_write_tool(tool_name):
-                                blocked_msgs.append(ToolMessage(
-                                    content=f"[AÇÃO CANCELADA PELO USUÁRIO] "
-                                            f"O usuário cancelou a ação '{tool_name}'. "
-                                            f"NÃO tente novamente. Informe o usuário "
-                                            f"que a ação foi cancelada.",
-                                    tool_call_id=tc.get("id", ""),
-                                ))
-                            else:
-                                # Non-write tools still execute
-                                pass
-                        # Execute only non-write tools
-                        write_call_ids = {
-                            tc.get("id") for tc in response.tool_calls
-                            if _is_write_tool(tc.get("name", ""))
-                        }
-                        if write_call_ids:
-                            # Filter out write tool calls, keep only reads
-                            read_response = response
-                            # We can't easily filter tool_calls on an
-                            # AIMessage, so just execute all and replace
-                            # write tool results with cancel messages
-                            tool_msgs, steps = await _execute_tools(
-                                response, steps, cache=self.tool_cache,
-                                tool_map=self.tool_map,
-                            )
-                            # Replace write tool results with cancel messages
-                            for i, tm in enumerate(tool_msgs):
-                                if hasattr(tm, "tool_call_id") and tm.tool_call_id in write_call_ids:
-                                    tool_msgs[i] = ToolMessage(
-                                        content=f"[AÇÃO CANCELADA PELO USUÁRIO] "
-                                                f"NÃO tente novamente.",
-                                        tool_call_id=tm.tool_call_id,
-                                    )
-                            msgs.extend(tool_msgs)
-                            all_tool_msgs.extend(tool_msgs)
-                            continue
-                    else:
-                        # No confirmation yet — block write tools, emit
-                        # action_request for each write tool call
-                        write_calls = [
-                            tc for tc in response.tool_calls
-                            if _is_write_tool(tc.get("name", ""))
-                        ]
-                        read_calls = [
-                            tc for tc in response.tool_calls
-                            if not _is_write_tool(tc.get("name", ""))
-                        ]
+                        # User cancelled — return immediately, don't loop
+                        cancel_answer = "Ação cancelada. Posso ajudar com algo mais?"
+                        return AgentResult(
+                            answer=cancel_answer,
+                            cot=_failure_cot(self.node_name, "Ação cancelada pelo usuário"),
+                            status=NodeStatus.SUCCESS,
+                            tool_messages=all_tool_msgs,
+                            steps=steps,
+                        )
 
-                        # Emit action_request for the first write tool
-                        # (typically there's only one per turn)
-                        if self.action_callback is not None and write_calls:
-                            tc = write_calls[0]
-                            args = dict(tc.get("args") or {})
-                            action_data = _build_action_from_tool(
-                                tc.get("name", ""), args
-                            )
-                            await self.action_callback(action_data)
+                    # No confirmation yet — block ALL write tools, emit
+                    # action_request, and STOP the loop immediately.
+                    # Returning here prevents the LLM from retrying the
+                    # tool call in a loop (which caused "too many failed
+                    # attempts").
+                    write_calls = [
+                        tc for tc in response.tool_calls
+                        if _is_write_tool(tc.get("name", ""))
+                    ]
 
-                        # Execute read tools (if any) but block write tools
-                        if read_calls:
-                            # Execute only read tools — create a filtered
-                            # response. Since we can't easily filter
-                            # tool_calls on AIMessage, execute all and
-                            # replace write tool results with block messages
-                            tool_msgs, steps = await _execute_tools(
-                                response, steps, cache=self.tool_cache,
-                                tool_map=self.tool_map,
-                            )
-                            write_ids = {tc.get("id") for tc in write_calls}
-                            for i, tm in enumerate(tool_msgs):
-                                if hasattr(tm, "tool_call_id") and tm.tool_call_id in write_ids:
-                                    tool_msgs[i] = ToolMessage(
-                                        content=f"[AÇÃO BLOQUEADA] A ação foi "
-                                                f"enviada para confirmação do "
-                                                f"usuário. Aguarde a resposta "
-                                                f"do usuário no próximo turno. "
-                                                f"NÃO chame esta tool novamente. "
-                                                f"Responda brevemente que está "
-                                                f"aguardando confirmação.",
-                                        tool_call_id=tm.tool_call_id,
-                                    )
-                            msgs.extend(tool_msgs)
-                            all_tool_msgs.extend(tool_msgs)
-                        else:
-                            # Only write tools — all blocked
-                            blocked_msgs = []
-                            for tc in write_calls:
-                                blocked_msgs.append(ToolMessage(
-                                    content=f"[AÇÃO BLOQUEADA] A ação foi "
-                                            f"enviada para confirmação do "
-                                            f"usuário. Aguarde a resposta "
-                                            f"do usuário no próximo turno. "
-                                            f"NÃO chame esta tool novamente. "
-                                            f"Responda brevemente que está "
-                                            f"aguardando confirmação.",
-                                    tool_call_id=tc.get("id", ""),
-                                ))
-                            msgs.extend(blocked_msgs)
-                            all_tool_msgs.extend(blocked_msgs)
-                        continue
+                    # Emit action_request for the first write tool
+                    if self.action_callback is not None and write_calls:
+                        tc = write_calls[0]
+                        args = dict(tc.get("args") or {})
+                        action_data = _build_action_from_tool(
+                            tc.get("name", ""), args
+                        )
+                        await self.action_callback(action_data)
+
+                    # Return immediately — don't let the LLM retry.
+                    # The user will confirm in the next turn, and the
+                    # tool will execute then (user_confirmed will be True).
+                    wait_answer = (
+                        "Estou aguardando sua confirmação acima para "
+                        "prosseguir. 👆"
+                    )
+                    return AgentResult(
+                        answer=wait_answer,
+                        cot="\n".join(reasoning_lines) if reasoning_lines else "",
+                        status=NodeStatus.SUCCESS,
+                        tool_messages=all_tool_msgs,
+                        steps=steps,
+                    )
 
                 # Also handle explicit request_user_action calls from the LLM
                 if self.action_callback is not None:
