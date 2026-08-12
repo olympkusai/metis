@@ -4,6 +4,8 @@ from pydantic import BaseModel
 from typing import Optional
 from langchain_core.messages import HumanMessage, AIMessage
 from metis.agent.graph import get_finance_agent_graph, FinanceAgentState, NextAction
+from metis.agent.graph_v2 import get_finance_agent_graph_v2
+from metis.config import get_settings
 from metis.memory.conversation_history import (
     get_conversation_history,
     MessageRole,
@@ -15,6 +17,14 @@ import asyncio
 import uuid
 
 router = APIRouter()
+
+
+def _get_agent_graph():
+    """Select agent graph based on AGENT_VERSION feature flag."""
+    settings = get_settings()
+    if settings.agent_version == "v2":
+        return get_finance_agent_graph_v2()
+    return get_finance_agent_graph()
 
 
 # ─────────────────────────────────────────────
@@ -130,7 +140,7 @@ async def chat(
 
     messages.append(HumanMessage(content=request.message))
 
-    agent = get_finance_agent_graph()
+    agent = _get_agent_graph()
     initial_state = FinanceAgentState(
         messages=messages,
         user_id=user_id,
@@ -219,7 +229,7 @@ async def streaming_chat(
 
         messages.append(HumanMessage(content=request.message))
 
-        agent = get_finance_agent_graph()
+        agent = _get_agent_graph()
         initial_state = FinanceAgentState(
             messages=messages,
             user_id=user_id,

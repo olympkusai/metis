@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     oidc_issuer: str = Field(default="https://auth.olympkusai.com", description="Expected JWT issuer (must match Soter's OIDC_ISSUER)")
     jwks_cache_ttl_seconds: float = Field(default=600.0, description="TTL in seconds for cached JWKS keys")
     max_concurrent_requests: int = Field(default=10, description="Maximum concurrent API requests")
+    agent_version: str = Field(default="v1", description="Agent graph version: 'v1' (fixed pipeline) or 'v2' (ReAct loop)")
 
     @validator('openai_api_key')
     def validate_openai_key(cls, v):
