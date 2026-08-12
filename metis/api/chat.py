@@ -553,3 +553,67 @@ async def get_trace_stats_endpoint(
     from metis.agent.trace_store import get_trace_stats
     stats = await get_trace_stats(user_id=uid, limit=min(limit, 500))
     return stats
+
+
+@router.post("/admin/backfill-embeddings")
+async def backfill_embeddings_endpoint(
+    authorization: Optional[str] = Header(None),
+    verifier: JWTVerifier = Depends(get_jwt_verifier),
+):
+    """Backfill embeddings for messages without them.
+
+    Admin endpoint — requires JWT auth. Embeds all messages where
+    embedding IS NULL using text-embedding-3-small.
+    """
+    await _validate_and_get_user_id(authorization, verifier)
+
+    from metis.memory.conversation_history import _get_conversation_db_pool
+    from openai import AsyncOpenAI
+    from metis.config import get_settings
+
+    pool = _get_conversation_db_pool()
+    settings = get_settings()
+    client = AsyncOpenAI(api_key=settings.openai_api_key)
+
+    # Count
+    total = await pool.fetchval(
+        "SELECT count(*) FROM chat_messages WHERE embedding IS NULL"
+    )
+
+    if total == 0:
+        return {"status": "nothing to do", "total": 0, "embedded": 0}
+
+    done = 0
+    failed = 0
+    while True:
+        rows = await pool.fetch(
+            "SELECT id, content FROM chat_messages "
+            "WHERE embedding IS NULL ORDER BY created_at LIMIT 50"
+        )
+        if not rows:
+            break
+        texts = [r["content"][:8000] for r in rows]
+        try:
+            resp = await client.embeddings.create(
+                model="text-embedding-3-small", input=texts,
+            )
+            for r, d in zip(rows, resp.data):
+                try:
+                    await pool.execute(
+                        "UPDATE chat_messages SET embedding = $1 WHERE id = $2",
+                        d.embedding, r["id"],
+                    )
+                    done += 1
+                except Exception as e:
+                    print(f"[backfill] Failed to store {r['id']}: {e}")
+                    failed += 1
+        except Exception as e:
+            print(f"[backfill] Batch failed: {e}")
+            failed += len(rows)
+
+    return {
+        "status": "complete",
+        "total": total,
+        "embedded": done,
+        "failed": failed,
+    }
