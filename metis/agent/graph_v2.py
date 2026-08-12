@@ -27,11 +27,13 @@ from langgraph.graph import END, StateGraph
 
 from metis.agent.graph import FinanceAgentState, NextAction
 from metis.agent.runtime import AgentRuntime, AgentResult, NodeStatus, _append_reasoning
+from metis.agent.effort import EffortConfig, get_effort_config
 from metis.tools import build_tool_catalog, close_hermes_client, set_auth_token
 from metis.pluto_client import PlutoApiError, get_pluto_client
 from metis.soter_client import SoterApiError, get_soter_client
 from metis.agent.finance_prompts import (
     _FINANCE_AGENT_V2_SYSTEM,
+    _FINANCE_AGENT_V2_COMPRESSED,
     build_personalization_directives,
 )
 
@@ -71,7 +73,31 @@ async def finance_agent_v2_node(
     set_auth_token(state.auth_token)
     tools, hermes_client = await build_tool_catalog(state.auth_token)
 
+    # ── 1b. Determine effort level ──────────────────────────────
+    # Extract the user's latest message for auto-selection
+    user_message = ""
+    if state.messages:
+        for m in reversed(state.messages):
+            if isinstance(m, HumanMessage):
+                user_message = getattr(m, "content", "") or ""
+                break
+            elif isinstance(m, dict) and m.get("type") in ("human", "user"):
+                user_message = m.get("content", "") or ""
+                break
+
+    # Effort level from config metadata or env var, default: auto
+    effort_level = "auto"
+    if config:
+        metadata = config.get("metadata", {}) if hasattr(config, "get") else {}
+        if isinstance(metadata, dict):
+            effort_level = metadata.get("effort", "auto")
+
+    effort = get_effort_config(effort_level, user_message)
+    logger.info(f"[finance_agent_v2] effort={effort.level} model={effort.model} "
+                f"msg='{user_message[:60]}'")
+
     # ── 2. Fetch user profile + accounts + categories (pre-step, not a tool) ─
+    # Pre-fetch reports based on effort level to reduce ReAct iterations
     try:
         client = get_pluto_client()
         soter = get_soter_client()
@@ -86,6 +112,37 @@ async def finance_agent_v2_node(
             categories = await client.list_categories(token=state.auth_token)
         except Exception:
             pass
+
+        # Pre-fetch reports based on effort config (reduces ReAct iterations)
+        spending_data = None
+        cashflow_data = None
+        budget_data = None
+        goals_data = None
+        prefetch_tasks = []
+        if effort.prefetch_spending:
+            prefetch_tasks.append(("spending", client.spending_by_category(token=state.auth_token)))
+        if effort.prefetch_cashflow:
+            prefetch_tasks.append(("cashflow", client.cashflow(token=state.auth_token)))
+        if effort.prefetch_budget:
+            prefetch_tasks.append(("budget", client.budget_progress(token=state.auth_token)))
+        if effort.prefetch_goals:
+            prefetch_tasks.append(("goals", client.goal_summary(token=state.auth_token)))
+
+        if prefetch_tasks:
+            prefetch_results = await asyncio.gather(
+                *[t[1] for t in prefetch_tasks], return_exceptions=True,
+            )
+            for (name, _), result in zip(prefetch_tasks, prefetch_results):
+                if isinstance(result, Exception):
+                    logger.warning(f"[finance_agent_v2] prefetch {name} failed: {result}")
+                elif name == "spending":
+                    spending_data = result
+                elif name == "cashflow":
+                    cashflow_data = result
+                elif name == "budget":
+                    budget_data = result
+                elif name == "goals":
+                    goals_data = result
 
         # AI personalization from Soter (best-effort)
         personalization: dict = {}
@@ -164,8 +221,22 @@ async def finance_agent_v2_node(
         f"[PERFIL FINANCEIRO DO USUÁRIO]\n{profile_json}"
     )
 
+    # Add pre-fetched reports to context (saves ReAct iterations)
+    if spending_data is not None:
+        extra_context += f"\n\n[GASTOS POR CATEGORIA (mês corrente)]\n{json.dumps(spending_data, ensure_ascii=False, default=str)}"
+    if cashflow_data is not None:
+        extra_context += f"\n\n[FLUXO DE CAIXA (mês corrente)]\n{json.dumps(cashflow_data, ensure_ascii=False, default=str)}"
+    if budget_data is not None:
+        extra_context += f"\n\n[PROGRESSO DO ORÇAMENTO]\n{json.dumps(budget_data, ensure_ascii=False, default=str)}"
+    if goals_data is not None:
+        extra_context += f"\n\n[RESUMO DE METAS]\n{json.dumps(goals_data, ensure_ascii=False, default=str)}"
+
     # ── 4. Apply personalization directives to system prompt ────
-    system_prompt = _FINANCE_AGENT_V2_SYSTEM
+    # Use compressed prompt for low effort, full prompt otherwise
+    system_prompt = (
+        _FINANCE_AGENT_V2_COMPRESSED if effort.compressed_prompt
+        else _FINANCE_AGENT_V2_SYSTEM
+    )
     pers = personalization
     profile_currency = profile.get("currency") if isinstance(profile, dict) else None
     if pers and isinstance(pers, dict):
@@ -202,9 +273,9 @@ async def finance_agent_v2_node(
         runtime = AgentRuntime(
             system_prompt=system_prompt,
             tools=tools,
-            model="gpt-4o",
-            temperature=0.1,
-            max_iterations=20,
+            model=effort.model,
+            temperature=effort.temperature,
+            max_iterations=effort.max_iterations,
             enable_cot=False,
             node_name="finance_agent_v2",
             stream_callback=stream_callback,

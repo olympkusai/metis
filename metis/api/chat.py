@@ -5,6 +5,7 @@ from typing import Optional
 from langchain_core.messages import HumanMessage, AIMessage
 from metis.agent.graph import get_finance_agent_graph, FinanceAgentState, NextAction
 from metis.agent.graph_v2 import get_finance_agent_graph_v2
+from metis.agent.effort import get_effort_config
 from metis.config import get_settings
 from metis.memory.conversation_history import (
     get_conversation_history,
@@ -202,10 +203,19 @@ async def streaming_chat(
     )
 
     async def event_generator():
+        # Determine effort level for this request.
+        # Can be set via env var (AGENT_EFFORT=low/medium/high/auto) or
+        # per-request via the request body. Default: auto.
+        settings = get_settings()
+        effort_level = getattr(settings, "agent_effort", None) or "auto"
+
+        # Auto-select based on the user's message
+        effort = get_effort_config(effort_level, request.message)
+
         session_history = await conv_history.get_conversation_history(
             user_id=user_id,
             session_id=session_id,
-            limit=20,
+            limit=effort.history_limit,
         )
         global_context = await conv_history.get_global_context(
             user_id=user_id,
@@ -270,6 +280,7 @@ async def streaming_chat(
                     "stream_callback": stream_callback,
                     "reasoning_callback": reasoning_callback,
                     "action_callback": action_callback,
+                    "effort": effort.level,
                 },
             },
             stream_mode=["messages", "updates"],
