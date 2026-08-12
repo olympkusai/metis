@@ -71,14 +71,21 @@ async def finance_agent_v2_node(
     set_auth_token(state.auth_token)
     tools, hermes_client = await build_tool_catalog(state.auth_token)
 
-    # ── 2. Fetch user profile + accounts (pre-step, not a tool) ─
+    # ── 2. Fetch user profile + accounts + categories (pre-step, not a tool) ─
     try:
         client = get_pluto_client()
         soter = get_soter_client()
+        # Categories is best-effort: if the endpoint doesn't exist or fails,
+        # we still proceed with profile + accounts.
         profile, accounts = await asyncio.gather(
             client.get_financial_profile(token=state.auth_token),
             client.list_accounts(token=state.auth_token),
         )
+        categories: dict | list = []
+        try:
+            categories = await client.list_categories(token=state.auth_token)
+        except Exception:
+            pass
 
         # AI personalization from Soter (best-effort)
         personalization: dict = {}
@@ -132,11 +139,28 @@ async def finance_agent_v2_node(
     accounts_json = json.dumps(accounts_data, ensure_ascii=False, default=str)
     profile_json = json.dumps(profile, ensure_ascii=False, default=str)
 
+    # Build a compact category list (id + name only) for the context
+    categories_data = (
+        categories.get("categories", categories)
+        if isinstance(categories, dict)
+        else categories
+    ) if categories else []
+    categories_compact = []
+    if isinstance(categories_data, list):
+        for cat in categories_data:
+            if isinstance(cat, dict):
+                categories_compact.append({
+                    "id": cat.get("id", cat.get("category_id", "")),
+                    "name": cat.get("name", ""),
+                })
+    categories_json = json.dumps(categories_compact, ensure_ascii=False, default=str)
+
     extra_context = (
         f"[DATA ATUAL] {today} (UTC) — use esta data quando o usuário não "
         f"especificar uma data. NUNCA use data futura.\n"
         f"[HORÁRIO ATUAL] {time_utc} (UTC)\n\n"
         f"[CONTAS DO USUÁRIO]\n{accounts_json}\n\n"
+        f"[CATEGORIAS DO USUÁRIO]\n{categories_json}\n\n"
         f"[PERFIL FINANCEIRO DO USUÁRIO]\n{profile_json}"
     )
 

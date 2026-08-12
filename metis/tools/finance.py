@@ -108,11 +108,45 @@ async def list_transactions_filtered(
     """Lista transações do usuário com filtros opcionais por categoria, tipo
     (expense/income/saving/investment/dividend/investment_withdrawal/transfer)
     e período (YYYY-MM-DD). Use quando precisar ver transações individuais,
-    não apenas totais agregados."""
+    não apenas totais agregados.
+
+    category_id pode ser o UUID da categoria OU o nome da categoria
+    (ex: "mercado", "lazer", "transporte"). Se for um nome, a tool
+    resolve automaticamente para o UUID correspondente."""
     try:
-        data = await get_pluto_client().list_transactions(
-            token=_current_token(),
-            category_id=category_id,
+        client = get_pluto_client()
+        token = _current_token()
+
+        # Resolve category name → UUID if needed
+        resolved_category_id = category_id
+        if category_id and not _is_uuid(category_id):
+            try:
+                cats_data = await client.list_categories(token=token)
+                categories = (
+                    cats_data.get("categories", cats_data)
+                    if isinstance(cats_data, dict)
+                    else cats_data
+                )
+                if isinstance(categories, list):
+                    cat_lower = category_id.lower().strip()
+                    for cat in categories:
+                        cat_name = ""
+                        cat_uuid = ""
+                        if isinstance(cat, dict):
+                            cat_name = str(cat.get("name", "")).lower()
+                            cat_uuid = cat.get("id", cat.get("category_id", ""))
+                        elif isinstance(cat, str):
+                            cat_name = cat.lower()
+                        if cat_name == cat_lower and cat_uuid:
+                            resolved_category_id = cat_uuid
+                            break
+            except PlutoApiError:
+                # If category lookup fails, try with the original value
+                pass
+
+        data = await client.list_transactions(
+            token=token,
+            category_id=resolved_category_id,
             type=type,
             date_from=date_from,
             date_to=date_to,
@@ -121,6 +155,18 @@ async def list_transactions_filtered(
         return json.dumps(data)
     except PlutoApiError as e:
         return json.dumps({"error": str(e)})
+
+
+def _is_uuid(value: str) -> bool:
+    """Check if a string looks like a UUID."""
+    if not value or len(value) < 32:
+        return False
+    try:
+        import uuid as _uuid
+        _uuid.UUID(value)
+        return True
+    except (ValueError, AttributeError):
+        return False
 
 
 finance_tools = [

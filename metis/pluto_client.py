@@ -81,6 +81,9 @@ class PlutoApiClient:
     async def list_accounts(self, *, token: str) -> dict:
         return await self._request_json("GET", "/accounts", token=token)
 
+    async def list_categories(self, *, token: str) -> dict:
+        return await self._request_json("GET", "/categories", token=token)
+
     # ── Reports (fetched on-demand by finance tools) ──
 
     async def spending_by_category(self, *, token: str, date_from: str = "", date_to: str = "") -> dict:
