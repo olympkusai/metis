@@ -70,6 +70,39 @@ CREATE TABLE IF NOT EXISTS chat_message_feedback (
 # Notifications have been moved to Stentor (db-stentor).
 # The notifications table is no longer created in db-metis.
 
+# ─────────────────────────────────────────────────────────────
+# Agent traces — structured execution traces for observability.
+# Each row is a single agent execution (one user message → one
+# assistant response). The trace_id comes from Nike's X-Request-ID
+# header so traces correlate with gateway logs.
+# ─────────────────────────────────────────────────────────────
+CREATE_AGENT_TRACES_TABLE = """
+CREATE TABLE IF NOT EXISTS agent_traces (
+    trace_id varchar PRIMARY KEY,
+    user_id varchar NOT NULL,
+    session_id varchar NOT NULL,
+    user_message text,
+    final_answer text,
+    total_time_ms int,
+    iterations int,
+    llm_calls int,
+    tool_calls int,
+    input_tokens int,
+    output_tokens int,
+    cost_usd numeric(10,6),
+    effort varchar,
+    model varchar,
+    status varchar NOT NULL DEFAULT 'running',
+    summary jsonb NOT NULL DEFAULT '{}'::jsonb,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_traces_user_id ON agent_traces (user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_traces_session_id ON agent_traces (session_id);
+CREATE INDEX IF NOT EXISTS idx_agent_traces_status ON agent_traces (status);
+"""
+
 
 async def run_conversation_migrations(pool) -> None:
     """Run migrations for the conversation schema (db-metis).
@@ -80,3 +113,4 @@ async def run_conversation_migrations(pool) -> None:
     await pool.execute(CREATE_CONVERSATIONS_TABLE)
     await pool.execute(CREATE_CHAT_MESSAGES_TABLE)
     await pool.execute(CREATE_CHAT_MESSAGE_FEEDBACK_TABLE)
+    await pool.execute(CREATE_AGENT_TRACES_TABLE)

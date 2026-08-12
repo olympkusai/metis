@@ -6,6 +6,7 @@ from langchain_core.messages import HumanMessage, AIMessage
 from metis.agent.graph import get_finance_agent_graph, FinanceAgentState, NextAction
 from metis.agent.graph_v2 import get_finance_agent_graph_v2
 from metis.agent.effort import get_effort_config_async
+from metis.agent.tracing import AgentTrace
 from metis.config import get_settings
 from metis.memory.conversation_history import (
     get_conversation_history,
@@ -177,6 +178,7 @@ async def chat(
 async def streaming_chat(
     request: ChatRequest,
     authorization: Optional[str] = Header(None),
+    x_request_id: Optional[str] = Header(None, alias="X-Request-ID"),
     verifier: JWTVerifier = Depends(get_jwt_verifier),
 ):
     """Streaming endpoint that emits SSE events in real time.
@@ -189,10 +191,21 @@ async def streaming_chat(
     - { type: "node_start", node } — a node started executing
     - { type: "token", node, content } — a token chunk from the LLM (live reasoning)
     - { type: "node_execution", node, thought } — a node completed with its CoT
+    - { type: "action_request", ... } — action card for user confirmation
+    - { type: "trace", ... } — execution metrics (iterations, tokens, cost, effort)
     - { type: "completion", response, session_id } — final answer
     """
     user_id, auth_token = await _validate_and_get_user_id(authorization, verifier)
     session_id = request.session_id or f"{user_id}:{uuid.uuid4().hex}"
+
+    # Trace ID from Nike's X-Request-ID header (or generated if missing)
+    trace_id = x_request_id or uuid.uuid4().hex
+    trace = AgentTrace(
+        trace_id=trace_id,
+        user_id=user_id,
+        session_id=session_id,
+        user_message=request.message,
+    )
 
     conv_history = get_conversation_history()
     await conv_history.save_message(
@@ -211,6 +224,10 @@ async def streaming_chat(
 
         # Auto-select using LLM classifier (gpt-4o-mini) with regex fallback
         effort = await get_effort_config_async(effort_level, request.message)
+
+        # Record effort selection in trace
+        trace.add_event("effort", 0, level=effort.level, model=effort.model,
+                        iterations=effort.max_iterations, history_limit=effort.history_limit)
 
         session_history = await conv_history.get_conversation_history(
             user_id=user_id,
@@ -281,6 +298,7 @@ async def streaming_chat(
                     "reasoning_callback": reasoning_callback,
                     "action_callback": action_callback,
                     "effort": effort.level,
+                    "trace": trace,
                 },
             },
             stream_mode=["messages", "updates"],
@@ -432,23 +450,38 @@ async def streaming_chat(
             elif event_type == "action":
                 yield f"data: {json.dumps(content)}\n\n"
 
+        # Finalize trace and send trace event before completion
+        final_answer = accumulated_state.get("final_answer", "")
+        trace.set_final_answer(final_answer, status="success")
+        trace_sse = trace.sse_summary()
+        yield f"data: {json.dumps(trace_sse)}\n\n"
+
         final_event = {
             "node": "final",
             "type": "completion",
-            "response": accumulated_state.get("final_answer", ""),
+            "response": final_answer,
             "timestamp": asyncio.get_event_loop().time(),
             "session_id": session_id,
+            "trace_id": trace.trace_id,
         }
 
         await conv_history.save_message(
             user_id=user_id,
             session_id=session_id,
             role=MessageRole.ASSISTANT,
-            content=accumulated_state.get("final_answer", ""),
+            content=final_answer,
             metadata={
                 "chain_of_thought": accumulated_state.get("cot", ""),
+                "trace_id": trace.trace_id,
             },
         )
+
+        # Persist trace to database (best-effort, non-blocking)
+        try:
+            from metis.agent.trace_store import save_trace
+            await save_trace(trace)
+        except Exception as e:
+            print(f"[chat] Failed to save trace: {e}")
 
         yield f"data: {json.dumps(final_event)}\n\n"
 
@@ -459,5 +492,63 @@ async def streaming_chat(
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",  # disable proxy buffering (nginx/Railway edge)
+            "X-Request-ID": trace_id,   # echo back for client-side correlation
         },
     )
+
+
+# ─────────────────────────────────────────────────────────────
+# Trace endpoints — observability
+# ─────────────────────────────────────────────────────────────
+
+@router.get("/traces")
+async def list_traces_endpoint(
+    authorization: Optional[str] = Header(None),
+    verifier: JWTVerifier = Depends(get_jwt_verifier),
+    user_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+    limit: int = 20,
+    offset: int = 0,
+):
+    """List agent execution traces.
+
+    Filters by user_id (from JWT) or session_id.
+    Returns summary metrics for each trace.
+    """
+    uid, _ = await _validate_and_get_user_id(authorization, verifier)
+    from metis.agent.trace_store import list_traces
+    traces = await list_traces(
+        user_id=uid,
+        session_id=session_id or "",
+        limit=min(limit, 100),
+        offset=offset,
+    )
+    return {"traces": traces, "count": len(traces)}
+
+
+@router.get("/traces/{trace_id}")
+async def get_trace_endpoint(
+    trace_id: str,
+    authorization: Optional[str] = Header(None),
+    verifier: JWTVerifier = Depends(get_jwt_verifier),
+):
+    """Get a single trace by ID with full event detail."""
+    await _validate_and_get_user_id(authorization, verifier)
+    from metis.agent.trace_store import get_trace
+    trace = await get_trace(trace_id)
+    if not trace:
+        raise HTTPException(status_code=404, detail="Trace not found")
+    return trace
+
+
+@router.get("/traces/stats/summary")
+async def get_trace_stats_endpoint(
+    authorization: Optional[str] = Header(None),
+    verifier: JWTVerifier = Depends(get_jwt_verifier),
+    limit: int = 100,
+):
+    """Aggregate stats from recent traces for the authenticated user."""
+    uid, _ = await _validate_and_get_user_id(authorization, verifier)
+    from metis.agent.trace_store import get_trace_stats
+    stats = await get_trace_stats(user_id=uid, limit=min(limit, 500))
+    return stats

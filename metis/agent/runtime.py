@@ -574,6 +574,7 @@ class AgentRuntime:
         stream_callback: Callable[[str], Awaitable[None]] | None = None,
         reasoning_callback: Callable[[str], Awaitable[None]] | None = None,
         action_callback: Callable[[dict], Awaitable[None]] | None = None,
+        trace: Any = None,  # AgentTrace instance (optional)
     ):
         self.system_prompt = system_prompt
         self.tools = tools
@@ -587,6 +588,7 @@ class AgentRuntime:
         self.stream_callback = stream_callback
         self.reasoning_callback = reasoning_callback
         self.action_callback = action_callback
+        self.trace = trace
 
         settings = get_settings()
         self.llm = ChatOpenAI(
@@ -833,10 +835,23 @@ class AgentRuntime:
                         if input_tokens > 0 or output_tokens > 0:
                             cost_tracker.add_call(model_name, input_tokens, output_tokens, self.node_name)
 
+                        # Trace: LLM call
+                        if self.trace is not None:
+                            from metis.utils.cost_tracker import MODEL_PRICES
+                            price_key = "gpt-4o-mini" if "gpt-4o-mini" in model_name.lower() else "gpt-4o"
+                            prices = MODEL_PRICES.get(price_key, MODEL_PRICES["gpt-4o"])
+                            call_cost = (input_tokens / 1e6 * prices["input"]) + (output_tokens / 1e6 * prices["output"])
+                            self.trace.add_event("llm_call", iteration,
+                                model=model_name, input_tokens=input_tokens,
+                                output_tokens=output_tokens, cost_usd=call_cost,
+                                has_tool_calls=bool(getattr(response, 'tool_calls', None)))
+
                     break
                 except Exception as e:
                     if attempt == MAX_RETRIES - 1:
                         error_msg = f"[LLM ERROR after {MAX_RETRIES} retries]: {str(e)}"
+                        if self.trace is not None:
+                            self.trace.add_event("error", iteration, message=error_msg, phase="llm_call")
                         return AgentResult(
                             answer=error_msg,
                             cot=_failure_cot(self.node_name, error_msg),
@@ -1009,12 +1024,38 @@ class AgentRuntime:
                             }
                             await self.action_callback(action_data)
 
+                # Trace: tool calls (before execution)
+                if self.trace is not None:
+                    for tc in response.tool_calls:
+                        tool_name = tc.get("name", "unknown")
+                        args = dict(tc.get("args") or {})
+                        # Don't log full args (may contain sensitive data)
+                        # Just log the tool name and arg keys
+                        self.trace.add_event("tool_call", iteration,
+                            tool_name=tool_name,
+                            arg_keys=list(args.keys()),
+                            is_write=_is_write_tool(tool_name))
+
                 tool_msgs, steps = await _execute_tools(
                     response, steps, cache=self.tool_cache,
                     tool_map=self.tool_map,
                 )
                 msgs.extend(tool_msgs)
                 all_tool_msgs.extend(tool_msgs)
+
+                # Trace: tool results (after execution)
+                if self.trace is not None:
+                    for tc in response.tool_calls:
+                        tool_name = tc.get("name", "unknown")
+                        # Find corresponding tool message
+                        result_size = 0
+                        for tm in tool_msgs:
+                            tm_content = getattr(tm, 'content', '') or ''
+                            if tm_content and len(tm_content) > result_size:
+                                result_size = len(tm_content)
+                        self.trace.add_event("tool_result", iteration,
+                            tool_name=tool_name,
+                            result_size=result_size)
             elif hasattr(response, 'content'):
                 # AIMessage / AIMessageChunk — use .content (the actual text),
                 # NOT model_dump() which serializes the entire message object
@@ -1029,6 +1070,11 @@ class AgentRuntime:
                 # trail) as CoT so the UI shows what the agent consulted.
                 final_cot = _build_cot(cot) if self.enable_cot else "\n".join(reasoning_lines)
                 status = NodeStatus.OK if (final_cot or not self.enable_cot) else NodeStatus.NO_COT
+                # Trace: final answer
+                if self.trace is not None:
+                    self.trace.add_event("final", iteration,
+                        answer_len=len(answer) if answer else 0,
+                        reasoning_steps=len(reasoning_lines))
                 return AgentResult(
                     answer=answer,
                     cot=final_cot,

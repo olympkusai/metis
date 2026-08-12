@@ -264,12 +264,14 @@ async def finance_agent_v2_node(
     stream_callback = None
     reasoning_callback = None
     action_callback = None
+    trace = None
     if config:
         metadata = config.get("metadata", {}) if hasattr(config, "get") else {}
         if isinstance(metadata, dict):
             stream_callback = metadata.get("stream_callback")
             reasoning_callback = metadata.get("reasoning_callback")
             action_callback = metadata.get("action_callback")
+            trace = metadata.get("trace")
 
     try:
         runtime = AgentRuntime(
@@ -283,6 +285,7 @@ async def finance_agent_v2_node(
             stream_callback=stream_callback,
             reasoning_callback=reasoning_callback,
             action_callback=action_callback,
+            trace=trace,
         )
 
         result: AgentResult = await runtime.run(
@@ -297,6 +300,9 @@ async def finance_agent_v2_node(
             "Tente novamente em alguns instantes."
         )
         print(f"[finance_agent_v2] AgentRuntime error: {e}")
+        if trace is not None:
+            trace.add_event("error", 0, message=str(e), phase="runtime")
+            trace.set_final_answer(error_msg, status="error")
         if hermes_client is not None:
             await close_hermes_client(hermes_client)
         return {
