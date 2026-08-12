@@ -240,6 +240,7 @@ class AgentRuntime:
         tool_labels: dict[str, str] | None = None,
         stream_callback: Callable[[str], Awaitable[None]] | None = None,
         reasoning_callback: Callable[[str], Awaitable[None]] | None = None,
+        action_callback: Callable[[dict], Awaitable[None]] | None = None,
     ):
         self.system_prompt = system_prompt
         self.tools = tools
@@ -252,6 +253,7 @@ class AgentRuntime:
         self.tool_labels = tool_labels if tool_labels is not None else dict(_DEFAULT_TOOL_LABELS)
         self.stream_callback = stream_callback
         self.reasoning_callback = reasoning_callback
+        self.action_callback = action_callback
 
         settings = get_settings()
         self.llm = ChatOpenAI(
@@ -557,6 +559,24 @@ class AgentRuntime:
                         tool_messages=all_tool_msgs,
                         steps=steps,
                     )
+
+                # Intercept request_user_action: emit structured action via
+                # callback so the frontend renders buttons/cards. The tool
+                # still executes (returns a placeholder), and the LLM should
+                # produce a short text response telling the user it's waiting.
+                if self.action_callback is not None:
+                    for tc in response.tool_calls:
+                        if tc.get("name") == "request_user_action":
+                            args = dict(tc.get("args") or {})
+                            action_data = {
+                                "type": "action_request",
+                                "title": args.get("title", ""),
+                                "message": args.get("message", ""),
+                                "options": args.get("options", []),
+                                "action_type": args.get("action_type", "confirm"),
+                                "danger": args.get("danger", False),
+                            }
+                            await self.action_callback(action_data)
 
                 tool_msgs, steps = await _execute_tools(
                     response, steps, cache=self.tool_cache,

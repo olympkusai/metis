@@ -17,6 +17,7 @@ from metis.tools.finance import (
     list_transactions_filtered,
     set_auth_token,
 )
+from metis.tools.user_action import request_user_action
 
 __all__ = [
     "finance_tools",
@@ -27,13 +28,15 @@ __all__ = [
     "get_recurrences_due",
     "list_transactions_filtered",
     "set_auth_token",
+    "request_user_action",
     "build_tool_catalog",
     "close_hermes_client",
 ]
 
 
 async def build_tool_catalog(auth_token: str) -> tuple[list, Any]:
-    """Build a unified tool catalog: finance read tools + Hermes write tools.
+    """Build a unified tool catalog: finance read tools + Hermes write tools
+    + user action tool.
 
     This is the single source of truth for tools available to the AgentRuntime
     in the v2 agentic loop. The LLM sees ALL tools and decides freely which
@@ -47,8 +50,8 @@ async def build_tool_catalog(auth_token: str) -> tuple[list, Any]:
         (tools, hermes_client) — the unified list of LangChain BaseTool
         instances, plus the Hermes MCP client (which must be kept alive
         while tools are in use, and closed via close_hermes_client when done).
-        If Hermes is unreachable, returns (finance_tools, None) — read-only
-        mode, don't break the agent.
+        If Hermes is unreachable, returns (finance_tools + [request_user_action], None)
+        — read-only mode, don't break the agent.
     """
     # Set the ContextVar so finance read tools can authenticate Pluto calls.
     set_auth_token(auth_token)
@@ -56,5 +59,8 @@ async def build_tool_catalog(auth_token: str) -> tuple[list, Any]:
     # Discover Hermes write tools (best-effort: returns ([], None) if down).
     hermes_tools, hermes_client = await discover_hermes_tools(auth_token)
 
-    combined = finance_tools + hermes_tools
+    # Local tools (always available, no external dependency)
+    local_tools = [request_user_action]
+
+    combined = finance_tools + hermes_tools + local_tools
     return combined, hermes_client

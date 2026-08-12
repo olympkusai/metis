@@ -257,6 +257,9 @@ async def streaming_chat(
         async def reasoning_callback(content: str) -> None:
             event_queue.put_nowait(("reasoning", content))
 
+        async def action_callback(data: dict) -> None:
+            event_queue.put_nowait(("action", data))
+
         # stream_mode=["messages", "updates"] gives us both token-level
         # streaming AND node completion events in a single iteration.
         async for mode, payload in agent.astream(
@@ -266,6 +269,7 @@ async def streaming_chat(
                 "metadata": {
                     "stream_callback": stream_callback,
                     "reasoning_callback": reasoning_callback,
+                    "action_callback": action_callback,
                 },
             },
             stream_mode=["messages", "updates"],
@@ -376,6 +380,7 @@ async def streaming_chat(
             # callbacks in real time:
             #   ("reasoning", text) → emit as node_execution SSE event
             #   ("token", text)     → emit as token SSE event
+            #   ("action", dict)    → emit as action_request SSE event
             # Order is preserved: reasoning lines (from tool calls) are
             # pushed before token lines (from the final answer), so the
             # UI shows "Consultando X..." before the answer streams.
@@ -394,6 +399,8 @@ async def streaming_chat(
                     v2_tokens_streamed = True
                     async for sse_line in _yield_token_events(content, "finance_agent_v2"):
                         yield sse_line
+                elif event_type == "action":
+                    yield f"data: {json.dumps(content)}\n\n"
 
         # Final drain — catch any events pushed after the last astream event.
         while not event_queue.empty():
@@ -411,6 +418,8 @@ async def streaming_chat(
                 v2_tokens_streamed = True
                 async for sse_line in _yield_token_events(content, "finance_agent_v2"):
                     yield sse_line
+            elif event_type == "action":
+                yield f"data: {json.dumps(content)}\n\n"
 
         final_event = {
             "node": "final",

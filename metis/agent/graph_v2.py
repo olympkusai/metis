@@ -166,11 +166,13 @@ async def finance_agent_v2_node(
     # reasoning with the final answer and fires node_execution too late).
     stream_callback = None
     reasoning_callback = None
+    action_callback = None
     if config:
         metadata = config.get("metadata", {}) if hasattr(config, "get") else {}
         if isinstance(metadata, dict):
             stream_callback = metadata.get("stream_callback")
             reasoning_callback = metadata.get("reasoning_callback")
+            action_callback = metadata.get("action_callback")
 
     try:
         runtime = AgentRuntime(
@@ -183,6 +185,7 @@ async def finance_agent_v2_node(
             node_name="finance_agent_v2",
             stream_callback=stream_callback,
             reasoning_callback=reasoning_callback,
+            action_callback=action_callback,
         )
 
         result: AgentResult = await runtime.run(
