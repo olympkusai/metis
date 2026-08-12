@@ -239,11 +239,24 @@ async def streaming_chat(
         accumulated_state: dict = {}
         current_node: str = ""
 
+        # v2 real token streaming: the AgentRuntime calls stream_callback for
+        # each text chunk of the final answer (bypassing LangGraph's
+        # stream_mode which mixes intermediate ReAct reasoning). The callback
+        # pushes tokens to a queue; we drain it after each agent.astream event.
+        token_queue: asyncio.Queue = asyncio.Queue()
+        v2_tokens_streamed = False
+
+        async def stream_callback(content: str) -> None:
+            token_queue.put_nowait(content)
+
         # stream_mode=["messages", "updates"] gives us both token-level
         # streaming AND node completion events in a single iteration.
         async for mode, payload in agent.astream(
             initial_state,
-            config={"recursion_limit": 60},
+            config={
+                "recursion_limit": 60,
+                "metadata": {"stream_callback": stream_callback},
+            },
             stream_mode=["messages", "updates"],
         ):
             if mode == "messages":
@@ -266,10 +279,9 @@ async def streaming_chat(
                 # - finance_context: no LLM, static messages fake-streamed below
                 # - data_gathering: tool calls + CoT (shown via node_execution)
                 # - analysis: CoT only (shown via node_execution), not user text
-                # - finance_agent_v2: ReAct loop streams ALL iterations (intermediate
-                #   reasoning + tool-call deliberation + final answer) which mixes
-                #   messages. Skip live tokens; fake-stream the final answer from
-                #   the state update below (same as greeting/out-of-scope).
+                # - finance_agent_v2: tokens are streamed via stream_callback
+                #   (real-time, only final answer) not via LangGraph's messages
+                #   stream (which includes intermediate ReAct reasoning).
                 if node in ("finance_orchestrator", "finance_context", "data_gathering", "analysis", "finance_agent_v2"):
                     continue
 
@@ -313,13 +325,14 @@ async def streaming_chat(
                         ):
                             yield sse_line
 
-                    # v2: finance_agent_v2 sets final_answer in its state update.
-                    # Live tokens were skipped (see filter above) to avoid
-                    # mixing intermediate ReAct reasoning with the final answer.
-                    # Fake-stream the final answer now for a smooth UX.
+                    # v2: finance_agent_v2 — if stream_callback already
+                    # streamed the final answer tokens in real time, skip
+                    # fake-stream. Fall back to fake-stream only if no tokens
+                    # were streamed (e.g. error before streaming started).
                     if (
                         node_name == "finance_agent_v2"
                         and state_update.get("final_answer")
+                        and not v2_tokens_streamed
                     ):
                         async for sse_line in _yield_token_events(
                             state_update["final_answer"], node_name
@@ -340,6 +353,22 @@ async def streaming_chat(
                         "thought": thought,
                     }
                     yield f"data: {json.dumps(step_data)}\n\n"
+
+            # Drain the token queue after every event (messages or updates).
+            # The AgentRuntime's stream_callback pushes final-answer tokens
+            # here in real time; we emit them as SSE token events.
+            while not token_queue.empty():
+                content = token_queue.get_nowait()
+                v2_tokens_streamed = True
+                async for sse_line in _yield_token_events(content, "finance_agent_v2"):
+                    yield sse_line
+
+        # Final drain — catch any tokens pushed after the last astream event.
+        while not token_queue.empty():
+            content = token_queue.get_nowait()
+            v2_tokens_streamed = True
+            async for sse_line in _yield_token_events(content, "finance_agent_v2"):
+                yield sse_line
 
         final_event = {
             "node": "final",

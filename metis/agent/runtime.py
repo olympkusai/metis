@@ -16,7 +16,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import Any, Callable, Awaitable
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
@@ -238,6 +238,7 @@ class AgentRuntime:
         enable_cot: bool = False,
         node_name: str = "agent",
         tool_labels: dict[str, str] | None = None,
+        stream_callback: Callable[[str], Awaitable[None]] | None = None,
     ):
         self.system_prompt = system_prompt
         self.tools = tools
@@ -248,6 +249,7 @@ class AgentRuntime:
         self.enable_cot = enable_cot
         self.node_name = node_name
         self.tool_labels = tool_labels if tool_labels is not None else dict(_DEFAULT_TOOL_LABELS)
+        self.stream_callback = stream_callback
 
         settings = get_settings()
         self.llm = ChatOpenAI(
@@ -263,6 +265,52 @@ class AgentRuntime:
         self.tool_cache: dict[str, str] = {}
         self.steps: list[tuple[str, str]] = []
         self.reasoning_lines: list[str] = []
+
+    async def _astream_and_collect(
+        self,
+        msgs: list,
+        *,
+        config: RunnableConfig | None = None,
+    ) -> tuple[AIMessage, str | None]:
+        """Stream the LLM response, collecting chunks into a full AIMessage.
+
+        Only pure-text chunks (no tool_call_chunks) are forwarded to
+        stream_callback in real time. When the LLM is calling tools, the
+        chunks contain tool_call_chunks and are NOT forwarded — intermediate
+        reasoning stays internal. When the LLM produces the final answer
+        (no tool calls), all chunks are pure text and stream live.
+
+        In practice, with bind_tools the LLM either produces tool_calls OR
+        text in a given turn, rarely both. So this effectively streams only
+        the final answer.
+
+        Returns (assembled_aimessage, streamed_text_or_None).
+        """
+        chunks: list = []
+        streamed_parts: list[str] = []
+
+        async for chunk in self.llm.astream(msgs, config=config):
+            chunks.append(chunk)
+            content = getattr(chunk, "content", "")
+            # Only forward non-empty text chunks without tool_call_chunks
+            if content and self.stream_callback is not None:
+                has_tool_call = bool(
+                    getattr(chunk, "tool_call_chunks", None)
+                )
+                if not has_tool_call:
+                    streamed_parts.append(content)
+                    await self.stream_callback(content)
+
+        # Reassemble the full AIMessage from chunks
+        if chunks:
+            response = chunks[0]
+            for chunk in chunks[1:]:
+                response = response + chunk
+        else:
+            response = AIMessage(content="")
+
+        streamed_text = "".join(streamed_parts) if streamed_parts else None
+        return response, streamed_text
 
     async def run(
         self,
@@ -390,7 +438,17 @@ class AgentRuntime:
             response = None
             for attempt in range(MAX_RETRIES):
                 try:
-                    response = await self.llm.ainvoke(msgs, config=config, timeout=30)
+                    if self.stream_callback is not None:
+                        # Use astream so we can forward tokens to the callback
+                        # in real time. We collect chunks to reassemble the
+                        # full AIMessage (needed for tool_calls detection and
+                        # for appending to msgs).
+                        response, streamed_text = await self._astream_and_collect(
+                            msgs, config=config,
+                        )
+                    else:
+                        response = await self.llm.ainvoke(msgs, config=config, timeout=30)
+                        streamed_text = None
 
                     cost_tracker = get_cost_tracker()
                     if hasattr(response, 'response_metadata'):
@@ -547,10 +605,16 @@ class AgentRuntime:
 
         # Força finalização se exceder iterações
         try:
-            final = await self.llm.ainvoke(
-                msgs + [HumanMessage(content="Sintetize os resultados obtidos até agora.")],
-                config=config,
-            )
+            if self.stream_callback is not None:
+                final, _ = await self._astream_and_collect(
+                    msgs + [HumanMessage(content="Sintetize os resultados obtidos até agora.")],
+                    config=config,
+                )
+            else:
+                final = await self.llm.ainvoke(
+                    msgs + [HumanMessage(content="Sintetize os resultados obtidos até agora.")],
+                    config=config,
+                )
         except Exception as e:
             error_msg = f"[LLM ERROR on forced finalize]: {str(e)}"
             return AgentResult(
