@@ -363,6 +363,33 @@ class AgentRuntime:
         if extra_context:
             msgs.append(HumanMessage(content=f"[CONTEXTO DO PIPELINE]\n{extra_context}"))
 
+        # Include the full conversation history so the LLM has context from
+        # previous turns (e.g. when the user says "Sim" to confirm something
+        # the agent asked in the previous turn). Without this, the LLM only
+        # sees the latest message and can't connect it to prior context.
+        # We skip the last user message (added separately below) to avoid
+        # duplication, and we filter out any empty messages.
+        # Handles both LangChain message objects and dict representations
+        # (which occur after state serialization via model_dump()).
+        if len(messages) > 1:
+            for m in messages[:-1]:
+                if isinstance(m, HumanMessage):
+                    content = getattr(m, "content", "")
+                    if content and content.strip():
+                        msgs.append(m)
+                elif isinstance(m, AIMessage):
+                    content = getattr(m, "content", "")
+                    if content and content.strip():
+                        msgs.append(m)
+                elif isinstance(m, dict):
+                    mtype = m.get("type") or m.get("role")
+                    content = m.get("content", "")
+                    if content and content.strip():
+                        if mtype in ("human", "user"):
+                            msgs.append(HumanMessage(content=content))
+                        elif mtype in ("ai", "assistant"):
+                            msgs.append(AIMessage(content=content))
+
         # User's message goes LAST so the LLM treats it as the current request
         if original_query:
             msgs.append(original_query)
