@@ -42,26 +42,33 @@ _DEFAULT_TOOL_LABELS: dict[str, str] = {
     # Write tools (Hermes) — friendly labels for reasoning display
     "create_transaction": "criando transação",
     "update_transaction": "atualizando transação",
+    "delete_transaction": "excluindo transação",
     "reconcile_transaction": "reconciliando transação",
     "reverse_transaction": "estornando transação",
     "create_account": "criando conta",
     "update_account": "atualizando conta",
     "archive_account": "arquivando conta",
+    "mark_account_for_deletion": "marcando conta para exclusão",
     "create_budget": "criando orçamento",
     "update_budget": "atualizando orçamento",
     "create_goal": "criando meta",
     "update_goal": "atualizando meta",
+    "delete_goal": "excluindo meta",
     "track_goal_progress": "registrando progresso da meta",
     "complete_goal": "concluindo meta",
     "create_recurrence": "criando recorrência",
     "update_recurrence": "atualizando recorrência",
+    "delete_recurrence": "excluindo recorrência",
     "pay_recurrence": "pagando recorrência",
     "create_category": "criando categoria",
     "create_debt": "criando dívida",
+    "delete_debt": "excluindo dívida",
     "pay_debt": "pagando dívida",
     "create_installment": "criando parcelamento",
+    "delete_installment": "excluindo parcelamento",
     "pay_installment": "pagando parcela",
     "create_wishlist": "criando item da wishlist",
+    "delete_wishlist": "excluindo item da wishlist",
     "acquire_wishlist": "adquirindo item da wishlist",
     "upsert_financial_profile": "atualizando perfil financeiro",
     "complete_onboarding": "concluindo onboarding",
@@ -125,6 +132,43 @@ def _user_cancelled(message: str) -> bool:
         if word in msg_lower:
             return True
     return False
+
+
+def _humanize_reasoning(tool_name: str, args: dict) -> str:
+    """Build a human-readable reasoning line from a tool call.
+
+    Instead of showing technical args (type=expense, side=debit),
+    produces natural Portuguese like:
+      "Criando despesa de R$ 50 — Compra no mercado"
+      "Pagando dívida de R$ 100 — Cartão de crédito"
+    """
+    label = _DEFAULT_TOOL_LABELS.get(tool_name, tool_name.replace("_", " "))
+
+    # Map type values to Portuguese
+    type_map = {
+        "expense": "despesa",
+        "income": "receita",
+        "transfer": "transferência",
+        "investment": "investimento",
+        "saving": "poupança",
+    }
+
+    parts = []
+    txn_type = args.get("type", "")
+    if txn_type in type_map:
+        parts.append(type_map[txn_type])
+    if "amount" in args and args["amount"]:
+        parts.append(f"de R$ {args['amount']}")
+    if "description" in args and args["description"]:
+        parts.append(f"— {args['description']}")
+    elif "name" in args and args["name"]:
+        parts.append(f"— {args['name']}")
+    elif "title" in args and args["title"]:
+        parts.append(f"— {args['title']}")
+
+    if parts:
+        return f"{label.capitalize()} {' '.join(parts)}"
+    return label.capitalize()
 
 
 def _build_action_from_tool(tool_name: str, args: dict) -> dict:
@@ -680,25 +724,29 @@ class AgentRuntime:
                     if tool_name == "request_user_action":
                         pass  # no reasoning line, no callback
                     else:
-                        # Build a short human-readable description of the call.
-                        # Hide internal IDs (UUIDs, tokens) — only show
-                        # user-facing values like amount, description, type, date.
-                        if args:
-                            visible_args = {
-                                k: v for k, v in args.items()
-                                if k not in _HIDDEN_ARGS and v
-                            }
-                            if visible_args:
-                                arg_str = ", ".join(
-                                    f"{k}={v}" for k, v in visible_args.items()
-                                )
-                                reasoning_line = (
-                                    f"{friendly} ({arg_str})" if arg_str else friendly
-                                )
+                        # Build a human-readable reasoning line.
+                        # Uses _humanize_reasoning for write tools (natural
+                        # Portuguese), falls back to friendly label for reads.
+                        if _is_write_tool(tool_name):
+                            reasoning_line = _humanize_reasoning(tool_name, args)
+                        else:
+                            # Read tools: show label + key args (date range, etc)
+                            if args:
+                                visible_args = {
+                                    k: v for k, v in args.items()
+                                    if k not in _HIDDEN_ARGS and v
+                                }
+                                if visible_args:
+                                    arg_str = ", ".join(
+                                        f"{v}" for v in visible_args.values()
+                                    )
+                                    reasoning_line = (
+                                        f"{friendly} ({arg_str})" if arg_str else friendly
+                                    )
+                                else:
+                                    reasoning_line = friendly
                             else:
                                 reasoning_line = friendly
-                        else:
-                            reasoning_line = friendly
                         reasoning_lines.append(reasoning_line)
                         # Emit reasoning in real time so the UI shows what the
                         # agent is doing BEFORE the final answer streams.
