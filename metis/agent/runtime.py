@@ -138,9 +138,10 @@ def _humanize_reasoning(tool_name: str, args: dict) -> str:
     """Build a human-readable reasoning line from a tool call.
 
     Instead of showing technical args (type=expense, side=debit),
-    produces natural Portuguese like:
+    produces natural Portuguese specific to each tool type:
       "Criando despesa de R$ 50 — Compra no mercado"
-      "Pagando dívida de R$ 100 — Cartão de crédito"
+      "Criando dívida de R$ 5.000 — Empréstimo Banco Itaú"
+      "Criando meta de R$ 10.000 — Reserva de emergência"
     """
     label = _DEFAULT_TOOL_LABELS.get(tool_name, tool_name.replace("_", " "))
 
@@ -151,24 +152,182 @@ def _humanize_reasoning(tool_name: str, args: dict) -> str:
         "transfer": "transferência",
         "investment": "investimento",
         "saving": "poupança",
+        "loan": "empréstimo",
+        "financing": "financiamento",
+        "credit_card": "cartão de crédito",
     }
 
-    parts = []
-    txn_type = args.get("type", "")
-    if txn_type in type_map:
-        parts.append(type_map[txn_type])
-    if "amount" in args and args["amount"]:
-        parts.append(f"de R$ {args['amount']}")
-    if "description" in args and args["description"]:
-        parts.append(f"— {args['description']}")
-    elif "name" in args and args["name"]:
-        parts.append(f"— {args['name']}")
-    elif "title" in args and args["title"]:
-        parts.append(f"— {args['title']}")
+    # ── Tool-specific humanization ──
+    if tool_name in ("create_transaction", "update_transaction", "delete_transaction", "reverse_transaction"):
+        parts = []
+        txn_type = args.get("type", "")
+        if txn_type in type_map:
+            parts.append(type_map[txn_type])
+        if "amount" in args and args["amount"]:
+            parts.append(f"de R$ {args['amount']}")
+        desc = args.get("description") or args.get("title") or ""
+        if desc:
+            parts.append(f"— {desc}")
+        return f"{label.capitalize()} {' '.join(parts)}" if parts else label.capitalize()
 
-    if parts:
-        return f"{label.capitalize()} {' '.join(parts)}"
-    return label.capitalize()
+    if tool_name in ("create_debt", "delete_debt"):
+        parts = []
+        debt_type = args.get("type", "")
+        if debt_type in type_map:
+            parts.append(type_map[debt_type])
+        total = args.get("total_amount") or args.get("amount") or ""
+        if total:
+            parts.append(f"de R$ {total}")
+        title = args.get("title") or ""
+        creditor = args.get("creditor") or ""
+        desc = title or creditor
+        if title and creditor:
+            desc = f"{title} ({creditor})"
+        if desc:
+            parts.append(f"— {desc}")
+        return f"{label.capitalize()} {' '.join(parts)}" if parts else label.capitalize()
+
+    if tool_name == "pay_debt":
+        parts = []
+        amount = args.get("amount") or ""
+        if amount:
+            parts.append(f"de R$ {amount}")
+        title = args.get("title") or args.get("description") or ""
+        if title:
+            parts.append(f"— {title}")
+        return f"{label.capitalize()} {' '.join(parts)}" if parts else label.capitalize()
+
+    if tool_name in ("create_installment", "delete_installment"):
+        parts = []
+        total = args.get("total_amount") or ""
+        if total:
+            parts.append(f"de R$ {total}")
+        installments = args.get("total_installments") or ""
+        if installments:
+            parts.append(f"em {installments}x")
+        title = args.get("title") or ""
+        if title:
+            parts.append(f"— {title}")
+        return f"{label.capitalize()} {' '.join(parts)}" if parts else label.capitalize()
+
+    if tool_name == "pay_installment":
+        parts = []
+        amount = args.get("installment_amount") or args.get("amount") or ""
+        if amount:
+            parts.append(f"de R$ {amount}")
+        title = args.get("title") or ""
+        if title:
+            parts.append(f"— {title}")
+        return f"{label.capitalize()} {' '.join(parts)}" if parts else label.capitalize()
+
+    if tool_name in ("create_goal", "update_goal", "delete_goal"):
+        parts = []
+        target = args.get("target_amount") or ""
+        if target:
+            parts.append(f"de R$ {target}")
+        name = args.get("name") or ""
+        if name:
+            parts.append(f"— {name}")
+        return f"{label.capitalize()} {' '.join(parts)}" if parts else label.capitalize()
+
+    if tool_name == "track_goal_progress":
+        parts = []
+        amount = args.get("amount") or ""
+        if amount:
+            parts.append(f"de R$ {amount}")
+        name = args.get("name") or ""
+        if name:
+            parts.append(f"— {name}")
+        return f"{label.capitalize()} {' '.join(parts)}" if parts else label.capitalize()
+
+    if tool_name == "complete_goal":
+        name = args.get("name") or ""
+        if name:
+            return f"{label.capitalize()} — {name}"
+        return label.capitalize()
+
+    if tool_name in ("create_recurrence", "update_recurrence", "delete_recurrence"):
+        parts = []
+        rec_type = args.get("type", "")
+        if rec_type in type_map:
+            parts.append(type_map[rec_type])
+        amount = args.get("amount") or ""
+        if amount:
+            parts.append(f"de R$ {amount}")
+        title = args.get("title") or ""
+        if title:
+            parts.append(f"— {title}")
+        return f"{label.capitalize()} {' '.join(parts)}" if parts else label.capitalize()
+
+    if tool_name == "pay_recurrence":
+        parts = []
+        amount = args.get("amount") or ""
+        if amount:
+            parts.append(f"de R$ {amount}")
+        title = args.get("title") or ""
+        if title:
+            parts.append(f"— {title}")
+        return f"{label.capitalize()} {' '.join(parts)}" if parts else label.capitalize()
+
+    if tool_name in ("create_budget", "update_budget"):
+        parts = []
+        amount = args.get("amount") or ""
+        if amount:
+            parts.append(f"de R$ {amount}")
+        period = args.get("period") or ""
+        if period:
+            period_map = {"monthly": "mensal", "weekly": "semanal", "yearly": "anual"}
+            parts.append(period_map.get(period, period))
+        return f"{label.capitalize()} {' '.join(parts)}" if parts else label.capitalize()
+
+    if tool_name in ("create_wishlist", "delete_wishlist"):
+        parts = []
+        target = args.get("target_amount") or ""
+        if target:
+            parts.append(f"de R$ {target}")
+        name = args.get("name") or ""
+        if name:
+            parts.append(f"— {name}")
+        return f"{label.capitalize()} {' '.join(parts)}" if parts else label.capitalize()
+
+    if tool_name == "acquire_wishlist":
+        name = args.get("name") or ""
+        if name:
+            return f"{label.capitalize()} — {name}"
+        return label.capitalize()
+
+    if tool_name in ("create_account", "update_account", "archive_account", "mark_account_for_deletion"):
+        name = args.get("name") or ""
+        if name:
+            return f"{label.capitalize()} — {name}"
+        return label.capitalize()
+
+    if tool_name == "create_category":
+        name = args.get("name") or ""
+        if name:
+            return f"{label.capitalize()} — {name}"
+        return label.capitalize()
+
+    if tool_name == "upsert_financial_profile":
+        income = args.get("monthly_income") or ""
+        if income:
+            return f"{label.capitalize()} — renda mensal de R$ {income}"
+        return label.capitalize()
+
+    if tool_name == "complete_onboarding":
+        return label.capitalize()
+
+    # Fallback: generic format
+    parts = []
+    for key in ("amount", "total_amount", "target_amount", "name", "title", "description"):
+        val = args.get(key)
+        if val:
+            if key in ("amount", "total_amount", "target_amount"):
+                parts.append(f"de R$ {val}")
+            else:
+                parts.append(f"— {val}")
+            break  # only first matching key
+    return f"{label.capitalize()} {' '.join(parts)}" if parts else label.capitalize()
 
 
 def _build_action_from_tool(tool_name: str, args: dict) -> dict:
@@ -177,44 +336,33 @@ def _build_action_from_tool(tool_name: str, args: dict) -> dict:
     This is used when the LLM calls a write tool directly without
     request_user_action — the runtime intercepts and builds the card.
     """
-    # Friendly title based on tool name
-    label = _DEFAULT_TOOL_LABELS.get(tool_name, tool_name.replace("_", " "))
     is_delete = tool_name.startswith("delete_") or tool_name.startswith("archive_")
     is_pay = tool_name.startswith("pay_")
 
+    # Title: specific to the action type
     if is_delete:
-        title = f"Confirmar exclusão"
+        title = "Confirmar exclusão"
         options = ["Excluir", "Manter"]
         danger = True
     elif is_pay:
-        title = f"Confirmar pagamento"
+        title = "Confirmar pagamento"
+        options = ["Confirmar", "Cancelar"]
+        danger = False
+    elif tool_name.startswith("create_"):
+        title = "Confirmar criação"
+        options = ["Confirmar", "Cancelar"]
+        danger = False
+    elif tool_name.startswith("update_"):
+        title = "Confirmar alteração"
         options = ["Confirmar", "Cancelar"]
         danger = False
     else:
-        title = f"Confirmar ação"
+        title = "Confirmar ação"
         options = ["Confirmar", "Cancelar"]
         danger = False
 
-    # Build a human-readable message from the visible args
-    visible = {k: v for k, v in args.items() if k not in _HIDDEN_ARGS and v}
-    parts = []
-    if "amount" in visible:
-        parts.append(f"R$ {visible['amount']}")
-    if "description" in visible:
-        parts.append(str(visible["description"]))
-    if "type" in visible:
-        parts.append(f"tipo: {visible['type']}")
-    if "date" in visible:
-        parts.append(f"data: {visible['date']}")
-    if "title" in visible:
-        parts.append(str(visible["title"]))
-    if "name" in visible:
-        parts.append(str(visible["name"]))
-
-    if parts:
-        message = f"{label.capitalize()}: {', '.join(parts)}"
-    else:
-        message = f"{label.capitalize()}"
+    # Message: use the same humanized format as reasoning
+    message = _humanize_reasoning(tool_name, args)
 
     return {
         "type": "action_request",
