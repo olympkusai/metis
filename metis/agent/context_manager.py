@@ -51,7 +51,7 @@ _BUDGETS: dict[str, dict[str, int]] = {
         "output_budget": 1_500,
     },
     "medium": {
-        "system_prompt": 6_000,    # full prompt
+        "system_prompt": 7_000,    # full prompt (~6.2K)
         "tools_schema": 3_000,
         "extra_context": 4_000,
         "history": 8_000,
@@ -59,7 +59,7 @@ _BUDGETS: dict[str, dict[str, int]] = {
         "output_budget": 2_000,
     },
     "high": {
-        "system_prompt": 6_000,
+        "system_prompt": 7_000,
         "tools_schema": 3_000,
         "extra_context": 8_000,    # more prefetch data
         "history": 20_000,
