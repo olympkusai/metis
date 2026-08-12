@@ -24,6 +24,7 @@ from langchain_openai import ChatOpenAI
 
 from metis.config import get_settings
 from metis.utils.cost_tracker import get_cost_tracker
+from metis.agent.context_manager import ContextManager, count_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -489,11 +490,13 @@ async def _execute_tools(
     steps: list,
     cache: dict[str, str] | None = None,
     tool_map: dict | None = None,
+    context_manager: ContextManager | None = None,
 ) -> tuple[list[ToolMessage], list]:
     """Executa tool calls em paralelo, com dedup cache (por-run).
 
     `tool_map` permite a um agente resolver tool calls contra um
     conjunto de tools específico.
+    `context_manager` se fornecido, trunca os resultados ao budget de tokens.
     """
     tool_messages: list[ToolMessage] = []
     steps = list(steps)
@@ -527,6 +530,9 @@ async def _execute_tools(
         else:
             name, call_id, result, was_cached = item
             content = str(result)
+            # Truncate tool result to token budget if context manager is set
+            if context_manager is not None:
+                content = context_manager.truncate_tool_result(content)
             tool_messages.append(ToolMessage(content=content, tool_call_id=call_id))
             label = f"{name} [cached]" if was_cached else name
             steps.append((label, content))
@@ -575,6 +581,7 @@ class AgentRuntime:
         reasoning_callback: Callable[[str], Awaitable[None]] | None = None,
         action_callback: Callable[[dict], Awaitable[None]] | None = None,
         trace: Any = None,  # AgentTrace instance (optional)
+        effort: str = "medium",  # effort level for context budget
     ):
         self.system_prompt = system_prompt
         self.tools = tools
@@ -589,6 +596,7 @@ class AgentRuntime:
         self.reasoning_callback = reasoning_callback
         self.action_callback = action_callback
         self.trace = trace
+        self.context_manager = ContextManager(model=model, effort=effort)
 
         settings = get_settings()
         self.llm = ChatOpenAI(
@@ -698,11 +706,15 @@ class AgentRuntime:
         msgs: list = [SystemMessage(content=enhanced_prompt)]
 
         if reasoning_trail:
+            # Eviction: keep only last 5 entries to prevent unbounded growth
+            trimmed_trail = self.context_manager.truncate_reasoning_trail(
+                list(reasoning_trail), max_entries=5,
+            )
             trail_block = (
                 "RACIOCÍNIO DOS AGENTES ANTERIORES (use como contexto, não copie literalmente):\n"
                 + "\n".join(
                     f"  [{name}]({status}) {thought}"
-                    for name, thought, status in reasoning_trail
+                    for name, thought, status in trimmed_trail
                 )
             )
             msgs.append(HumanMessage(content=trail_block))
@@ -718,24 +730,52 @@ class AgentRuntime:
         # duplication, and we filter out any empty messages.
         # Handles both LangChain message objects and dict representations
         # (which occur after state serialization via model_dump()).
+        # ── Context management (Fase 2) ──
+        # If history exceeds token budget, summarize old messages into a
+        # compact [RESUMO DA CONVERSA ANTERIOR] block via gpt-4o-mini.
+        history_msgs: list = []
         if len(messages) > 1:
             for m in messages[:-1]:
                 if isinstance(m, HumanMessage):
                     content = getattr(m, "content", "")
                     if content and content.strip():
-                        msgs.append(m)
+                        history_msgs.append(m)
                 elif isinstance(m, AIMessage):
                     content = getattr(m, "content", "")
                     if content and content.strip():
-                        msgs.append(m)
+                        history_msgs.append(m)
                 elif isinstance(m, dict):
                     mtype = m.get("type") or m.get("role")
                     content = m.get("content", "")
                     if content and content.strip():
                         if mtype in ("human", "user"):
-                            msgs.append(HumanMessage(content=content))
+                            history_msgs.append(HumanMessage(content=content))
                         elif mtype in ("ai", "assistant"):
-                            msgs.append(AIMessage(content=content))
+                            history_msgs.append(AIMessage(content=content))
+
+        # Summarize if history exceeds budget
+        if history_msgs and self.context_manager.should_summarize(history_msgs):
+            to_summarize, to_keep = self.context_manager.select_messages_to_summarize(history_msgs)
+            if to_summarize:
+                # Use a cheap model for summarization
+                settings = get_settings()
+                summary_llm = ChatOpenAI(
+                    model="gpt-4o-mini",
+                    temperature=0,
+                    api_key=settings.openai_api_key,
+                )
+                summary_block = await self.context_manager.summarize_messages(
+                    to_summarize, summary_llm,
+                )
+                msgs.append(HumanMessage(content=summary_block))
+                if self.trace is not None:
+                    self.trace.add_event("context_summary", 0,
+                        messages_summarized=len(to_summarize),
+                        messages_kept=len(to_keep),
+                        original_tokens=self.context_manager.count_history_tokens(to_summarize))
+                history_msgs = to_keep
+
+        msgs.extend(history_msgs)
 
         # User's message goes LAST so the LLM treats it as the current request
         if original_query:
@@ -1039,6 +1079,7 @@ class AgentRuntime:
                 tool_msgs, steps = await _execute_tools(
                     response, steps, cache=self.tool_cache,
                     tool_map=self.tool_map,
+                    context_manager=self.context_manager,
                 )
                 msgs.extend(tool_msgs)
                 all_tool_msgs.extend(tool_msgs)

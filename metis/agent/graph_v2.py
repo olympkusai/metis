@@ -286,6 +286,7 @@ async def finance_agent_v2_node(
             reasoning_callback=reasoning_callback,
             action_callback=action_callback,
             trace=trace,
+            effort=effort.level,
         )
 
         result: AgentResult = await runtime.run(
