@@ -559,30 +559,36 @@ class AgentRuntime:
                     tool_name = tc.get("name", "unknown")
                     friendly = self.tool_labels.get(tool_name, tool_name.replace("_", " "))
                     args = dict(tc.get("args") or {})
-                    # Build a short human-readable description of the call.
-                    # Hide internal IDs (UUIDs, tokens) — only show
-                    # user-facing values like amount, description, type, date.
-                    if args:
-                        visible_args = {
-                            k: v for k, v in args.items()
-                            if k not in _HIDDEN_ARGS and v
-                        }
-                        if visible_args:
-                            arg_str = ", ".join(
-                                f"{k}={v}" for k, v in visible_args.items()
-                            )
-                            reasoning_line = (
-                                f"{friendly} ({arg_str})" if arg_str else friendly
-                            )
+                    # Skip reasoning for request_user_action — the action
+                    # card IS the user-facing interface, no need to show
+                    # "solicitando confirmação (title=...)" in reasoning.
+                    if tool_name == "request_user_action":
+                        pass  # no reasoning line, no callback
+                    else:
+                        # Build a short human-readable description of the call.
+                        # Hide internal IDs (UUIDs, tokens) — only show
+                        # user-facing values like amount, description, type, date.
+                        if args:
+                            visible_args = {
+                                k: v for k, v in args.items()
+                                if k not in _HIDDEN_ARGS and v
+                            }
+                            if visible_args:
+                                arg_str = ", ".join(
+                                    f"{k}={v}" for k, v in visible_args.items()
+                                )
+                                reasoning_line = (
+                                    f"{friendly} ({arg_str})" if arg_str else friendly
+                                )
+                            else:
+                                reasoning_line = friendly
                         else:
                             reasoning_line = friendly
-                    else:
-                        reasoning_line = friendly
-                    reasoning_lines.append(reasoning_line)
-                    # Emit reasoning in real time so the UI shows what the
-                    # agent is doing BEFORE the final answer streams.
-                    if self.reasoning_callback is not None:
-                        await self.reasoning_callback(reasoning_line)
+                        reasoning_lines.append(reasoning_line)
+                        # Emit reasoning in real time so the UI shows what the
+                        # agent is doing BEFORE the final answer streams.
+                        if self.reasoning_callback is not None:
+                            await self.reasoning_callback(reasoning_line)
                     # Track for repetition/cycle detection
                     try:
                         args_key = json.dumps(args, sort_keys=True, default=str)
