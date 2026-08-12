@@ -22,11 +22,23 @@ from langchain_core.tools import tool
 from metis.pluto_client import PlutoApiError, get_pluto_client
 
 _auth_token: ContextVar[str] = ContextVar("finance_auth_token", default="")
+_user_id: ContextVar[str] = ContextVar("finance_user_id", default="")
+_session_id: ContextVar[str] = ContextVar("finance_session_id", default="")
 
 
 def set_auth_token(token: str) -> None:
     """Sets the bearer token finance tools use for the current request."""
     _auth_token.set(token)
+
+
+def set_user_id(uid: str) -> None:
+    """Sets the user ID for the current request (for RAG memory recall)."""
+    _user_id.set(uid)
+
+
+def set_session_id(sid: str) -> None:
+    """Sets the session ID for the current request (to exclude from recall)."""
+    _session_id.set(sid)
 
 
 def _current_token() -> str:
@@ -169,6 +181,48 @@ def _is_uuid(value: str) -> bool:
         return False
 
 
+@tool
+async def recall_memory(query: str) -> str:
+    """Recupera memórias relevantes de conversas anteriores com base em
+    similaridade semântica. Use quando o usuário referenciar algo discutido
+    antes ("você lembra que...", "como tínhamos combinado", "aquela conversa
+    sobre...") ou quando precisar de contexto histórico.
+
+    Args:
+        query: O que procurar nas conversas anteriores (ex: "comprar carro",
+               "meta de economia", "dívida do cartão")
+    """
+    uid = _user_id.get()
+    if not uid:
+        return "Memória indisponível: usuário não identificado."
+
+    sid = _session_id.get()
+    try:
+        from metis.agent.memory_rag import recall_similar_messages
+        results = await recall_similar_messages(
+            query=query,
+            user_id=uid,
+            session_id=sid,
+            limit=5,
+            threshold=0.70,
+        )
+    except Exception as e:
+        return f"Erro ao buscar memórias: {e}"
+
+    if not results:
+        return "Nenhuma memória relevante encontrada para esta busca."
+
+    parts = []
+    for r in results:
+        date_str = r["created_at"].strftime("%d/%m/%Y")
+        role_label = "Você" if r["role"] == "user" else "Assistente"
+        sim_pct = int(r["similarity"] * 100)
+        parts.append(
+            f"[{date_str}] {role_label} ({sim_pct}% similar): {r['content'][:300]}"
+        )
+    return "\n".join(parts)
+
+
 finance_tools = [
     get_spending_by_category,
     get_cashflow,
@@ -176,4 +230,5 @@ finance_tools = [
     get_goal_summary,
     get_recurrences_due,
     list_transactions_filtered,
+    recall_memory,
 ]

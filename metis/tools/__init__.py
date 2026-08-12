@@ -15,7 +15,10 @@ from metis.tools.finance import (
     get_goal_summary,
     get_recurrences_due,
     list_transactions_filtered,
+    recall_memory,
     set_auth_token,
+    set_user_id,
+    set_session_id,
 )
 from metis.tools.user_action import request_user_action
 
@@ -27,7 +30,10 @@ __all__ = [
     "get_goal_summary",
     "get_recurrences_due",
     "list_transactions_filtered",
+    "recall_memory",
     "set_auth_token",
+    "set_user_id",
+    "set_session_id",
     "request_user_action",
     "build_tool_catalog",
     "close_hermes_client",

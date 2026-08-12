@@ -28,7 +28,7 @@ from langgraph.graph import END, StateGraph
 from metis.agent.graph import FinanceAgentState, NextAction
 from metis.agent.runtime import AgentRuntime, AgentResult, NodeStatus, _append_reasoning
 from metis.agent.effort import EffortConfig, get_effort_config, get_effort_config_async
-from metis.tools import build_tool_catalog, close_hermes_client, set_auth_token
+from metis.tools import build_tool_catalog, close_hermes_client, set_auth_token, set_user_id, set_session_id
 from metis.pluto_client import PlutoApiError, get_pluto_client
 from metis.soter_client import SoterApiError, get_soter_client
 from metis.agent.finance_prompts import (
@@ -71,6 +71,13 @@ async def finance_agent_v2_node(
 
     # ── 1. Set auth token + build tool catalog ──────────────────
     set_auth_token(state.auth_token)
+    set_user_id(state.user_id)
+    # Extract metadata from config (session_id, trace, callbacks)
+    _config_metadata = {}
+    if config:
+        _config_metadata = config.get("metadata", {}) if hasattr(config, "get") else {}
+        if isinstance(_config_metadata, dict):
+            set_session_id(_config_metadata.get("session_id", ""))
     tools, hermes_client = await build_tool_catalog(state.auth_token)
 
     # ── 1b. Determine effort level ──────────────────────────────
@@ -232,6 +239,45 @@ async def finance_agent_v2_node(
         extra_context += f"\n\n[PROGRESSO DO ORÇAMENTO]\n{json.dumps(budget_data, ensure_ascii=False, default=str)}"
     if goals_data is not None:
         extra_context += f"\n\n[RESUMO DE METAS]\n{json.dumps(goals_data, ensure_ascii=False, default=str)}"
+
+    # ── 3b. RAG memory recall (auto-injection) ──────────────────
+    # For medium/high effort, search previous conversations for relevant
+    # memories. Excludes the current session (already in context).
+    # Low effort skips this (simple queries don't need historical context).
+    _trace = _config_metadata.get("trace") if isinstance(_config_metadata, dict) else None
+    if effort.level != "low" and user_message and state.user_id:
+        try:
+            from metis.agent.memory_rag import recall_similar_messages
+            session_id = _config_metadata.get("session_id", "") if isinstance(_config_metadata, dict) else ""
+            memories = await recall_similar_messages(
+                query=user_message,
+                user_id=state.user_id,
+                session_id=session_id,
+                limit=3,
+                threshold=0.75,
+            )
+            if memories:
+                memory_parts = []
+                for m in memories:
+                    date_str = m["created_at"].strftime("%d/%m/%Y")
+                    role_label = "Usuário" if m["role"] == "user" else "Assistente"
+                    memory_parts.append(
+                        f"[{date_str}] {role_label}: {m['content'][:200]}"
+                    )
+                extra_context += (
+                    "\n\n[MEMÓRIAS RELEVANTES DE CONVERSAS ANTERIORES]\n"
+                    + "\n".join(memory_parts)
+                )
+                logger.info(
+                    f"[finance_agent_v2] RAG: {len(memories)} memories injected "
+                    f"(effort={effort.level})"
+                )
+                if _trace is not None:
+                    _trace.add_event("memory_recall", 0,
+                        memories_found=len(memories),
+                        top_similarity=memories[0]["similarity"] if memories else 0)
+        except Exception as e:
+            logger.warning(f"[finance_agent_v2] RAG memory recall failed: {e}")
 
     # ── 4. Apply personalization directives to system prompt ────
     # Use compressed prompt for low effort, full prompt otherwise

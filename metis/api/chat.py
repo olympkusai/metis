@@ -299,6 +299,7 @@ async def streaming_chat(
                     "action_callback": action_callback,
                     "effort": effort.level,
                     "trace": trace,
+                    "session_id": session_id,
                 },
             },
             stream_mode=["messages", "updates"],

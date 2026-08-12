@@ -42,7 +42,7 @@ CREATE TABLE IF NOT EXISTS chat_messages (
     user_id varchar NOT NULL,
     role varchar NOT NULL,
     content text NOT NULL,
-    embedding float8[],
+    embedding vector(1536),
     metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
     created_at timestamptz NOT NULL DEFAULT now(),
     updated_at timestamptz NOT NULL DEFAULT now(),
@@ -69,6 +69,51 @@ CREATE TABLE IF NOT EXISTS chat_message_feedback (
 
 # Notifications have been moved to Stentor (db-stentor).
 # The notifications table is no longer created in db-metis.
+
+# ─────────────────────────────────────────────────────────────
+# pgvector — semantic recall over chat history (Fase 5).
+# Activates the vector extension, converts the existing float8[]
+# embedding column to vector(1536), and creates an ivfflat index
+# for fast cosine similarity search.
+#
+# text-embedding-3-small produces 1536-dim vectors.
+# ivfflat with lists=100 is good for up to ~100K rows; for larger
+# datasets, increase lists or switch to HNSW.
+# ─────────────────────────────────────────────────────────────
+ENABLE_PGVECTOR = """
+DO $$
+BEGIN
+    CREATE EXTENSION IF NOT EXISTS vector;
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'pgvector extension not available: %', SQLERRM;
+END $$;
+"""
+
+ALTER_EMBEDDING_COLUMN = """
+DO $$
+BEGIN
+    -- Only alter if the column exists and is not already vector type
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'chat_messages'
+          AND column_name = 'embedding'
+          AND udt_name != 'vector'
+    ) THEN
+        ALTER TABLE chat_messages
+            ALTER COLUMN embedding TYPE vector(1536)
+            USING embedding::float8[]::vector(1536);
+    END IF;
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'Could not alter embedding column: %', SQLERRM;
+END $$;
+"""
+
+CREATE_EMBEDDING_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_chat_messages_embedding
+ON chat_messages USING ivfflat (embedding vector_cosine_ops)
+WITH (lists = 100)
+WHERE embedding IS NOT NULL;
+"""
 
 # ─────────────────────────────────────────────────────────────
 # Agent traces — structured execution traces for observability.
@@ -113,4 +158,8 @@ async def run_conversation_migrations(pool) -> None:
     await pool.execute(CREATE_CONVERSATIONS_TABLE)
     await pool.execute(CREATE_CHAT_MESSAGES_TABLE)
     await pool.execute(CREATE_CHAT_MESSAGE_FEEDBACK_TABLE)
+    # pgvector: activate extension, convert column, create index
+    await pool.execute(ENABLE_PGVECTOR)
+    await pool.execute(ALTER_EMBEDDING_COLUMN)
+    await pool.execute(CREATE_EMBEDDING_INDEX)
     await pool.execute(CREATE_AGENT_TRACES_TABLE)

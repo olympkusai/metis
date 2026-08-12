@@ -18,6 +18,7 @@ from typing import List, Dict, Any, Optional
 from datetime import datetime, UTC
 from enum import Enum
 from metis.storage.pool import DatabasePool
+import asyncio
 import json
 import uuid
 
@@ -113,6 +114,15 @@ class ConversationHistory:
             message_id, session_id, user_id, role.value, content,
             json.dumps(metadata or {}), now,
         )
+
+        # Generate embedding async (fire-and-forget, non-blocking)
+        # Only embed user and assistant messages (not system)
+        if role in (MessageRole.USER, MessageRole.ASSISTANT):
+            try:
+                from metis.agent.memory_rag import embed_and_store
+                asyncio.create_task(embed_and_store(message_id, content))
+            except Exception:
+                pass  # embedding is optional, don't block on import errors
 
         return message_id
 
