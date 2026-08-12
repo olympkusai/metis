@@ -16,13 +16,13 @@ Three effort levels control the trade-off between speed and capability:
           latency. Best for complex analysis ("analisa minha saúde
           financeira e sugere melhorias").
 
-Auto-selection picks the level based on the user's message:
-- Simple lookups / greetings / single action → low
-- Multi-tool queries / comparisons / transactions → medium
-- Analysis / planning / "analisa" / "sugere" / multi-step → high
+Auto-selection uses an LLM classifier (gpt-4o-mini, ~300ms) to determine
+the effort level from the user's message. Falls back to regex keyword
+matching if the LLM is unavailable or too slow.
 """
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from enum import Enum
@@ -110,13 +110,109 @@ _PRESETS: dict[str, EffortConfig] = {
 
 
 def get_effort_config(level: str = "auto", user_message: str = "") -> EffortConfig:
-    """Get the effort config for a given level.
+    """Get the effort config for a given level (synchronous, regex fallback).
 
-    If level is "auto", selects based on the user's message.
+    If level is "auto", selects based on the user's message using regex.
+    For LLM-based classification, use get_effort_config_async() instead.
     """
     if level == EffortLevel.AUTO.value:
         return _auto_select(user_message)
     return _PRESETS.get(level, _MEDIUM)
+
+
+# ── LLM classifier ──
+
+logger = logging.getLogger(__name__)
+
+# Cache the classifier LLM instance (lazy init)
+_classifier_llm = None
+_classifier_system_prompt = (
+    "Você é um classificador de esforço computacional para um assistente financeiro.\n"
+    "Analise a mensagem do usuário e determine o nível de esforço necessário:\n\n"
+    "low: Consultas simples, saudações, ações únicas, confirmações.\n"
+    "  Ex: \"olá\", \"quanto gastei hoje?\", \"gastei 50 no mercado\", \"sim\", \"qual meu saldo?\"\n\n"
+    "medium: Comparações, múltiplas ferramentas, consultas com filtros, criação de metas/orçamentos.\n"
+    "  Ex: \"compara meus gastos com mês passado\", \"cria uma meta de 10 mil\", \"transfere 100 pra poupança\"\n\n"
+    "high: Análise financeira profunda, planejamento, recomendações, diagnóstico, múltiplas etapas.\n"
+    "  Ex: \"analisa minha saúde financeira\", \"recomenda como sair das dívidas\", "
+    "\"me dá um panorama geral de como tô financeiramente\", \"planeja meu orçamento\"\n\n"
+    "Responda APENAS uma palavra: low, medium ou high"
+)
+
+
+def _get_classifier_llm():
+    """Lazy-init the classifier LLM (gpt-4o-mini, no streaming)."""
+    global _classifier_llm
+    if _classifier_llm is None:
+        from langchain_openai import ChatOpenAI
+        from metis.config import get_settings
+        settings = get_settings()
+        _classifier_llm = ChatOpenAI(
+            model="gpt-4o-mini",
+            temperature=0.0,
+            api_key=settings.openai_api_key,
+            streaming=False,
+            max_tokens=10,  # just "low", "medium", or "high"
+            timeout=5,  # fail fast if OpenAI is slow
+        )
+    return _classifier_llm
+
+
+async def classify_effort_llm(message: str) -> str | None:
+    """Classify effort level using gpt-4o-mini.
+
+    Returns "low", "medium", or "high". Returns None on any error
+    or timeout (caller should fall back to regex).
+    """
+    if not message or not message.strip():
+        return None
+
+    try:
+        from langchain_core.messages import HumanMessage, SystemMessage
+        llm = _get_classifier_llm()
+        response = await llm.ainvoke([
+            SystemMessage(content=_classifier_system_prompt),
+            HumanMessage(content=message.strip()),
+        ])
+        result = response.content.strip().lower()
+        # Validate response
+        if result in ("low", "medium", "high"):
+            return result
+        # Sometimes the LLM adds punctuation or extra text
+        for level in ("low", "medium", "high"):
+            if level in result:
+                return level
+        logger.warning(f"[effort] LLM classifier returned unexpected: '{result}'")
+        return None
+    except Exception as e:
+        logger.warning(f"[effort] LLM classifier failed: {e}")
+        return None
+
+
+async def get_effort_config_async(
+    level: str = "auto",
+    user_message: str = "",
+) -> EffortConfig:
+    """Get the effort config, using LLM classification for auto mode.
+
+    Falls back to regex (_auto_select) if the LLM classifier fails,
+    times out, or returns an invalid response.
+    """
+    if level != EffortLevel.AUTO.value:
+        return _PRESETS.get(level, _MEDIUM)
+
+    if not user_message or not user_message.strip():
+        return _MEDIUM
+
+    # Try LLM classifier first
+    llm_result = await classify_effort_llm(user_message)
+    if llm_result is not None:
+        logger.info(f"[effort] LLM classifier: '{user_message[:50]}' → {llm_result}")
+        return _PRESETS.get(llm_result, _MEDIUM)
+
+    # Fall back to regex
+    logger.info(f"[effort] Regex fallback: '{user_message[:50]}'")
+    return _auto_select(user_message)
 
 
 # ── Auto-selection ──

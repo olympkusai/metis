@@ -27,7 +27,7 @@ from langgraph.graph import END, StateGraph
 
 from metis.agent.graph import FinanceAgentState, NextAction
 from metis.agent.runtime import AgentRuntime, AgentResult, NodeStatus, _append_reasoning
-from metis.agent.effort import EffortConfig, get_effort_config
+from metis.agent.effort import EffortConfig, get_effort_config, get_effort_config_async
 from metis.tools import build_tool_catalog, close_hermes_client, set_auth_token
 from metis.pluto_client import PlutoApiError, get_pluto_client
 from metis.soter_client import SoterApiError, get_soter_client
@@ -85,13 +85,15 @@ async def finance_agent_v2_node(
                 user_message = m.get("content", "") or ""
                 break
 
-    # Effort level from config metadata or env var, default: auto
+    # Effort level from config metadata (resolved by chat.py) or fallback to auto
     effort_level = "auto"
     if config:
         metadata = config.get("metadata", {}) if hasattr(config, "get") else {}
         if isinstance(metadata, dict):
             effort_level = metadata.get("effort", "auto")
 
+    # If chat.py already resolved the effort (low/medium/high), use it directly.
+    # If still "auto" (e.g. called outside chat.py), use regex fallback.
     effort = get_effort_config(effort_level, user_message)
     logger.info(f"[finance_agent_v2] effort={effort.level} model={effort.model} "
                 f"msg='{user_message[:60]}'")

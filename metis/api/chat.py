@@ -5,7 +5,7 @@ from typing import Optional
 from langchain_core.messages import HumanMessage, AIMessage
 from metis.agent.graph import get_finance_agent_graph, FinanceAgentState, NextAction
 from metis.agent.graph_v2 import get_finance_agent_graph_v2
-from metis.agent.effort import get_effort_config
+from metis.agent.effort import get_effort_config_async
 from metis.config import get_settings
 from metis.memory.conversation_history import (
     get_conversation_history,
@@ -209,8 +209,8 @@ async def streaming_chat(
         settings = get_settings()
         effort_level = getattr(settings, "agent_effort", None) or "auto"
 
-        # Auto-select based on the user's message
-        effort = get_effort_config(effort_level, request.message)
+        # Auto-select using LLM classifier (gpt-4o-mini) with regex fallback
+        effort = await get_effort_config_async(effort_level, request.message)
 
         session_history = await conv_history.get_conversation_history(
             user_id=user_id,
