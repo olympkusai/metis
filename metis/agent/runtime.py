@@ -540,7 +540,9 @@ class AgentRuntime:
                 )
                 if self.enable_cot and not cot and steps:
                     cot = _synthesize_cot_from_steps(steps)
-                final_cot = _build_cot(cot) if self.enable_cot else ""
+                # Even without enable_cot, return reasoning_lines (tool call
+                # trail) as CoT so the UI shows what the agent consulted.
+                final_cot = _build_cot(cot) if self.enable_cot else "\n".join(reasoning_lines)
                 status = NodeStatus.OK if (final_cot or not self.enable_cot) else NodeStatus.NO_COT
                 return AgentResult(
                     answer=answer,
@@ -560,7 +562,7 @@ class AgentRuntime:
                 )
                 if self.enable_cot and not cot and steps:
                     cot = _synthesize_cot_from_steps(steps)
-                final_cot = _build_cot(cot) if self.enable_cot else ""
+                final_cot = _build_cot(cot) if self.enable_cot else "\n".join(reasoning_lines)
                 status = NodeStatus.OK if (final_cot or not self.enable_cot) else NodeStatus.NO_COT
                 return AgentResult(
                     answer=answer,
@@ -578,7 +580,7 @@ class AgentRuntime:
                 )
                 if self.enable_cot and not cot and steps:
                     cot = _synthesize_cot_from_steps(steps)
-                final_cot = _build_cot(cot) if self.enable_cot else ""
+                final_cot = _build_cot(cot) if self.enable_cot else "\n".join(reasoning_lines)
                 status = NodeStatus.OK if (final_cot or not self.enable_cot) else NodeStatus.NO_COT
                 return AgentResult(
                     answer=answer,
@@ -630,7 +632,7 @@ class AgentRuntime:
         )
         if self.enable_cot and not cot and steps:
             cot = _synthesize_cot_from_steps(steps)
-        final_cot = _build_cot(cot) if self.enable_cot else ""
+        final_cot = _build_cot(cot) if self.enable_cot else "\n".join(reasoning_lines)
         status = NodeStatus.OK if (final_cot or not self.enable_cot) else NodeStatus.NO_COT
         return AgentResult(
             answer=answer,
