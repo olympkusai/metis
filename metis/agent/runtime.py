@@ -32,13 +32,49 @@ _BASE_MODEL = "gpt-4o"
 # Human-readable names for each finance tool, so the CoT shows
 # "Consultando gastos por categoria" instead of "Consultando get_spending_by_category".
 _DEFAULT_TOOL_LABELS: dict[str, str] = {
+    # Read tools (Pluto)
     "get_spending_by_category": "gastos por categoria",
     "get_cashflow": "fluxo de caixa",
     "get_budget_progress": "progresso do orçamento",
     "get_goal_summary": "resumo de metas",
     "get_recurrences_due": "contas recorrentes a vencer",
     "list_transactions_filtered": "transações filtradas",
+    # Write tools (Hermes) — friendly labels for reasoning display
+    "create_transaction": "criando transação",
+    "update_transaction": "atualizando transação",
+    "reconcile_transaction": "reconciliando transação",
+    "reverse_transaction": "estornando transação",
+    "create_account": "criando conta",
+    "update_account": "atualizando conta",
+    "archive_account": "arquivando conta",
+    "create_budget": "criando orçamento",
+    "update_budget": "atualizando orçamento",
+    "create_goal": "criando meta",
+    "update_goal": "atualizando meta",
+    "track_goal_progress": "registrando progresso da meta",
+    "complete_goal": "concluindo meta",
+    "create_recurrence": "criando recorrência",
+    "update_recurrence": "atualizando recorrência",
+    "pay_recurrence": "pagando recorrência",
+    "create_category": "criando categoria",
+    "create_debt": "criando dívida",
+    "pay_debt": "pagando dívida",
+    "create_installment": "criando parcelamento",
+    "pay_installment": "pagando parcela",
+    "create_wishlist": "criando item da wishlist",
+    "acquire_wishlist": "adquirindo item da wishlist",
+    "upsert_financial_profile": "atualizando perfil financeiro",
+    "complete_onboarding": "concluindo onboarding",
+    "request_user_action": "solicitando confirmação",
 }
+
+# Args to hide from reasoning display (UUIDs, tokens, internal IDs).
+# Only show user-facing values like amount, description, type, date.
+_HIDDEN_ARGS = frozenset({
+    "account_id", "category_id", "budget_id", "goal_id",
+    "recurrence_id", "debt_id", "installment_id", "wishlist_id",
+    "transaction_id", "auth_token", "currency",
+})
 
 
 # ─────────────────────────────────────────────
@@ -523,17 +559,25 @@ class AgentRuntime:
                     tool_name = tc.get("name", "unknown")
                     friendly = self.tool_labels.get(tool_name, tool_name.replace("_", " "))
                     args = dict(tc.get("args") or {})
-                    # Build a short human-readable description of the call
+                    # Build a short human-readable description of the call.
+                    # Hide internal IDs (UUIDs, tokens) — only show
+                    # user-facing values like amount, description, type, date.
                     if args:
-                        arg_str = ", ".join(
-                            f"{k}={v}" for k, v in args.items()
-                            if k not in ("auth_token",) and v
-                        )
-                        reasoning_line = (
-                            f"Consultando {friendly}({arg_str})" if arg_str else f"Consultando {friendly}"
-                        )
+                        visible_args = {
+                            k: v for k, v in args.items()
+                            if k not in _HIDDEN_ARGS and v
+                        }
+                        if visible_args:
+                            arg_str = ", ".join(
+                                f"{k}={v}" for k, v in visible_args.items()
+                            )
+                            reasoning_line = (
+                                f"{friendly} ({arg_str})" if arg_str else friendly
+                            )
+                        else:
+                            reasoning_line = friendly
                     else:
-                        reasoning_line = f"Consultando {friendly}"
+                        reasoning_line = friendly
                     reasoning_lines.append(reasoning_line)
                     # Emit reasoning in real time so the UI shows what the
                     # agent is doing BEFORE the final answer streams.
