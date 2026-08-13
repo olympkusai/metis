@@ -15,10 +15,71 @@ from metis.memory.conversation_history import (
 from metis.jwt_verifier import JWTVerifier, InvalidTokenError
 from metis.api.deps import get_jwt_verifier
 import json
+import re
 import asyncio
 import uuid
 
 router = APIRouter()
+
+
+# ─────────────────────────────────────────────
+# Input sanitization & PII redaction
+# ─────────────────────────────────────────────
+
+_MAX_MESSAGE_LENGTH = 2000
+
+# Common prompt-injection phrases appearing at the start of a message.
+_INJECTION_PATTERNS = [
+    re.compile(r"^\s*ignore (all )?(previous|prior|above) (instructions?|rules?|prompts?)", re.IGNORECASE),
+    re.compile(r"^\s*you are now\b", re.IGNORECASE),
+    re.compile(r"^\s*system\s*:", re.IGNORECASE),
+    re.compile(r"^\s*assistant\s*:", re.IGNORECASE),
+]
+
+# Control characters (C0 + C1 + DEL) — preserves tab/newline/carriage-return.
+_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\x80-\x9f]")
+
+# PII patterns
+_CPF_RE = re.compile(r"\d{3}\.\d{3}\.\d{3}-\d{2}")
+_CARD_RE = re.compile(r"\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}")
+# Long digit sequences (>= 12 consecutive digits) resembling account numbers.
+_ACCOUNT_RE = re.compile(r"\d{12,}")
+
+
+def sanitize_input(message: str) -> str:
+    """Sanitize user input before it reaches the LLM.
+
+    - Rejects messages longer than 2000 characters (HTTP 400).
+    - Strips common prompt-injection prefixes from the start of the message.
+    - Removes special control characters.
+    """
+    if not isinstance(message, str):
+        raise HTTPException(status_code=400, detail="Message must be a string")
+
+    if len(message) > _MAX_MESSAGE_LENGTH:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Message exceeds maximum length of {_MAX_MESSAGE_LENGTH} characters",
+        )
+
+    cleaned = message
+    for pattern in _INJECTION_PATTERNS:
+        cleaned = pattern.sub("", cleaned)
+
+    cleaned = _CONTROL_CHARS.sub("", cleaned)
+    return cleaned.strip()
+
+
+def redact_pii(message: str) -> str:
+    """Redact common PII patterns from the user message.
+
+    Replaces CPF, credit card numbers, and long account-like digit
+    sequences with redaction placeholders before sending to the LLM.
+    """
+    message = _CPF_RE.sub("[CPF_REDACTED]", message)
+    message = _CARD_RE.sub("[CARD_REDACTED]", message)
+    message = _ACCOUNT_RE.sub("[ACCOUNT_REDACTED]", message)
+    return message
 
 
 def _get_agent_graph():
@@ -105,6 +166,8 @@ async def chat(
     verifier: JWTVerifier = Depends(get_jwt_verifier),
 ):
     user_id, auth_token = await _validate_and_get_user_id(authorization, verifier)
+    # Sanitize input and redact PII before any processing.
+    request.message = redact_pii(sanitize_input(request.message))
     session_id = request.session_id or f"{user_id}:{uuid.uuid4().hex}"
 
     conv_history = get_conversation_history()
@@ -196,6 +259,8 @@ async def streaming_chat(
     - { type: "completion", response, session_id } — final answer
     """
     user_id, auth_token = await _validate_and_get_user_id(authorization, verifier)
+    # Sanitize input and redact PII before any processing.
+    request.message = redact_pii(sanitize_input(request.message))
     session_id = request.session_id or f"{user_id}:{uuid.uuid4().hex}"
 
     # Trace ID from Nike's X-Request-ID header (or generated if missing)

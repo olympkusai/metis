@@ -3,8 +3,9 @@ import logging
 import sys
 
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 
 if __package__ in {None, ""}:
@@ -13,10 +14,11 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from metis.api import register_routes
-from metis.api.deps import set_jwt_verifier
+from metis.api.deps import set_jwt_verifier, get_jwt_verifier
+from metis.api.ratelimit import RateLimiter, RateLimitExceeded
 from metis.pluto_client import close_pluto_client
 from metis.soter_client import close_soter_client
-from metis.jwt_verifier import JWTVerifier
+from metis.jwt_verifier import JWTVerifier, InvalidTokenError
 from metis.config import get_settings
 from metis.storage import DatabasePool
 from metis.storage.migrations import run_conversation_migrations
@@ -106,6 +108,43 @@ app.add_middleware(
 app.add_middleware(RequestIdMiddleware)
 
 register_routes(app)
+
+# ── Rate limiting for chat routes ──────────────────────────────────
+# In-memory sliding-window limiter: 20 messages / minute / user (JWT sub).
+_chat_rate_limiter = RateLimiter(max_requests=20, window_seconds=60)
+_CHAT_RATE_LIMIT_PATHS = {"/api/chat", "/api/streaming/chat"}
+
+
+@app.middleware("http")
+async def chat_rate_limit_middleware(request: Request, call_next):
+    """Enforce per-user rate limits on chat endpoints.
+
+    Identifies the user via the JWT in the Authorization header and rejects
+    with 429 ``{"error": "rate limit exceeded"}`` when the limit is exceeded.
+    Requests without a valid bearer token are allowed through so the normal
+    401 authentication error from the route handler is preserved.
+    """
+    if request.url.path in _CHAT_RATE_LIMIT_PATHS:
+        authorization = request.headers.get("authorization", "")
+        if authorization.startswith("Bearer "):
+            token = authorization.removeprefix("Bearer ").strip()
+            try:
+                verifier = get_jwt_verifier()
+            except RuntimeError:
+                # Verifier not initialized yet — let the request proceed.
+                return await call_next(request)
+            try:
+                identity = await verifier.verify(token)
+                _chat_rate_limiter.check(identity.user_id)
+            except RateLimitExceeded:
+                return JSONResponse(
+                    status_code=429,
+                    content={"error": "rate limit exceeded"},
+                )
+            except InvalidTokenError:
+                # Let the route handler produce the canonical 401 response.
+                pass
+    return await call_next(request)
 
 @app.get("/")
 async def root():
