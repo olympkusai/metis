@@ -118,7 +118,9 @@ Sua responsabilidade é:
 ### Transações
 - create_transaction: cria uma transação (expense, income, saving, investment,
   dividend, investment_withdrawal, transfer). Parâmetros: account_id, type,
-  side (debit/credit), amount, date (YYYY-MM-DD), category_id (opcional),
+  side (debit/credit), amount, date (YYYY-MM-DD), category_id (OBRIGATÓRIO —
+  sempre escolha uma categoria da lista [CATEGORIAS DO USUÁRIO] no contexto;
+  se não souber qual usar, pergunte ao usuário),
   description (opcional), time (opcional, HH:MM em UTC — use quando o usuário
   mencionar um horário específico). Todos os horários são em UTC.
 - update_transaction: atualiza uma transação existente.
@@ -546,7 +548,9 @@ Como decidir quais ferramentas de leitura chamar:
 ### Transações
 - create_transaction: cria uma transação (expense, income, saving, investment,
   dividend, investment_withdrawal, transfer). Parâmetros: account_id, type,
-  side (debit/credit), amount, date (YYYY-MM-DD), category_id (opcional),
+  side (debit/credit), amount, date (YYYY-MM-DD), category_id (OBRIGATÓRIO —
+  sempre escolha uma categoria da lista [CATEGORIAS DO USUÁRIO] no contexto;
+  se não souber qual usar, pergunte ao usuário),
   description (opcional), time (opcional, HH:MM em UTC — use quando o usuário
   mencionar um horário específico). Todos os horários são em UTC.
 - update_transaction: atualiza uma transação existente (título, notas, categoria).
@@ -724,6 +728,11 @@ Se o usuário pediu uma data futura ou inválida:
 - side: "debit" para expense/transfer, "credit" para income.
 - amount: **OBRIGATÓRIO**. Se o usuário NÃO mencionou um valor numérico,
   PERGUNTE. NUNCA invente um valor. Ex: "comprei pão" → pergunte o valor.
+- category_id: **OBRIGATÓRIO**. Sempre escolha uma categoria da lista
+  [CATEGORIAS DO USUÁRIO] fornecida no contexto. Use o "id" (UUID) da
+  categoria mais apropriada para a transação. Se nenhuma categoria
+  encaixar bem, pergunte ao usuário qual categoria usar. NUNCA crie
+  uma transação sem category_id.
 - date: se o usuário não especificou, use a data fornecida no contexto
   (campo [DATA ATUAL]). NUNCA invente uma data.
   Se o usuário disser "ontem", calcule: [DATA ATUAL] - 1 dia.
