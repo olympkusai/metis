@@ -6,4 +6,4 @@ from metis.api.categorize import router as categorize_router
 def register_routes(app: FastAPI):
     app.include_router(chat_router, prefix="/api")
     app.include_router(conversations_router, prefix="/api")
-    app.include_router(categorize_router, prefix="/api")
+    app.include_router(categorize_router)
