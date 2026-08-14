@@ -7,12 +7,23 @@ import json
 import logging
 from typing import Optional
 
-from fastapi import APIRouter, Header
+from fastapi import APIRouter, Header, HTTPException
 from openai import AsyncOpenAI
 from pydantic import BaseModel, Field
 
 from metis.config import get_settings
 from metis.api.deps import get_jwt_verifier
+
+
+async def _verify_auth(authorization: str, x_service_token: str | None = None) -> None:
+    """Authenticate via JWT (user) or X-Service-Token (service-to-service)."""
+    settings = get_settings()
+    if x_service_token and settings.service_token and x_service_token == settings.service_token:
+        return  # service-to-service auth — skip JWT
+    if not authorization:
+        raise HTTPException(status_code=401, detail="missing authorization")
+    verifier = get_jwt_verifier()
+    await verifier.verify(authorization.removeprefix("Bearer ").strip())
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["categorization"])
@@ -101,11 +112,10 @@ def _build_user_prompt(transactions: list[CategorizeItem], categories: list[Cate
 @router.post("/categorize", response_model=CategorizeResponse)
 async def categorize_transactions(
     req: CategorizeRequest,
-    authorization: str = Header(...),
+    authorization: str = Header(default=""),
+    x_service_token: str = Header(default="", alias="X-Service-Token"),
 ) -> CategorizeResponse:
-    # Validate JWT — ensures only authenticated Pluto users can call this
-    verifier = get_jwt_verifier()
-    await verifier.verify(authorization.removeprefix("Bearer ").strip())
+    await _verify_auth(authorization, x_service_token)
 
     client = _get_openai_client()
 
@@ -155,3 +165,44 @@ async def categorize_transactions(
                 )
 
     return CategorizeResponse(results=all_results)
+
+
+# ── Embedding endpoint ─────────────────────────────────────────────────
+
+
+class EmbedRequest(BaseModel):
+    texts: list[str] = Field(min_length=1, max_length=100)
+
+
+class EmbedResponse(BaseModel):
+    embeddings: list[list[float]]
+    model: str
+    dimensions: int
+
+
+@router.post("/embed", response_model=EmbedResponse)
+async def embed_texts(
+    req: EmbedRequest,
+    authorization: str = Header(default=""),
+    x_service_token: str = Header(default="", alias="X-Service-Token"),
+) -> EmbedResponse:
+    """Generate embeddings for a list of texts using text-embedding-3-small.
+    Used by Pluto to build the merchant category cache with pgvector."""
+    await _verify_auth(authorization, x_service_token)
+
+    client = _get_openai_client()
+
+    try:
+        resp = await client.embeddings.create(
+            model="text-embedding-3-small",
+            input=req.texts,
+        )
+        embeddings = [item.embedding for item in resp.data]
+        return EmbedResponse(
+            embeddings=embeddings,
+            model="text-embedding-3-small",
+            dimensions=len(embeddings[0]) if embeddings else 0,
+        )
+    except Exception as e:
+        logger.error("embed: OpenAI call failed: %s", e)
+        raise HTTPException(status_code=502, detail="embedding service unavailable")

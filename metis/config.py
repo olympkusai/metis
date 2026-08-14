@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     database_dsn: str = Field(default="", description="Postgres DSN (legacy — no longer used for market data)")
     conversation_database_url: str = Field(..., description="Postgres DSN for db-metis (conversations, chat_messages)")
     redis_url: Optional[str] = Field(default=None, description="Redis connection URL (currently unused — no code path consumes it)")
+    service_token: Optional[str] = Field(default=None, description="Shared token for service-to-service auth (Pluto worker pool, etc.)")
     api_base_url: HttpUrl = Field(default="https://api.olympkusai.com/api/v1", description="API base URL")
     pluto_base_url: str = Field(default="https://api.olympkusai.com/pluto/api/v1", description="Pluto personal-finance API base URL (via Nike gateway)")
     pluto_request_timeout_seconds: float = Field(default=15.0, description="Timeout in seconds for Pluto API requests")
