@@ -29,7 +29,7 @@ class CategorizeItem(BaseModel):
     transaction_id: str
     description: str = Field(min_length=1, max_length=500)
     amount: float = Field(gt=0)
-    currency: str = "BRL"
+    currency: str
     date: str = ""
 
 
