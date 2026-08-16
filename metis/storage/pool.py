@@ -36,15 +36,20 @@ class DatabasePool:
         async def _init_conn(conn: Connection) -> None:
             """Register pgvector codec so list[float] ↔ vector(1536) works.
 
-            Uses pgvector.asyncpg.register_vector if available; otherwise
-            falls back to a manual codec that converts list[float] to the
-            pgvector text format on the wire.
+            Tries pgvector.asyncpg.register_vector if available; otherwise
+            falls back to a manual text codec. If the vector type doesn't
+            exist in the DB yet, silently skips — embedding will fail at
+            runtime but all other queries work fine.
             """
             try:
-                from pgvector.asyncpg import register_vector
-                await register_vector(conn)
-            except ImportError:
-                # Manual fallback: register a codec for the 'vector' type
+                try:
+                    from pgvector.asyncpg import register_vector
+                    await register_vector(conn)
+                    return
+                except ImportError:
+                    pass
+
+                # Manual fallback: register a text codec for the 'vector' type
                 # that serializes list[float] → '[v1,v2,...]' text format.
                 async def _encode(value):
                     if value is None:
@@ -54,7 +59,6 @@ class DatabasePool:
                 async def _decode(value):
                     if value is None:
                         return None
-                    # value comes as a string like '[v1,v2,...]'
                     if isinstance(value, str):
                         return [float(x) for x in value.strip('[]').split(',') if x]
                     return value
@@ -67,7 +71,7 @@ class DatabasePool:
                     format='text',
                 )
             except Exception:
-                # pgvector extension may not be installed on this DB;
+                # pgvector extension or vector type not available;
                 # embedding storage will fail at runtime but other queries work.
                 pass
 
