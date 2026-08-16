@@ -33,11 +33,22 @@ class DatabasePool:
         Returns:
             DatabasePool instance
         """
+        async def _init_conn(conn: Connection) -> None:
+            """Register pgvector codec so list[float] ↔ vector(1536) works."""
+            try:
+                from pgvector.asyncpg import register_vector
+                await register_vector(conn)
+            except Exception:
+                # pgvector extension may not be installed on this DB;
+                # embedding storage will fail at runtime but other queries work.
+                pass
+
         pool = await asyncpg.create_pool(
             dsn,
             min_size=min_size,
             max_size=max_size,
             command_timeout=command_timeout,
+            init=_init_conn,
         )
         
         # Test connection
