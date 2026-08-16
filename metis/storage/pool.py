@@ -23,21 +23,49 @@ class DatabasePool:
         command_timeout: float = 60.0,
     ) -> "DatabasePool":
         """Create a new database connection pool.
-        
+
         Args:
             dsn: Database connection string
             min_size: Minimum pool size
             max_size: Maximum pool size
             command_timeout: Default command timeout in seconds
-            
+
         Returns:
             DatabasePool instance
         """
         async def _init_conn(conn: Connection) -> None:
-            """Register pgvector codec so list[float] ↔ vector(1536) works."""
+            """Register pgvector codec so list[float] ↔ vector(1536) works.
+
+            Uses pgvector.asyncpg.register_vector if available; otherwise
+            falls back to a manual codec that converts list[float] to the
+            pgvector text format on the wire.
+            """
             try:
                 from pgvector.asyncpg import register_vector
                 await register_vector(conn)
+            except ImportError:
+                # Manual fallback: register a codec for the 'vector' type
+                # that serializes list[float] → '[v1,v2,...]' text format.
+                async def _encode(value):
+                    if value is None:
+                        return None
+                    return '[' + ','.join(str(float(v)) for v in value) + ']'
+
+                async def _decode(value):
+                    if value is None:
+                        return None
+                    # value comes as a string like '[v1,v2,...]'
+                    if isinstance(value, str):
+                        return [float(x) for x in value.strip('[]').split(',') if x]
+                    return value
+
+                await conn.set_type_codec(
+                    'vector',
+                    encoder=_encode,
+                    decoder=_decode,
+                    schema='pg_catalog',
+                    format='text',
+                )
             except Exception:
                 # pgvector extension may not be installed on this DB;
                 # embedding storage will fail at runtime but other queries work.
@@ -50,11 +78,11 @@ class DatabasePool:
             command_timeout=command_timeout,
             init=_init_conn,
         )
-        
+
         # Test connection
         async with pool.acquire() as conn:
             await conn.fetchval("SELECT 1")
-        
+
         return cls(pool)
     
     async def close(self) -> None:
