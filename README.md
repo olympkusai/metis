@@ -218,3 +218,22 @@ poetry run python run_migration.py
 # Checar disponibilidade de candles por intervalo
 poetry run python check_db_intervals.py BTCUSDT 30
 ```
+
+## Migrations & Admin Processes (12-Factor)
+
+As migrations rodam automaticamente no startup do app (lifespan handler). Para
+rodar como processo one-off no Railway (recomendado para migrations pesadas):
+
+```bash
+# Rodar migration do pgvector como one-off no Railway
+railway run --service metis --environment production -- poetry run python scripts/migrate_pgvector.py
+
+# Backfill de embeddings (one-off)
+railway run --service metis --environment production -- poetry run python scripts/backfill_embeddings.py
+
+# Verificar pgvector (one-off, read-only)
+railway run --service metis --environment production -- poetry run python scripts/check_pgvector.py
+```
+
+Para staging, troque `--environment production` por `--environment staging`.
+

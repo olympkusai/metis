@@ -17,8 +17,11 @@ from metis.api.deps import get_jwt_verifier
 
 async def _verify_auth(authorization: str, x_service_token: str | None = None) -> None:
     """Authenticate via JWT (user) or X-Service-Token (service-to-service)."""
+    import secrets
     settings = get_settings()
-    if x_service_token and settings.service_token and x_service_token == settings.service_token:
+    # Accept dedicated METIS_SERVICE_TOKEN (preferred) or legacy shared SERVICE_TOKEN
+    valid_tokens = [t for t in (settings.metis_service_token, settings.service_token) if t]
+    if x_service_token and any(secrets.compare_digest(x_service_token, t) for t in valid_tokens):
         return  # service-to-service auth — skip JWT
     if not authorization:
         raise HTTPException(status_code=401, detail="missing authorization")

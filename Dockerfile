@@ -1,4 +1,4 @@
-FROM python:3.14-slim
+FROM python:3.12-slim
 
 WORKDIR /app
 
@@ -25,8 +25,9 @@ COPY ./metis ./metis
 # Set PYTHONPATH
 ENV PYTHONPATH=/app
 
-# Expose port
+# Expose port (Railway injects PORT env var; default 8082 for local/docker-compose)
+ENV PORT=8082
 EXPOSE 8082
 
-# Run the application
-CMD ["uvicorn", "metis.main:app", "--host", "0.0.0.0", "--port", "8082", "--loop", "asyncio"]
+# Run the application — port from env (Railway injects PORT)
+CMD ["sh", "-c", "uvicorn metis.main:app --host 0.0.0.0 --port ${PORT:-8082} --loop asyncio"]

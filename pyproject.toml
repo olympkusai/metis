@@ -7,7 +7,7 @@ readme = "README.md"
 packages = [{ include = "metis" }]
 
 [tool.poetry.dependencies]
-python = "^3.14"
+python = "^3.12"
 fastapi = "^0.116.0"
 uvicorn = {extras = ["standard"], version = "^0.34.0"}
 langchain = "^0.3.0"
